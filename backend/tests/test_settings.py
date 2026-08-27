@@ -178,7 +178,11 @@ def test_llm_test_uses_body_override(
               "model": "tmp-model", "temperature": 0.9},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"ok": True, "model": "tmp-model", "latency_ms": 1, "error": None}
+    assert resp.json() == {
+        "ok": True, "model": "tmp-model", "latency_ms": 1, "error": None,
+        # 探测走真实 /v1/models，FakeLLM 场景下拿不到规格 → None
+        "capability": None,
+    }
     assert captured[-1] == {
         "base_url": "https://tmp.example.com/v1",
         "api_key": "sk-tmpkey999988887777",

@@ -8,6 +8,7 @@ import './markdown.css'
 import { cn } from '../../lib/cn'
 import { CodeBlock } from './CodeBlock'
 import { MermaidBlock } from './MermaidBlock'
+import { normalizeMathDelimiters } from './normalizeMath'
 
 const remarkPlugins = [remarkGfm, remarkMath]
 const rehypePlugins = [rehypeKatex]
@@ -77,7 +78,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
         rehypePlugins={rehypePlugins}
         components={components}
       >
-        {markdown}
+        {normalizeMathDelimiters(markdown)}
       </ReactMarkdown>
     </div>
   )

@@ -1039,6 +1039,55 @@ def _add_paragraph_with_inline_images(
             _set_run_font(run, "宋体", 10.5)
 
 
+# --- LaTeX 原生分隔符归一化 -------------------------------------------------
+# 交底书/专利正文的写作规范要求「行内公式以 \(...\) 标记，独立公式以 \[...\] 标记」，
+# 这是专利文书的通行写法，也是模型的自然输出。而本模块下游的解析历来只认
+# `$`/`$$`：块级分支要求 `\[` 独占一行，行内分支只匹配 `$...$`。与其在四五处
+# 正则里各加一套分支，不如在入口把分隔符统一成 `$` 系，让既有的
+# OMML → PNG → 原文 回退链路原样复用。
+# Markdown 原文不受影响——归一化只作用于送进转换器的内存副本。
+
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+# 整行就是一条独立公式：\[ ... \]
+_ONELINE_DISPLAY_RE = re.compile(r"^\s*\\\[(.+?)\\\]\s*$")
+# 独占一行的开 / 闭分隔符（多行公式写法）
+_OPEN_ONLY_RE = re.compile(r"^\s*\\\[\s*$")
+_CLOSE_ONLY_RE = re.compile(r"^\s*\\\]\s*$")
+# 行内 \( ... \)（只在同一行内配对：跨行放开会把整段文字误吞成公式）
+_INLINE_PAREN_RE = re.compile(r"\\\((.+?)\\\)")
+
+
+def _normalize_math_delimiters(md_text: str) -> str:
+    r"""把 ``\[..\]`` / ``\(..\)`` 归一化为 ``$$``/``$``；围栏代码块内原样保留。"""
+    if "\\[" not in md_text and "\\(" not in md_text:
+        return md_text
+    out: list[str] = []
+    in_fence = False
+    for line in md_text.splitlines():
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        m = _ONELINE_DISPLAY_RE.match(line)
+        if m:
+            # 拆成独占三行，正好命中下游既有的块级 ``$$`` 分支
+            out.extend(["$$", m.group(1).strip(), "$$"])
+            continue
+        if _OPEN_ONLY_RE.match(line) or _CLOSE_ONLY_RE.match(line):
+            out.append("$$")
+            continue
+        # 行内公式：``$...$`` 不能跨行，故把内部换行压成空格
+        out.append(
+            _INLINE_PAREN_RE.sub(
+                lambda mm: "$" + " ".join(mm.group(1).split()) + "$", line
+            )
+        )
+    return "\n".join(out)
+
+
 def convert_md_to_docx(
     md_text: str,
     base_dir: Path | None,
@@ -1061,7 +1110,7 @@ def convert_md_to_docx(
     except (AttributeError, KeyError):
         pass
 
-    lines = md_text.splitlines()
+    lines = _normalize_math_delimiters(md_text).splitlines()
     i = 0
     para_buf: list[str] = []
     ordered_num_id: int | None = None
