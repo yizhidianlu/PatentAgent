@@ -15,6 +15,7 @@ import json
 import logging
 import random
 import re
+import base64
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
@@ -45,6 +46,10 @@ TModel = TypeVar("TModel", bound=BaseModel)
 DEFAULT_TIMEOUT = 300
 REASONING_TIMEOUT = 900
 TEST_TIMEOUT = 30
+# 出图比对话慢一到两个数量级：文生图从提交到返回常见 20-120 秒，4K 或排队时更久。
+# 拿 TEST_TIMEOUT(30s) 去测图像模型，结果是「配置明明正确却永远超时」——
+# 而超时的报错长得跟网络不通一样，看不出真正原因。
+IMAGE_TIMEOUT = 180
 
 
 class LlmNotConfiguredError(RuntimeError):
@@ -1006,6 +1011,60 @@ async def test_llm(override: dict[str, Any] | None = None) -> LlmTestResult:
 DEFAULT_IMAGE_TEST_PROMPT = "专利附图风格：黑白线条示意图，白底，无阴影无文字，简单的方框与箭头"
 
 
+class ImageGenUnavailableError(RuntimeError):
+    """图像生成未启用或未配置——调用方据此走「只给提示词」的降级路径。"""
+
+
+async def generate_image(
+    prompt: str,
+    *,
+    case_id: str | None = None,
+    step_key: str | None = None,
+) -> bytes:
+    """按提示词出一张图，返回 PNG 字节。
+
+    与 test_image_gen 的区别：这是生产路径，出图会进交付物，所以
+      * 未启用/未配置时抛 ImageGenUnavailableError，由调用方决定如何降级；
+      * 端点只给 URL 时会把图拉回来——交付物不能依赖一个随时会失效的外链。
+    """
+    cfg = load_image_gen_settings()
+    if not cfg.enabled:
+        raise ImageGenUnavailableError("图像生成未启用")
+    if not cfg.model:
+        raise ImageGenUnavailableError("尚未配置图像生成模型")
+
+    client = _client(cfg.base_url, cfg.api_key, timeout=IMAGE_TIMEOUT)
+    started = time.perf_counter()
+    resp = await client.images.generate(
+        model=cfg.model, prompt=prompt, n=1, size=cfg.size or "1024x1024",
+    )
+    latency = int((time.perf_counter() - started) * 1000)
+
+    item = resp.data[0] if getattr(resp, "data", None) else None
+    if not item:
+        raise RuntimeError("图像端点未返回任何数据")
+
+    b64 = getattr(item, "b64_json", None)
+    data: bytes
+    if b64:
+        data = base64.b64decode(b64)
+    else:
+        url = getattr(item, "url", None)
+        if not url:
+            raise RuntimeError("图像端点既未返回 url 也未返回 b64_json")
+        # 落地保存，不留外链：交付物要能长期打开
+        async with httpx.AsyncClient(timeout=IMAGE_TIMEOUT) as http:
+            r = await http.get(url)
+            r.raise_for_status()
+            data = r.content
+
+    if not data:
+        raise RuntimeError("图像端点返回了空内容")
+    await _notify(case_id, f"出图完成（{cfg.model}，{latency}ms，{len(data) // 1024} KB）", step_key=step_key)
+    return data
+
+
+
 async def test_image_gen(override: dict[str, Any] | None = None) -> ImageGenTestResult:
     """用当前（或临时）配置发一次最小 images 请求，返回可预览的缩略图或错误。
 
@@ -1015,7 +1074,7 @@ async def test_image_gen(override: dict[str, Any] | None = None) -> ImageGenTest
     cfg = load_image_gen_settings(override)
     if not cfg.model:
         return ImageGenTestResult(ok=False, error="尚未配置图像生成模型")
-    client = _client(cfg.base_url, cfg.api_key, timeout=TEST_TIMEOUT)
+    client = _client(cfg.base_url, cfg.api_key, timeout=IMAGE_TIMEOUT)
     started = time.perf_counter()
     try:
         resp = await client.images.generate(
@@ -1036,7 +1095,13 @@ async def test_image_gen(override: dict[str, Any] | None = None) -> ImageGenTest
         )
     except Exception as exc:  # noqa: BLE001
         latency = int((time.perf_counter() - started) * 1000)
-        return ImageGenTestResult(ok=False, model=cfg.model, latency_ms=latency, error=str(exc))
+        msg = str(exc)
+        if "timed out" in msg.lower() or "timeout" in msg.lower():
+            msg = (
+                f"出图超时（已等待 {IMAGE_TIMEOUT} 秒）。该模型可能排队较久或不支持当前尺寸；"
+                "可换一个更快的图像模型、把尺寸调小后重试。"
+            )
+        return ImageGenTestResult(ok=False, model=cfg.model, latency_ms=latency, error=msg)
 
 
 async def test_embedding(override: dict[str, Any] | None = None) -> EmbeddingTestResult:

@@ -1370,12 +1370,16 @@ async def regenerate_drawings(
             work = await drawings_service.generate(case_id, work)
         except drawings_service.DrawingGenerationError as exc:
             figure_no = exc.figure_no
-            if figure_no is None:  # 整体失败：全部图降级为 image_model_prompt-only
+            if figure_no is None:  # 整体失败：逐图先试图像模型，不成再降级
                 for n in _figure_numbers(work):
+                    if await drawings_service.try_ai_figure(case_id, work, n, step_key="drawings"):
+                        continue
                     gaps.append(drawings_service.degrade_figure(work, n, "附图脚本执行失败"))
                     degraded.append(n)
                 break
             if await _try_repair(work, figure_no, str(exc)):
+                continue
+            if await drawings_service.try_ai_figure(case_id, work, figure_no, step_key="drawings"):
                 continue
             gaps.append(
                 drawings_service.degrade_figure(work, figure_no, "规格中的步骤/模块不足以成图")
@@ -1392,6 +1396,10 @@ async def regenerate_drawings(
         for figure_no in failed:
             if await _try_repair(
                 work, figure_no, "画布留白过大或图内混入图题，validation.passes=false"
+            ):
+                progressed = True
+            elif await drawings_service.try_ai_figure(
+                case_id, work, figure_no, step_key="drawings"
             ):
                 progressed = True
             else:

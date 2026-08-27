@@ -214,6 +214,83 @@ def fallback_image_prompt(figure_no: int, spec: str) -> str:
     )
 
 
+async def try_ai_figure(
+    case_id: str, content: dict[str, Any], figure_no: int, *, step_key: str | None = None
+) -> bool:
+    """脚本画不出这张图时，用配置好的图像模型补一张；成功则写进 drawing_assets。
+
+    此前这条路是断的：平台把精修提示词算好放进 image_model_prompts，却要用户自己
+    拿去别处出图——设置页明明配了图像模型，却没有任何地方会用它。
+
+    产物同时落 PNG 与一层 SVG 外壳。DOCX 生成器要求每个 asset 有 svg_path
+    （png_path 只是可选回退），而它实际嵌入时优先用 PNG；给一层内嵌该 PNG 的 SVG，
+    既满足了它的入口校验，嵌进文档的又是真正的图，无需改动交付路径。
+
+    任何失败都只返回 False，由调用方降级为「只给提示词」——出图是增强，不是主路径。
+    """
+    from . import llm  # 延迟导入：drawings 被 CLI 工具单独引用时不该拖上 LLM 依赖
+
+    spec = spec_of(content, figure_no)
+    if not spec:
+        return False
+    prompt = fallback_image_prompt(figure_no, spec)
+    try:
+        data = await llm.generate_image(prompt, case_id=case_id, step_key=step_key)
+    except llm.ImageGenUnavailableError:
+        return False        # 没配就是没配，静默走降级
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("AI 补图失败 case=%s 图%s：%s", case_id, figure_no, exc)
+        return False
+
+    try:
+        width, height = _png_size(data)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("AI 补图产物不是有效 PNG case=%s 图%s：%s", case_id, figure_no, exc)
+        return False
+
+    work = work_dir(case_id)
+    png_path = work / f"figure_{figure_no}_ai.png"
+    svg_path = work / f"figure_{figure_no}_ai.svg"
+    png_path.write_bytes(data)
+    svg_path.write_text(_svg_wrapper(png_path.name, width, height), encoding="utf-8")
+
+    title = re.sub(r"^图\s*\d+\s*[：:]\s*", "", spec.strip())[:40] or f"图{figure_no}"
+    assets = [
+        a for a in (content.get("drawing_assets") or [])
+        if not (isinstance(a, dict) and int(a.get("figure_no") or 0) == figure_no)
+    ]
+    assets.append({
+        "figure_no": figure_no,
+        "svg_path": svg_path.name,
+        "png_path": png_path.name,
+        "title": title,
+        "caption": f"图{figure_no} {title}",
+        "source": "image_model",   # 标明来路：人工复核时要能一眼分出哪些图是模型画的
+    })
+    content["drawing_assets"] = sorted(assets, key=lambda a: int(a.get("figure_no") or 0))
+    logger.info("AI 补图成功 case=%s 图%s %sx%s", case_id, figure_no, width, height)
+    return True
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    """从 PNG 字节读宽高（只认 IHDR，不引入图像库）。"""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("不是 PNG")
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def _svg_wrapper(png_name: str, width: int, height: int) -> str:
+    """把 PNG 包一层 SVG：满足 DOCX 生成器对 svg_path 的入口校验。"""
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n'
+        f'  <image xlink:href="{png_name}" x="0" y="0" '
+        f'width="{width}" height="{height}"/>\n'
+        f'</svg>\n'
+    )
+
+
 def degrade_figure(content: dict[str, Any], figure_no: int, reason: str = "") -> str:
     """把某图降级为「只留 image_model_prompt」：移出 drawings/drawing_assets，返回 gaps 文案。
 
