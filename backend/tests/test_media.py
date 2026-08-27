@@ -147,3 +147,33 @@ def test_disclosure_upload_figure_is_served(client: TestClient) -> None:
     r = client.get(f"{API}/cases/{case_id}/media", params={"path": as_posix})
     assert r.status_code == 200, r.text
     assert r.content == PNG_BYTES
+
+
+def test_data_dir_relative_path_is_served(client: TestClient, case_with_figure) -> None:
+    """`outputs/<case>/x.png` 就是 artifacts.stored_path 的入库形态。
+
+    部署端在恢复演练里正是照这个形态传的，拿到 404 后差点当成缺陷报上来。
+    少认一种写法，调用方就得去猜该传哪种——那种猜测迟早会以 bug 的形式回来。
+    """
+    case_id, png = case_with_figure
+    rel = f"outputs/{case_id}/p2p_work/{png.name}"
+    r = client.get(f"{API}/cases/{case_id}/media", params={"path": rel})
+    assert r.status_code == 200, r.text
+    assert r.content == PNG_BYTES
+
+
+def test_another_cases_data_dir_relative_path_is_refused(
+    client: TestClient, case_with_figure
+) -> None:
+    """认得更多不等于放得更松：别的案件的路径照样进不来。"""
+    case_id, png = case_with_figure
+    other = client.post(f"{API}/cases", json={"module": "disclosure", "title": "别人的案件"})
+    other_id = other.json()["id"]
+    outdir = get_config().outputs_dir / other_id
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "secret.png").write_bytes(PNG_BYTES)
+
+    r = client.get(
+        f"{API}/cases/{case_id}/media", params={"path": f"outputs/{other_id}/secret.png"}
+    )
+    assert r.status_code == 404, "跨案件取图必须被包含判定挡住"

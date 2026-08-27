@@ -62,10 +62,11 @@ def _within(path: Path, root: Path) -> bool:
 def resolve_media_path(case_id: str, raw: str) -> Path | None:
     """把正文里的图片引用解析成本案件目录内的真实文件；越界或不存在返回 None。
 
-    正文里的写法有三种，都要认：
+    路径的写法有四种，都要认——少认一种，调用方就得去猜该传哪种形态：
     - 绝对路径（交底书插图、AI 补图）
     - 相对工作目录的文件名（附图脚本回写的 ``png_path`` 有时只有文件名）
     - 相对案件输出目录的路径（mermaid / 公式 PNG 的 ``assets_dir``）
+    - 相对 ``DATA_DIR`` 的路径（``outputs/<case>/图1.png``，即入库形态）
     """
     text = (raw or "").strip()
     if not text:
@@ -89,6 +90,10 @@ def resolve_media_path(case_id: str, raw: str) -> Path | None:
         for root in roots:
             tries.append(root / candidate)
             tries.append(root / "p2p_work" / candidate)
+        # 也认「相对 DATA_DIR」的形态：`outputs/<case>/图1.png` 正是
+        # artifacts.stored_path 现在的存储形态，把它直接递过来是很自然的写法。
+        # 放行它不放松边界——下面的包含判定照做，别的案件的路径照样进不来。
+        tries.append(paths_service.data_dir() / candidate)
 
     for item in tries:
         try:
