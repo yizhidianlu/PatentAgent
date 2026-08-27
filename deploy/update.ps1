@@ -112,14 +112,25 @@ function Invoke-Step {
 
 # --- 进程控制 ---------------------------------------------------------------
 function Get-AppProcesses {
-    <# 只认本仓库 .venv 起的 uvicorn，避免误杀同机其它 Python 服务 #>
-    $venvPy = $Py -replace '\\', '\\'
+    <# 找出「我们这一份部署」的进程，返回 PID 数组。
+
+       主判据是谁在监听本部署的端口——这是唯一不会误伤的判据。同一台机器上
+       很可能还跑着别的 uvicorn，而且它们的命令行同样是 `app.main:app`
+       （不同项目重名很常见），只靠命令行匹配会连别人的服务一起杀掉。
+
+       再补一条命令行判据兜底：进程已崩到不再监听、或刚起还没绑上端口时，
+       仅凭端口就找不到它，会留下抢占端口的僵尸。这条限定在本仓库自己的
+       .venv 解释器上，不会波及外部项目。
+    #>
+    $pids = [System.Collections.Generic.HashSet[int]]::new()
+    try {
+        Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object { [void] $pids.Add([int] $_.OwningProcess) }
+    } catch { }
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.CommandLine -and
-            $_.CommandLine -like "*$venvPy*" -and
-            $_.CommandLine -like '*uvicorn*'
-        }
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Py*" -and $_.CommandLine -like '*uvicorn*' } |
+        ForEach-Object { [void] $pids.Add([int] $_.ProcessId) }
+    return @($pids)
 }
 
 function Get-WatchdogProcesses {
@@ -144,15 +155,17 @@ function Start-Watchdog {
 }
 
 function Stop-App {
-    $procs = @(Get-AppProcesses)
-    if ($procs.Count -eq 0) { Write-Log 'INFO' '应用未运行'; return }
-    foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+    $pids = @(Get-AppProcesses)
+    if ($pids.Count -eq 0) { Write-Log 'INFO' '应用未运行'; return }
+    foreach ($processId in $pids) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
     # 等端口真正释放，否则新进程会撞上 address in use
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
         if (@(Get-AppProcesses).Count -eq 0) { break }
     }
-    Write-Log 'OK' "已停应用（$($procs.Count) 个进程）"
+    $left = @(Get-AppProcesses).Count
+    if ($left -gt 0) { throw "停应用后仍有 $left 个进程占着端口 $Port" }
+    Write-Log 'OK' "已停应用（$($pids.Count) 个进程）"
 }
 
 function Start-App {
