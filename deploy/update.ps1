@@ -38,6 +38,15 @@
 .PARAMETER SkipBackup
     跳过数据库备份。仅用于确认无数据的全新环境，日常绝不要用。
 
+.PARAMETER NoRollback
+    失败时不回滚，保持现场。用于「已经确认失败来自本脚本自身的误报」这类情况——
+    自动回滚在那时只会把刚拉来的修复一起还原掉，反而挡住自愈。
+    用完请自行确认服务状态。
+
+.PARAMETER NoSelfHeal
+    回滚时连 deploy\ 也一并回退（默认会把它留在新版，好让下次更新用上修好的脚本）。
+    只在需要精确复现某个旧版本行为时使用。
+
 .EXAMPLE
     .\deploy\update.ps1
     检查并更新到最新，失败自动回滚。
@@ -65,7 +74,9 @@ param(
     [string] $Branch        = 'main',
     [switch] $Force,
     [switch] $CheckOnly,
-    [switch] $SkipBackup
+    [switch] $SkipBackup,
+    [switch] $NoRollback,
+    [switch] $NoSelfHeal
 )
 
 $ErrorActionPreference = 'Stop'
@@ -547,6 +558,17 @@ $BackupDir = Join-Path $DataDir 'backups'
 Write-Log 'INFO' "数据目录：$DataDir"
 
 $dirty = @(& git -C $Root status --porcelain)
+# 上一次失败回滚时特意把 deploy/ 留在了新版（见回滚段的说明），它会在这里
+# 显示为「已修改」。那是本脚本自己干的、且正是自愈所依赖的状态，不能因此拒绝执行。
+if ($dirty.Count -gt 0) {
+    $nonDeploy = @($dirty | Where-Object { $_ -notmatch '^\s*\S+\s+deploy[/\\]' })
+    if ($nonDeploy.Count -eq 0) {
+        Write-Log 'INFO' "deploy\ 相对 HEAD 有改动（上次回滚保留的新版脚本），继续"
+        $dirty = @()
+    } else {
+        $dirty = $nonDeploy
+    }
+}
 if ($dirty.Count -gt 0) {
     if (-not $Force) {
         Write-Log 'ERR' "工作区有 $($dirty.Count) 处未提交改动，已中止："
@@ -637,12 +659,41 @@ try {
 }
 catch {
     Write-Log 'ERR' "更新失败：$($_.Exception.Message)"
+    if ($NoRollback) {
+        Write-Log 'WARN' '已指定 -NoRollback：保持现场不回滚'
+        Write-Log 'WARN' "  代码停在 $($newCommit.Substring(0,7))，数据库备份：$backup"
+        Write-Log 'WARN' "  请自行确认服务状态；需要回退时用：git reset --hard $($oldCommit.Substring(0,7))"
+        if ($watchdogWasRunning) { Start-Watchdog }
+        exit 1
+    }
     Write-Log 'STEP' '开始回滚...'
     $rolledBack = $true
     try {
         Stop-App
         & git -C $Root reset --hard $oldCommit | Out-Null
         Write-Log 'OK' "代码已回退到 $($oldCommit.Substring(0,7))"
+
+        # 代码回退，但 deploy/ 留在新版——这一条是为了打破一个死锁：
+        #
+        #   本脚本自身有缺陷 → 更新触发回滚 → 回滚把刚拉来的修复一起还原掉
+        #   → 下次仍从旧脚本开始 → 又回滚 …… 于是「脚本自身的任何缺陷」
+        #   都永久无法通过更新修复，只能人工介入。
+        #
+        # deploy/ 是元层：它管的是「怎么更新」，不是「跑什么代码」。让它保持最新，
+        # 比让它与业务代码版本一致更重要。下次跑更新时用的就是修好的逻辑。
+        if (-not $NoSelfHeal) {
+            try {
+                & git -C $Root checkout $newCommit -- 'deploy' 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log 'OK' "deploy\ 保留在新版 $($newCommit.Substring(0,7))（下次更新即用修好的脚本）"
+                    Write-Log 'INFO' '  这会让工作区相对 HEAD 显示为「已修改」，属预期；下次更新会自动消化'
+                } else {
+                    Write-Log 'WARN' 'deploy\ 未能保留新版，若本次失败源于更新脚本自身，需人工处理'
+                }
+            } catch {
+                Write-Log 'WARN' "deploy\ 保留新版失败：$($_.Exception.Message)"
+            }
+        }
 
         if ($backup) { Restore-Database -BackupPath $backup }
 
