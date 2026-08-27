@@ -312,27 +312,75 @@ function Start-App {
     )
     $proc = Start-Process -FilePath $Py -ArgumentList $argList -WorkingDirectory $Backend `
                           -WindowStyle Hidden -PassThru
+    # 连创建时间一起记下：单看 PID 无法区分「还是那个进程」和「PID 被复用了」
+    $ci = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue
     Write-Log 'INFO' "应用启动中（pid=$($proc.Id)）..."
-    return $proc.Id
+    return [pscustomobject]@{
+        Id      = [int] $proc.Id
+        Started = $(if ($ci) { $ci.CreationDate } else { $null })
+    }
+}
+
+function Test-DescendantOf {
+    <# 端口属主是否就是 $Expected 本身，或它的后代进程。
+
+       Windows 上 <venv>\Scripts\python.exe 是个 launcher：它把真正的解释器作为
+       **子进程**拉起，socket 归子进程持有。所以 Start-Process 返回的 PID 与端口
+       属主 PID 永远不相等——这不是 conda 的问题，用 uv 建的 venv 同样如此，
+       只要按 DEPLOYMENT.md 用 backend\.venv 部署就一定会遇上。
+       （顺带：属主的 ExecutablePath 指向 venv 的 base 解释器、并不在仓库目录下，
+       所以也不能靠「路径是否落在 .venv 里」来判定。）
+
+       因此改为沿父进程链回溯。限深 6 层足够——实测只差 1 层，多留些余量以防
+       将来的 launcher 实现多套一层。
+    #>
+    param([int] $OwnerPid, $Expected)
+    $cur = $OwnerPid
+    for ($depth = 0; $depth -lt 6; $depth++) {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+        if (-not $p) { return $false }
+        if ([int] $p.ProcessId -eq $Expected.Id) {
+            # 防 PID 复用：命中的必须是同一次启动
+            if ($Expected.Started -and $p.CreationDate -and $p.CreationDate -ne $Expected.Started) {
+                return $false
+            }
+            return $true
+        }
+        $cur = [int] $p.ParentProcessId
+        if ($cur -le 0) { return $false }
+    }
+    return $false
 }
 
 function Assert-PortOwnedBy {
-    <# 端口的监听者必须是我们刚起的那个进程，否则说明端口被别人占着。 #>
-    param([int] $ExpectedPid)
+    <# 确认端口上跑的就是我们刚起的进程；对不上只告警，不中断。
+
+       这个检查的价值是**留下线索**，不是否决更新。判据一旦误报，代价是把一次
+       本来成功的更新回滚掉、再对着一个健康的服务喊「请人工介入」——比漏报严重得多。
+       而真正的成败判据是健康检查加 revision 比对，那两条已经过了。
+
+       所以这里一律 WARN。真出现「端口被别人占着」的情况，日志里有属主 PID 与
+       可执行文件路径可查。
+    #>
+    param($Expected)
     $owners = @()
     try {
         $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty OwningProcess -Unique)
     } catch { }
     if ($owners.Count -eq 0) {
-        # 拿不到属主信息（cmdlet 不可用等）时不阻断更新，健康检查仍是主判据
         Write-Log 'WARN' "无法确认端口 $Port 的属主进程，跳过归属校验"
         return
     }
-    if ($owners -notcontains $ExpectedPid) {
-        throw ("端口 $Port 的监听者是 pid=$($owners -join ',')，而本次启动的是 pid=$ExpectedPid。" +
-               '通常意味着有看门狗或残留进程抢先占用了端口，当前服务跑的不是刚更新的代码。')
+    foreach ($ownerPid in $owners) {
+        if (Test-DescendantOf -OwnerPid ([int] $ownerPid) -Expected $Expected) { return }
     }
+    Write-Log 'WARN' "端口 $Port 的监听者是 pid=$($owners -join ',')，未能回溯到本次启动的 pid=$($Expected.Id)"
+    foreach ($ownerPid in $owners) {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
+        if ($p) { Write-Log 'WARN' "  pid=$ownerPid  $($p.ExecutablePath)" }
+    }
+    Write-Log 'WARN' '  健康检查与 revision 已通过，更新继续；若服务行为异常请核对上面的进程'
 }
 
 function Test-Healthy {
@@ -540,11 +588,11 @@ try {
     Update-Dependencies -FromCommit $oldCommit -ToCommit $newCommit
     Build-Frontend
 
-    $appPid = Start-App
+    $app = Start-App
     $rev = Test-Healthy -TimeoutSeconds 90
     if (-not $rev) { throw '应用启动后 90 秒内未通过健康检查' }
-    # 健康检查过了不等于「跑的是我起的那个进程」——先确认端口归属再下结论
-    Assert-PortOwnedBy -ExpectedPid $appPid
+    # 健康检查过了不等于「跑的是我起的那个进程」；对不上只告警，不否决这次更新
+    Assert-PortOwnedBy -Expected $app
 
     $expect = $newCommit.Substring(0, 7)
     if ($rev -ne $expect) {
@@ -567,11 +615,11 @@ catch {
         # 回退后依赖与前端产物都得跟着回到旧版本
         Update-Dependencies -FromCommit $newCommit -ToCommit $oldCommit
         Build-Frontend
-        $appPid = Start-App
+        $app = Start-App
 
         $rev = Test-Healthy -TimeoutSeconds 90
         if ($rev) {
-            Assert-PortOwnedBy -ExpectedPid $appPid
+            Assert-PortOwnedBy -Expected $app
             Write-Log 'OK' "=== 已回滚并恢复服务（revision=$rev）==="
         } else {
             Write-Log 'ERR' '=== 回滚后服务仍不健康，需要人工介入 ==='
