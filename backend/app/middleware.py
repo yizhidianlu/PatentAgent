@@ -17,6 +17,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from .db import database as db
 from .services import auth as auth_service
 
 logger = logging.getLogger(__name__)
@@ -68,17 +69,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not session_id:
             return _unauthorized("尚未登录，请先登录")
 
-        session = auth_service.load_session(session_id)
+        # 这几次查库必须经 db.arun 丢到线程池 —— 它们是同步 sqlite3 调用，
+        # 直接在这里 await 之外执行等于在事件循环线程里做阻塞 IO。
+        # 中间件跑在**每一个** API 请求上，一次请求两次同步读；平台又是单进程，
+        # 长流水线正跑着时，这些阻塞会直接叠加到所有并发请求的延迟上。
+        session = await db.arun(auth_service.load_session, session_id)
         if not session:
             return _unauthorized("登录已过期，请重新登录")
 
-        user = auth_service.get_user_row(session["user_id"])
+        user = await db.arun(auth_service.get_user_row, session["user_id"])
         if not user:
-            auth_service.destroy_session(session_id)
+            await db.arun(auth_service.destroy_session, session_id)
             return _unauthorized("账号不存在，请重新登录")
         if (user.get("status") or "active") != "active":
             # 管理员停用账号后，已签发会话立即作废
-            auth_service.destroy_user_sessions(user["id"])
+            await db.arun(auth_service.destroy_user_sessions, user["id"])
             return _unauthorized("账号已被停用，请联系管理员")
 
         # CSRF：非幂等方法必须带正确的 token

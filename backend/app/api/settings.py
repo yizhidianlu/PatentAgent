@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from ..db import database as db
 from ..models.settings import (
@@ -34,12 +34,36 @@ from ..models.settings import (
     load_tolerant,
 )
 from ..services import llm as llm_service
-from .deps import current_user, require_admin
+from ..services import auth as auth_service
+from .deps import client_ip, current_user, require_admin
 
 router = APIRouter(prefix="/settings", tags=["设置"])
 
 #: 平台级配置（模型服务 / 向量与检索 / 图像生成）统一挂管理员依赖
 ADMIN_ONLY = [Depends(require_admin)]
+
+
+def _audit_settings(
+    admin: dict[str, Any],
+    request: Request,
+    section: str,
+    detail: dict[str, Any],
+) -> None:
+    """记一条平台级设置变更。
+
+    detail 只放「改成了什么形状」——模型名、开关、引擎选择这类，
+    **绝不放 api_key**：审计日志的查看门槛比设置页低（管理员都能翻历史），
+    把密钥写进去等于给它开第二个出口。密钥只留「是否被改过」这一个布尔。
+    """
+    auth_service.audit(
+        "settings_updated",
+        actor_id=admin["id"],
+        actor_name=admin["username"],
+        target_type="settings",
+        target_id=section,
+        detail=detail,
+        ip=client_ip(request),
+    )
 
 
 def _load_llm() -> LlmSettings:
@@ -92,9 +116,15 @@ async def get_llm() -> LlmSettings:
     return cfg.masked()
 
 
-@router.put("/llm", dependencies=ADMIN_ONLY, response_model=LlmSettings,
+@router.put("/llm", response_model=LlmSettings,
             summary="保存 LLM 配置（api_key 省略/为空/为掩码 = 不修改）")
-async def put_llm(body: LlmSettings) -> LlmSettings:
+async def put_llm(
+    body: LlmSettings,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> LlmSettings:
+    stored_key_before = (await db.arun(_load_llm)).api_key
+
     def op() -> LlmSettings:
         stored = _load_llm()
         merged = body.model_copy(update={"api_key": _keep_stored_key(body.api_key, stored.api_key)})
@@ -102,6 +132,16 @@ async def put_llm(body: LlmSettings) -> LlmSettings:
         return merged
 
     merged = await db.arun(op)
+    # 只留「密钥是否被改过」，不留密钥本身
+    await db.arun(
+        _audit_settings, admin, request, "llm",
+        {
+            "model": merged.model,
+            "base_url": merged.base_url,
+            "api_key_changed": bool(body.api_key and body.api_key != stored_key_before),
+            "supports_json_mode": merged.supports_json_mode,
+        },
+    )
     return merged.masked()
 
 
@@ -121,10 +161,14 @@ async def get_embedding() -> EmbeddingSettings:
     return cfg.masked()
 
 
-@router.put("/embedding", dependencies=ADMIN_ONLY, response_model=EmbeddingUpdateResult,
+@router.put("/embedding", response_model=EmbeddingUpdateResult,
             summary="保存 Embedding 配置（api_key 省略/为空/为掩码 = 不修改）；"
                     "dim 变化时返回 need_rebuild=true 提示需重建向量库")
-async def put_embedding(body: EmbeddingSettings) -> EmbeddingUpdateResult:
+async def put_embedding(
+    body: EmbeddingSettings,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> EmbeddingUpdateResult:
     def op() -> tuple[EmbeddingSettings, bool]:
         stored = _load_embedding()
         merged = body.model_copy(update={"api_key": _keep_stored_key(body.api_key, stored.api_key)})
@@ -133,6 +177,11 @@ async def put_embedding(body: EmbeddingSettings) -> EmbeddingUpdateResult:
         return merged, need_rebuild
 
     merged, need_rebuild = await db.arun(op)
+    await db.arun(
+        _audit_settings, admin, request, "embedding",
+        {"model": merged.model, "enabled": merged.enabled,
+         "dim": merged.dim, "need_rebuild": need_rebuild},
+    )
     return EmbeddingUpdateResult(settings=merged.masked(), need_rebuild=need_rebuild)
 
 
@@ -178,9 +227,13 @@ async def get_image_gen() -> ImageGenSettings:
     return cfg.masked()
 
 
-@router.put("/image-gen", dependencies=ADMIN_ONLY, response_model=ImageGenSettings,
+@router.put("/image-gen", response_model=ImageGenSettings,
             summary="保存图像生成配置（api_key 省略/为空/为掩码 = 不修改）")
-async def put_image_gen(body: ImageGenSettings) -> ImageGenSettings:
+async def put_image_gen(
+    body: ImageGenSettings,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> ImageGenSettings:
     def op() -> ImageGenSettings:
         stored = _load_image_gen()
         merged = body.model_copy(update={"api_key": _keep_stored_key(body.api_key, stored.api_key)})
@@ -188,6 +241,11 @@ async def put_image_gen(body: ImageGenSettings) -> ImageGenSettings:
         return merged
 
     merged = await db.arun(op)
+    await db.arun(
+        _audit_settings, admin, request, "image_gen",
+        {"enabled": merged.enabled, "model": merged.model,
+         "provider": merged.provider, "size": merged.size},
+    )
     return merged.masked()
 
 
@@ -206,7 +264,15 @@ async def get_general() -> GeneralSettings:
     return await db.arun(_load_general)
 
 
-@router.put("/general", dependencies=ADMIN_ONLY, response_model=GeneralSettings, summary="保存通用设置")
-async def put_general(body: GeneralSettings) -> GeneralSettings:
+@router.put("/general", response_model=GeneralSettings, summary="保存通用设置")
+async def put_general(
+    body: GeneralSettings,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> GeneralSettings:
     await db.arun(db.set_setting_json, "general", body.model_dump())
+    await db.arun(
+        _audit_settings, admin, request, "general",
+        {k: v for k, v in body.model_dump().items() if k != "api_key"},
+    )
     return body
