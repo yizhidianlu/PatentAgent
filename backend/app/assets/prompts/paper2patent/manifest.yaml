@@ -1,0 +1,102 @@
+# 引途医疗专利智能体 · 模块 B（论文转专利）prompt 资产清单
+# 约定：source_repo/source_path 指向 backend/app/assets/vendor/ 下的原文快照；
+# treatment: verbatim（逐字整份）| verbatim_split（逐字拆分片段）| adapted（改编）| new（新写）
+# 署名：paper2patent 全部条目来源 7toCR/paper2patent（MIT + CLAUSE.md），依 CLAUSE.md 显著注明来源。
+source_url: https://github.com/7toCR/paper2patent
+ported_version: 2026-08-25.1
+files:
+  - file: pro/role_task.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L117-L134
+    treatment: verbatim_split
+    notes: Pro Prompt 拆分之一：Role + Task；一字未改。
+  - file: pro/part1_abstract.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L135-L159
+    treatment: verbatim_split
+    notes: Output Structure 总述 + Part 1 说明书摘要。
+  - file: pro/part2_abstract_fig.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L160-L172
+    treatment: verbatim_split
+    notes: Part 2 摘要附图。
+  - file: pro/part3_claims.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L173-L270
+    treatment: verbatim_split
+    notes: Part 3 权利要求书（数量规划/独权/从权/示例框架/质量检查点）。
+  - file: pro/part4_description.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L271-L372
+    treatment: verbatim_split
+    notes: Part 4 说明书（结构框架 + 撰写质量标准）。
+  - file: pro/part5_drawings.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L373-L447
+    treatment: verbatim_split
+    notes: Part 5 说明书附图（基本规范/内容要求/命名编号）。
+  - file: pro/writing_methods.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L448-L500
+    treatment: verbatim_split
+    notes: Patent Writing Methods 方法一/二/三。
+  - file: pro/critical_rules.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L501-L575
+    treatment: verbatim_split
+    notes: Critical Rules 规则1-12（含15禁用词全表）。
+  - file: pro/content_constraints.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L576-L628
+    treatment: verbatim_split
+    notes: Content Constraints（语言表达/内容深度/结构层次）。
+  - file: pro/final_format.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L629-L896
+    treatment: verbatim_split
+    notes: Input Methodology + Execution Flow 四阶段 + Reflection & Verification + 反思与自我评估 + Patent Conversion Notes + Template Version Information + Final Output Format；10 个 pro/*.md 按行号顺序拼接可还原 Pro Prompt 全文（L117-L896）。
+  - file: flash.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L54-L109
+    treatment: verbatim
+    notes: 『论文转专利 Flash』Prompt 逐字；快速档单调用流式。
+  - file: drawing_image_prompt.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md#L911-L994
+    treatment: verbatim
+    notes: 『专利附图生成（Gemini）』Prompt 逐字；供可选图像模型精修与导出给用户。
+  - file: input_assessment.md
+    source_repo: 7toCR/paper2patent
+    source_path: skills/paper2patent/references/input-requirements.md
+    treatment: adapted
+    notes: B1 输入评估 STRUCT 调用；输出 {completeness,patentability_clues,fidelity_risks,drawing_readiness,gaps}。
+  - file: extraction.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md（Pro Prompt Patent Writing Methods 方法一/二）
+    treatment: new
+    notes: B2 深读提取 STRUCT 调用；输出含 source_map，source_quote 必须论文原文逐字摘录。
+  - file: claims_spec_rules.md
+    source_repo: 7toCR/paper2patent
+    source_path: skills/paper2patent/references/claims-and-specification-rules.md
+    treatment: verbatim
+    notes: 整份逐字复制（含原 CRLF 字节）；权利要求/说明书生成与 REPAIR 调用注入。
+  - file: drawing_rules.md
+    source_repo: 7toCR/paper2patent
+    source_path: skills/paper2patent/references/drawing-generation.md
+    treatment: verbatim
+    notes: 整份逐字复制（含原 CRLF 字节）；附图规格调用注入；脚本执行由服务端 services/drawings.py 承担。
+  - file: quality_check.md
+    source_repo: 7toCR/paper2patent
+    source_path: skills/paper2patent/references/quality-checklist.md
+    treatment: adapted
+    notes: B7 质检 AUDIT；五类清单正文逐字保留（行尾统一 LF），输出改补丁契约 {verdict,patches,unresolved}。
+  - file: workflow_notes.md
+    source_repo: 7toCR/paper2patent
+    source_path: skills/paper2patent/references/text-conversion-workflow.md
+    treatment: adapted
+    notes: 五部分内容模型与 JSON 字段映射保留；执行顺序标注「由平台代码执行」。
+  - file: faithfulness_audit.md
+    source_repo: 7toCR/paper2patent
+    source_path: README.md（Pro Prompt Critical Rules 规则9/10 + Flash 绝对红线）
+    treatment: new
+    notes: B4b 忠实性审计 AUDIT；断言逐条落源，落不了源列入 unsourced。

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Yintu AI — 引途医疗专利智能体">
+  <defs>
+    <linearGradient id="yintu-brand" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#61d0e2"/>
+      <stop offset="0.5" stop-color="#492497"/>
+      <stop offset="1" stop-color="#d13870"/>
+    </linearGradient>
+  </defs>
+  <!-- 方形图标。品牌名「Yintu」作主体居中偏下，「AI」缩为右上角小角标：
+       主体独占一行可用更大字号（24px header 仍清晰），AI 不抢视觉重心。 -->
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#yintu-brand)"/>
+  <text x="30" y="41" text-anchor="middle"
+        font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif"
+        font-size="19" font-weight="700" fill="#ffffff" letter-spacing="-0.3">Yintu</text>
+  <text x="51" y="19" text-anchor="middle"
+        font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif"
+        font-size="10.5" font-weight="700" fill="#ffffff" opacity="0.88" letter-spacing="0.3">AI</text>
+</svg>

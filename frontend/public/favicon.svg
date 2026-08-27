@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Yintu AI">
+  <defs>
+    <linearGradient id="yintu-fav" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#61d0e2"/>
+      <stop offset="0.5" stop-color="#492497"/>
+      <stop offset="1" stop-color="#d13870"/>
+    </linearGradient>
+  </defs>
+  <!-- 浏览器标签只有 16px：两行文字必糊，故 favicon 只取品牌首字母「Y」。
+       完整字标见 logo.svg（与 Google favicon 只放 G 同理）。 -->
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#yintu-fav)"/>
+  <text x="32" y="34" text-anchor="middle" dominant-baseline="central"
+        font-family="Segoe UI, -apple-system, BlinkMacSystemFont, Helvetica Neue, Arial, sans-serif"
+        font-size="38" font-weight="800" fill="#ffffff" letter-spacing="-1">Y</text>
+</svg>

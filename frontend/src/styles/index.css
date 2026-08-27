@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+@custom-variant dark (&:where(.dark, .dark *));
+@custom-variant touch (@media (pointer: coarse));
+@custom-variant tablet-landscape (@media (min-width:768px) and (max-width:1366px) and (orientation:landscape));
+@custom-variant desktop (@media (min-width:1025px));
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+               "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --color-primary-500: #6366f1;  --color-primary-600: #5558e6;
+  --color-brand-cyan: #61d0e2;  --color-brand-purple: #492497;  --color-brand-pink: #d13870;
+  --color-accent-orange: #f97316;
+  --radius-sm:.25rem; --radius-md:.375rem; --radius-lg:.5rem;
+  --radius-xl:.75rem; --radius-2xl:1rem;  --radius-3xl:1.5rem;
+  --blur-sm:8px; --blur-md:12px; --blur-xl:24px;
+  --default-transition-duration:.15s;
+  --default-transition-timing-function:cubic-bezier(.4,0,.2,1);
+  --ease-smooth: cubic-bezier(.25,.1,.25,1);
+  --animate-shimmer: shimmer 1.6s infinite;
+  --animate-glow: glow 1.5s ease-in-out infinite alternate;
+  --animate-pulse-glow: pulse-glow 2s infinite;
+  --animate-badge-shimmer: badge-shimmer 3s linear infinite;
+  --animate-fade-in-scale: fadeInScale .3s ease-out both;
+  --animate-float: float 3s ease-in-out infinite;
+}
+
+:root{
+  --app-header-h:56px;
+  --z-hide:-1; --z-base:0; --z-raised:10; --z-sticky:1000; --z-header:1100;
+  --z-fab:1200; --z-dropdown:1300; --z-drawer:1400;
+  --z-modal:101500; --z-popover:101600; --z-toast:101900; --z-tooltip:102000;
+  --theme-transition-duration:.3s;
+}
+
+@layer base {
+  html{ scroll-behavior:smooth }
+  body{ -webkit-font-smoothing:antialiased; font-feature-settings:"rlig" 1,"calt" 1;
+    transition-property:color,background-color,border-color; transition-duration:var(--theme-transition-duration); }
+  /* 顺序不可调换：:root 在前、.dark 在后，等特异性下后者胜出（与参考站一致） */
+  :root{ color-scheme:light }
+  .dark{ color-scheme:dark }
+  ::selection{color:#1e3a8a;background-color:#dbeafe}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:0 0}
+  ::-webkit-scrollbar-thumb{background-color:#9ca3af80;background-clip:content-box;
+    border:3px solid #0000;border-radius:99px}
+  ::-webkit-scrollbar-thumb:hover{background-color:#9ca3afcc}
+  ::-webkit-scrollbar-button{background-color:#0000;width:6px;height:6px}
+  .dark ::-webkit-scrollbar-thumb{background-color:#4b556380}
+  .dark ::-webkit-scrollbar-thumb:hover{background-color:#4b5563cc}
+  .scrollbar-thin::-webkit-scrollbar{width:6px;height:6px}
+}
+
+@utility glass-effect { backdrop-filter:blur(16px) saturate(180%); background-color:#ffffffd9;
+  border:1px solid #ffffff20; .dark &{background-color:#111928d9} }
+@utility glass-card { backdrop-filter:blur(10px); background:#ffffff1a; border:1px solid #fff3;
+  border-radius:1rem; .dark &{background:#0003;border-color:#ffffff1a} }
+@utility glass-morphism { background:rgba(255,255,255,.1); backdrop-filter:blur(10px);
+  border:1px solid rgba(255,255,255,.2); box-shadow:0 8px 32px rgba(31,38,135,.37) }
+
+/*
+ * 无障碍：prefers-reduced-motion 时停掉大幅位移/缩放动画与主题过渡，
+ * 但保留纯不透明度脉冲（animate-pulse / spin），否则「生成中 / 待确认 / 加载中」
+ * 三类进行时指示会静止到无法分辨。framer-motion 侧由 App 的
+ * <MotionConfig reducedMotion="user"> 统一降级（宽度/位移/高度动画）。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    animation-delay: 0ms !important;
+    transition-duration: .01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+  .animate-pulse {
+    animation: pulse 2s cubic-bezier(.4,0,.6,1) infinite !important;
+  }
+  .animate-spin {
+    animation: spin 1s linear infinite !important;
+  }
+  /* 位移扫光 / 浮动：彻底取消（reduce 下最刺激的两类） */
+  .animate-shimmer, .animate-badge-shimmer, .animate-float,
+  .animate-pulse-glow, .animate-glow {
+    animation: none !important;
+  }
+}
+
+@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+@keyframes glow{0%{box-shadow:0 0 5px rgba(59,130,246,.5)}to{box-shadow:0 0 20px rgba(59,130,246,.8),0 0 30px rgba(59,130,246,.6)}}
+@keyframes pulse-glow{0%,to{box-shadow:0 0 #3b82f666}50%{box-shadow:0 0 0 10px #3b82f600}}
+@keyframes badge-shimmer{0%{background-position:200% 0}to{background-position:-200% 0}}
+@keyframes fadeInScale{0%{opacity:0;transform:scale(.8)}60%{opacity:1;transform:scale(1.05)}to{opacity:1;transform:scale(1)}}
+@keyframes float{0%,to{transform:translateY(0)}50%{transform:translateY(-10px)}}

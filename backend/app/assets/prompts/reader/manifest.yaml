@@ -1,0 +1,46 @@
+# 引途医疗专利智能体 · 模块 C（专利解读）prompt 资产清单
+# 约定：source_repo/source_path 指向 backend/app/assets/vendor/ 下的原文快照；
+# treatment: verbatim | verbatim_split | adapted | new
+source_url: https://github.com/handsomestWei/patent-disclosure-skill
+ported_version: 2026-08-25.1
+files:
+  - file: claim_tree.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/patent_plain_reader.md#第1.55步
+    treatment: adapted
+    notes: C2 权要树抽取 STRUCT；输出 {claims:[{no,type,refs,ref_mode,preamble,features:[{fid,text}]}],ambiguities}；多引用消歧规则保留；树 lint 由平台代码执行。
+  - file: claim_deltas.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/patent_plain_reader.md#第1.6步
+    treatment: adapted
+    notes: C3 每权 12-40 字白话增量 STRUCT；写作规则与示例沿用源 skill；长度校验由平台执行。
+  - file: report_template.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: assets/patent_note_template.md
+    treatment: adapted
+    notes: 11 节结构逐字保留（L18-19+L27-114，行尾统一 LF）；Obsidian frontmatter→报告 meta JSON；callout→站内 block 类型映射表；Obsidian 导航区删除。
+  - file: report_style.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/patent_plain_reader.md#L53,L55,L274,L389
+    treatment: adapted
+    notes: 风格纪律四段逐字抽取（标题纪律/实现痕迹禁令/说明书段落依据/查新一致性）+ 平台适配说明；注入模块 C 全部 GEN 调用。
+  - file: report_writer.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/patent_plain_reader.md#第4步
+    treatment: adapted
+    notes: C5 三次 GEN 调用分工（①结构节三四五六 ②叙事节一二七八九 ③附录十/十一）；删 Obsidian 环境探测、取证与入库脚本指令。
+  - file: grounding.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/patent_plain_reader.md#第1.5/2步 + references/ipc_application_hints.yaml
+    treatment: adapted
+    notes: C4 落地线索 STRUCT；ipc_application_hints 注入说明；anchor_fits 硬性=每条锚定说明书段落号；统一「推断自公开文本，未联网核验」标注；离线化（原 WebSearch 路径弃用）。
+  - file: self_check.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/patent_reader_self_check.md
+    treatment: adapted
+    notes: C7 自检 AUDIT 补丁契约 {verdict,patches,unresolved}；弃用 Obsidian 专属核对项（Canvas/入库/插件引导/cssclasses）。
+  - file: type_hooks.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/reader/type_hooks.md
+    treatment: adapted
+    notes: 种类码判型兜底 STRUCT；判定顺序保留；脚本判定改为服务端主路径；实用/外观改为报告增设「结构说明」「外观要点」节说明。

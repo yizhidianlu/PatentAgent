@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=4" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>引途医疗专利智能体</title>
+    <script>(function(){try{
+  var t=localStorage.getItem('pa-theme')||'system',d;
+  if(t==='dark')d=true;else if(t==='light')d=false;
+  else if(t==='auto'){var h=new Date().getHours();d=(h>=18||h<6);}
+  else d=matchMedia('(prefers-color-scheme: dark)').matches;
+  var e=document.documentElement;e.classList.add(d?'dark':'light');e.dataset.theme=d?'dark':'light';
+}catch(e){}})();</script>
+  </head>
+  <body
+    class="bg-gradient-to-br from-slate-50 via-blue-50/30 to-indigo-50/50
+             dark:from-gray-900 dark:via-gray-800/30 dark:to-slate-900/50
+             text-gray-900 dark:text-gray-100 antialiased"
+  >
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

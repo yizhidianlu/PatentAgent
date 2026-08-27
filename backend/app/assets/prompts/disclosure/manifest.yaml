@@ -1,0 +1,164 @@
+# 引途医疗专利智能体 · 模块 A（专利交底书）prompt 资产清单（含 common/ 公共层）
+# 约定：source_repo/source_path 指向 backend/app/assets/vendor/ 下的原文快照；
+# treatment: verbatim（逐字整份）| adapted（改编：规则正文逐字、宿主指令剥离）| new（新写）
+# 署名：除标注 new 者外，全部条目来源 handsomestWei/patent-disclosure-skill（MIT）。
+source_url: https://github.com/handsomestWei/patent-disclosure-skill
+ported_version: 2026-08-25.1
+files:
+  # ---------- common/（公共注入层，路径相对 backend/app/assets/prompts/） ----------
+  - file: ../common/system_base.md
+    source_repo: null
+    source_path: null
+    treatment: new
+    notes: 平台角色头（阶段执行者定位 + 输出纪律：不输出内部分析、不提及自检清单、按指定格式输出）；所有调用 system prompt 首段。
+  - file: ../common/desensitization.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/disclosure_builder.md#§7.5
+    treatment: adapted
+    notes: 脱敏规则正文逐字抽出；仅 §7.9 行内引用改为 common/terminology_rules.md。所有 GEN 调用注入。
+  - file: ../common/terminology_rules.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/disclosure_builder.md#§7.9
+    treatment: adapted
+    notes: 术语/标题贯穿规则逐字；文末新增 terminology_sheet 注入说明与 terms_delta 围栏块输出约定（GEN 调用文末必附）。
+  # ---------- disclosure/ 顶层 ----------
+  - file: intake.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/intake.md
+    treatment: adapted
+    notes: 三问话术/默认规则/总结性反问模板逐字（兼前端表单文案与复述指令）；类型路由表与 --type 工具参数删除（平台处理）。
+  - file: material_digest.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/project_scan.md
+    treatment: adapted
+    notes: 改编为逐文件消化 STRUCT 调用；优先级表与按类型加扫表逐字；Office/CAD/线稿/示例案件宿主步骤删除；输出 {file,priority,summary_zh,tech_points,components,figures_mentioned,sensitive_hits,type_signals}。
+  - file: prior_art/search_terms.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/prior_art_search.md#§A.4
+    treatment: adapted
+    notes: 检索词构造规则逐字；宿主探测/执行命令删除；输出 {blocks[2-8],type_param,rationale}。
+  - file: prior_art/abstract_digest.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/prior_art_search.md#§A.6-A.7+分析要求+记录习惯
+    treatment: adapted
+    notes: abstract 必用三条+分析要求逐字；「缺失时补全」改为保守概括防编造（平台无浏览）；URL 只准照抄 link；输出 digests JSON（每批≤8条）。
+  - file: prior_art/section_1_1_writer.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/prior_art_search.md#1.1检索说明写法 + prompts/disclosure/invention/template_reference.md#§1.1
+    treatment: adapted
+    notes: 检索说明须写/禁写清单与示例段落逐字；新增「未检索时如实写明、禁止编造」硬规则（对应 A4 跳过分支）。
+  - file: preview.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/disclosure_preview.md
+    treatment: adapted
+    notes: 类型路由（摘要口径）与「摘要应包含」逐字；可选确认语删除（平台暂停点 UI）；输出结构化摘要 markdown。
+  - file: self_check_invention.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/disclosure_self_check.md#§8.1+§8.2+§8.3
+    treatment: adapted
+    notes: 8.1/8.2 逐字（脚本调用改「平台已复算」）；8.3 取正文可核项，删服务端/对话职责条目；输出补丁契约 {verdict,patches[],unresolved[]}。
+  - file: self_check_utility.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/disclosure_self_check.md#§8.1+§8.3+§8.4
+    treatment: adapted
+    notes: 组合按移植规格；8.4 末条 image_gen 线稿流程改 v1 表述；输出补丁契约。
+  - file: self_check_design.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/disclosure_self_check.md#§8.1+§8.3+§8.5
+    treatment: adapted
+    notes: 组合按移植规格；8.5 中 image_gen 线稿条改 v1 表述；输出补丁契约。
+  # ---------- disclosure/iteration/ ----------
+  - file: iteration/intent_router.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/iteration_context.md
+    treatment: adapted
+    notes: 意图判别表逐字；改编为 IT0 STRUCT 分类调用，新增 question/new_case；输出 {intent,rationale,evidence}。
+  - file: iteration/merger.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/merger.md
+    treatment: adapted
+    notes: 合并流程七步与「## 合并摘要（留档）」格式逐字；执行门禁/落盘/修订记录改平台职责；CAD 分支删除；文末新增合并元信息 JSON 契约。
+  - file: iteration/correction.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/correction_handler.md
+    treatment: adapted
+    notes: 纠正分类规则（事实/术语/公式体例/查新/保护点/附图六分支）与「## 纠正摘要（留档）」格式逐字；门禁/落盘改平台职责；文末新增纠正元信息 JSON 契约。
+  # ---------- disclosure/invention/ ----------
+  - file: invention/points.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/patent_points_analyzer.md
+    treatment: adapted
+    notes: Step3-4 挖掘与融合规则逐字；输出 {candidates[3-5]{id,title,background,innovation,distinction,feasibility,score},recommended,fusion_note}。
+  - file: invention/builder_core.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/disclosure_builder.md#§7.1+§7.2
+    treatment: adapted
+    notes: 六章结构+文头模板+1.1 硬性要求+禁止条款逐字；§7.3 已代码化；§7.4-7.9 拆至各规则文件；定稿交付/OMML/STEP 宿主节删除。
+  - file: invention/mermaid_rules.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/disclosure_builder.md#§7.4
+    treatment: adapted
+    notes: §7.4 三条要点逐字；渲染工具括注改「平台服务端渲染 PNG」。
+  - file: invention/formula_style.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/disclosure_builder.md#§7.7
+    treatment: adapted
+    notes: 符号表先行/下标上标/LaTeX 分隔/跨节一致逐字；formula_plan 前置流程改平台 G4 门禁表述。
+  - file: invention/claim_bias.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/disclosure_builder.md#§7.6
+    treatment: adapted
+    notes: 「禁止捏造偏向」与句式模板逐字；输出 {groups[{axis,option_a{label,basis_quote},option_b}]}，basis_quote 须为终稿子串（服务端校验）。
+  - file: invention/template_reference.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/invention/template_reference.md
+    treatment: verbatim
+    notes: 整体逐字复制；文内原仓库脚本名按 verbatim 保留，泄漏由 system_base 约束 + 服务端 lint 兜底。
+  # ---------- disclosure/utility_model/ ----------
+  - file: utility_model/points.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/utility_model/patent_points.md
+    treatment: adapted
+    notes: 要求表与图际启发式表逐字；输出 candidates[2-4]+type_mismatch_note JSON 契约。
+  - file: utility_model/builder.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/utility_model/disclosure_builder.md
+    treatment: adapted
+    notes: 7.1/7.2/7.4/7.5 及图示纪律逐字；线稿生成改用户上传（v1）；7.6 自检节删除（独立阶段）。
+  - file: utility_model/template_reference.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/utility_model/template_reference.md
+    treatment: verbatim
+    notes: 整体逐字复制。
+  # ---------- disclosure/design/ ----------
+  - file: design/points.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/design/patent_points.md
+    treatment: adapted
+    notes: 要求表与多视启发式表逐字；输出 candidates[1-3]+type_mismatch_note JSON 契约。
+  - file: design/builder.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/design/disclosure_builder.md
+    treatment: adapted
+    notes: 7.1/7.2/7.3 逐字（线稿生成改用户上传、查新参数改平台）；7.4 命名交付改平台职责；7.5 自检节删除。
+  - file: design/template_reference.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/disclosure/design/template_reference.md
+    treatment: verbatim
+    notes: 整体逐字复制。
+  # ---------- disclosure/shared/ ----------
+  - file: shared/fill_structure_schema.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/shared/fill_structure_schema.md + references/schemas/structure.schema.yaml
+    treatment: adapted
+    notes: 识图纪律保留；输出对齐 structure.schema.yaml 字段（YAML 骨架逐字嵌入）；宿主落盘/CAD/线稿生成删除。
+  - file: shared/fill_appearance_schema.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/shared/fill_appearance_schema.md + references/schemas/appearance.schema.yaml
+    treatment: adapted
+    notes: 先判再收图/正投影五步保留（五步逐字）；输出对齐 appearance.schema.yaml 字段（YAML 骨架逐字嵌入）。
+  - file: manifest.yaml
+    source_repo: null
+    source_path: null
+    treatment: new
+    notes: 本清单；驱动搬运脚本与 NOTICE 校验。

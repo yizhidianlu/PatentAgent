@@ -1,0 +1,36 @@
+# 引途医疗专利智能体 · 模块 D（审查意见答复）prompt 资产清单
+# 约定：source_repo/source_path 指向 backend/app/assets/vendor/ 下的原文快照；
+# treatment: verbatim | verbatim_split | adapted | new
+source_url: https://github.com/handsomestWei/patent-disclosure-skill
+ported_version: 2026-08-25.1
+files:
+  - file: guardrails.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/oa/guardrails.md
+    treatment: adapted
+    notes: 「定位」「禁止」「人审闸门」规则正文逐字保留（L3-18、L36-41）；人审闸门改编为平台暂停点 P1-P4 说明；「配置」节改编为设置页表单说明（configure_embedding.md 问答与 config.py 脚本弃用）；注入模块 D 全部调用。
+  - file: notice_struct.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/oa/respond_office_action.md#步骤1 + references/schemas/oa_case.schema.yaml
+    treatment: adapted
+    notes: D1 通知书结构化 STRUCT；输出 {notice_kind,application_no,patent_type,deadline,issues:[{id,statute,defect_type,claims_involved,examiner_argument_digest,cited_documents}]}；附条款/缺陷类型枚举表；statute 照抄原文防幻觉；输出后强制 [PAUSE] 人审。
+  - file: case_note_template.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/oa/case_note_template.md
+    treatment: verbatim
+    notes: 全文逐字复制（含原字节）+ 外层 front-matter；D-ingest 草稿生成的结构模板。
+  - file: ingest_case.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/oa/ingest_case.md + references/schemas/oa_case.schema.yaml
+    treatment: adapted
+    notes: D-ingest 案例笔记草稿生成 STRUCT；frontmatter 枚举沿用 oa_case.schema；脱敏项登记 redactions 供人审；脚本与 Obsidian 落盘指令删除。
+  - file: strategy.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/oa/respond_office_action.md#步骤3
+    treatment: new
+    notes: D3 策略选项 STRUCT；每 issue 输出 {issue_id,options:[{strategy,rationale,risk,amendment_sketch}],recommended}；strategy 枚举 argue_only|amend_claims|amend_description|formal_fix；修改类选项强制超范围（专利法第33条）风险评估；输出后 [PAUSE] 人勾选。
+  - file: respond_issue.md
+    source_repo: handsomestWei/patent-disclosure-skill
+    source_path: prompts/oa/respond_office_action.md#步骤4
+    treatment: adapted
+    notes: D4 逐条起草 GEN（每 issue 一次流式调用）；逐条对应编号、案例引用带 case_id+差异、修改指向说明书支持位置（未知标「待发明人指认段落」）；amend_claims 输出修改对照表+修改后权项全文，服务端过权项 lint。

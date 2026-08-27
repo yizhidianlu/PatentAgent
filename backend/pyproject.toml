@@ -1,0 +1,50 @@
+[project]
+name = "patent-agent-backend"
+version = "0.1.0"
+description = "引途医疗专利智能体 — 后端（FastAPI + SQLite）"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.115",
+  "starlette>=0.37",                                         # app/main.py、app/api/oa.py 直接 import（不只依赖 fastapi 传递）
+  "uvicorn[standard]>=0.30",
+  "anyio>=4",                                                # db/pipelines/api 广泛直接 import anyio.to_thread
+  "pydantic>=2.8",
+  "pydantic-settings>=2.4",
+  "sse-starlette>=2.1",
+  "python-multipart>=0.0.9",
+  "openai>=1.60",                                            # OpenAI 兼容 chat + embedding（base_url 可配）
+  "httpx>=0.27",                                             # 连接测试 / 通用抓取
+  "playwright>=1.47",                                        # CNIPA 爬虫 + mermaid 渲染（channel=chrome，浏览器用本机 Chrome）
+  "python-docx>=1.1",
+  "latex2mathml>=3.77",                                      # md_to_docx OMML
+  "pymupdf>=1.24,<1.28",                                     # PDF→md（论文/OA通知书/专利PDF）；1.28 在本机 Win/Py3.13 DLL 加载失败
+  "mammoth>=1.8",                                            # docx_to_md.py 依赖
+  "python-pptx>=1.0",                                        # pptx_to_md.py 依赖
+  "lxml<6",                                                  # lxml 6.x 在本机 Win/Py3.13 DLL 加载失败，连累 python-docx/pptx
+  "pillow>=10",                                              # 附图 PNG / PDF 兜底
+  "pyyaml>=6",
+  "sqlite-vec>=0.1.6",                                       # OA 案例向量库（Windows/Py3.13 下加载可能失败，代码内按可选处理）
+  "docx2pdf>=0.1.8",
+  "pywin32>=306; sys_platform == 'win32'",                   # Word COM PDF
+  "python-ulid>=2",                                          # 主键 ULID（时间有序）
+  "argon2-cffi>=23",                                         # 账号系统：密码哈希（argon2id）
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+formula-png = ["matplotlib>=3.9"]                            # OMML 失败时公式转 PNG 的可选降级
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py313"
