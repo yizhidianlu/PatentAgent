@@ -47,6 +47,14 @@
     只看有什么更新，不动线上。
 
 .NOTES
+    退出码：
+      0  成功，或已是最新
+      1  更新失败，已回滚到更新前的状态
+      2  工作区有未提交改动，拒绝执行
+      3  更新成功，但看门狗没能起回来（服务当前无人守护）
+      4  连不上远端仓库，未做任何改动
+
+
     首次部署见 docs\DEPLOYMENT.md 与 docs\DEPLOY_CLOUDFLARE.md。
     双机协作规则见 docs\SYNC_PROTOCOL.md。
 #>
@@ -552,7 +560,33 @@ if ($dirty.Count -gt 0) {
 }
 
 # 1. 看看有没有更新
-Invoke-Step '拉取远端信息' { & git -C $Root fetch origin $Branch --quiet }
+#
+# fetch 带重试：到 GitHub 的 TLS 握手会被本地代理/网络抖动打断（实测报
+# 「schannel: failed to receive handshake」，重试一次即通）。这一步失败时
+# 还没动过任何东西——服务照常在跑、看门狗也没停——所以直接干净退出，
+# 不要抛未捕获异常吓人，也不要跟「更新失败已回滚」共用退出码。
+$fetched = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    Write-Log 'STEP' "拉取远端信息（第 $attempt 次）"
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        $fetchOut = & git -C $Root fetch origin $Branch --quiet 2>&1 | ForEach-Object { "$_" }
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if ($LASTEXITCODE -eq 0) { $fetched = $true; break }
+    Write-Log 'WARN' "拉取失败（exit=$LASTEXITCODE）：$(Format-Tail $fetchOut 4)"
+    if ($attempt -lt 3) { Start-Sleep -Seconds (3 * $attempt) }
+}
+if (-not $fetched) {
+    Write-Log 'ERR' '连不上远端仓库，本次未做任何改动；服务保持原状'
+    Write-Log 'ERR' '请检查网络/代理后重试（若本机开着 TUN 模式的代理，可先关掉再试）'
+    if ($script:StashRef) { & git -C $Root stash pop | Out-Null }
+    exit 4
+}
+
 $oldCommit = (& git -C $Root rev-parse HEAD).Trim()
 $newCommit = (& git -C $Root rev-parse "origin/$Branch").Trim()
 
