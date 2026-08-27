@@ -715,6 +715,7 @@ async def draft(ctx: Ctx) -> dict[str, Any]:
     }
 
     # ① 权利要求书（GEN，chat 通道流式；尾部 JSON 契约）
+    await ctx.progress("撰写权利要求书", index=1, total=5, waiting_for="模型")
     claims_system = assembler.assemble(CLAIMS_PARTS, runtime_ctx=common_ctx)
     claims_user = (
         "请基于上述深读提取产物撰写**权利要求书**（6-10 项，含 1-2 项独立权利要求）。\n"
@@ -733,6 +734,7 @@ async def draft(ctx: Ctx) -> dict[str, Any]:
     await _set_case_title(ctx, draft_claims.invention_name)
 
     # ② 说明书摘要（GEN，doc 通道；服务端校验失败触发 REPAIR）
+    await ctx.progress("撰写摘要", index=2, total=5, waiting_for="模型")
     abstract_system = assembler.assemble(
         ABSTRACT_PARTS,
         runtime_ctx={
@@ -774,6 +776,7 @@ async def draft(ctx: Ctx) -> dict[str, Any]:
         abstract_text = repaired.abstract.strip()
 
     # ③ 说明书（GEN×2：前三节 / 附图说明+具体实施方式，后者独占全额输出预算）
+    await ctx.progress("撰写说明书前三节", index=3, total=5, waiting_for="模型")
     desc_ctx = {
         **common_ctx,
         "extra": {
@@ -799,6 +802,12 @@ async def draft(ctx: Ctx) -> dict[str, Any]:
     )
     part1 = _split_sections(part1_md)
 
+    # 全流程最慢的一次调用：独占全额输出预算，实测可达二十多分钟
+    await ctx.progress(
+        "撰写附图说明与具体实施方式", index=4, total=5,
+        detail="本节最长，输出期间会持续有正文流入右侧文档面板",
+        waiting_for="模型",
+    )
     part2_md = await _stream_gen(
         ctx,
         tag="description.part2",
@@ -825,6 +834,7 @@ async def draft(ctx: Ctx) -> dict[str, Any]:
     }
 
     # ④ 附图规格（STRUCT，原图优先）
+    await ctx.progress("规划附图", index=5, total=5, waiting_for="模型")
     specs_system = assembler.assemble(
         DRAWING_SPEC_PARTS,
         runtime_ctx={
@@ -1409,7 +1419,14 @@ async def regenerate_drawings(
         if not failed:
             break
         progressed = False
-        for figure_no in failed:
+        for position, figure_no in enumerate(failed, start=1):
+            if ctx is not None:
+                await ctx.progress(
+                    "修复未通过校验的附图",
+                    index=position, total=len(failed),
+                    detail=f"图{figure_no}",
+                    waiting_for="模型",
+                )
             if await _try_repair(
                 work, figure_no, "画布留白过大或图内混入图题，validation.passes=false"
             ):
@@ -1446,6 +1463,12 @@ async def drawings(ctx: Ctx) -> dict[str, Any]:
     if not content:
         raise ValueError("缺少专利内容契约，无法生成附图")
 
+    planned = len(_figure_numbers(content))
+    await ctx.progress(
+        "生成说明书附图",
+        detail=f"共 {planned} 幅待成图" if planned else "",
+        waiting_for="附图脚本",
+    )
     result = await regenerate_drawings(ctx, ctx.case_id, content)
     content = result["content"]
     assets = result["assets"]

@@ -82,6 +82,48 @@ function doc(
   }))
 }
 
+
+/**
+ * 一拍步骤内进度心跳。
+ *
+ * mock 里也要有它：LiveProgress 的三种「不动」（等用户 / 等外部超时 / 事件流断）
+ * 只有在能重现的情况下才改得动样式，否则每次调它都要真跑一次 40 分钟的流水线。
+ */
+function beat(
+  stepKey: string,
+  phase: string,
+  opts: {
+    index?: number
+    total?: number
+    detail?: string
+    elapsedMs?: number
+    idleMs?: number
+    stalled?: boolean
+    suspended?: boolean
+    waitingFor?: string
+    stallHint?: string
+    delay?: number
+  } = {},
+): MockTimelineEvent {
+  return {
+    delay: opts.delay ?? 400,
+    event: 'step_progress',
+    data: {
+      step_key: stepKey,
+      phase,
+      index: opts.index,
+      total: opts.total,
+      detail: opts.detail,
+      elapsed_ms: opts.elapsedMs ?? 12_000,
+      idle_ms: opts.idleMs ?? 800,
+      stalled: opts.stalled ?? false,
+      suspended: opts.suspended,
+      waiting_for: opts.waitingFor,
+      stall_hint: opts.stallHint,
+    },
+  }
+}
+
 function step(
   stepKey: string,
   status: CaseSseEventMap['step_status']['status'],
@@ -577,11 +619,29 @@ function buildDisclosureTimeline(): MockTimelineEvent[] {
     event: 'search_progress',
     data: { phase: 'digest', message: '正在消化材料 1/3：技术方案说明.docx…', count: 1 },
   })
+  t.push(
+    beat('material_scan', '消化材料《技术方案说明.docx》', {
+      index: 1, total: 3, elapsedMs: 8_000, waitingFor: '模型',
+    }),
+    beat('material_scan', '消化材料《实验数据.xlsx》', {
+      index: 2, total: 3, elapsedMs: 26_000, waitingFor: '模型', delay: 900,
+    }),
+  )
   t.push({
     delay: 900,
     event: 'search_progress',
     data: { phase: 'digest', message: '正在消化材料 3/3：样机结构图.pdf…', count: 3 },
   })
+  t.push(
+    beat('material_scan', '消化材料《样机结构图.pdf》', {
+      index: 3, total: 3, elapsedMs: 41_000, detail: '长材料分片处理：第 2/4 片',
+      waitingFor: '模型',
+    }),
+    // 静默一段时间但还没到卡住阈值：如实说在等谁、静了多久
+    beat('material_scan', '消化材料《样机结构图.pdf》', {
+      index: 3, total: 3, elapsedMs: 74_000, idleMs: 33_000, waitingFor: '模型', delay: 1200,
+    }),
+  )
   t.push(
     ...chat(
       'material_scan',
@@ -717,6 +777,18 @@ function buildDisclosureTimeline(): MockTimelineEvent[] {
   t.push(
     ...chat('build', '开始按骨架逐章成文，正文将在右侧文档面板实时呈现 →'),
     chatDone('build'),
+  )
+  // 成文是全流程最长的一步：八个阶段逐个报，分子是真实的阶段序号
+  t.push(
+    beat('build', '产出骨架（案件名称 / 模块 / 流程步骤 / 章节大纲）', {
+      index: 1, total: 8, elapsedMs: 6_000, waitingFor: '模型',
+    }),
+    beat('build', '撰写第一、二章（技术领域与背景技术）', {
+      index: 2, total: 8, elapsedMs: 52_000, waitingFor: '模型', delay: 800,
+    }),
+    beat('build', '撰写 3.1–3.3（技术方案总体与模块框图）', {
+      index: 3, total: 8, elapsedMs: 121_000, waitingFor: '模型', delay: 800,
+    }),
   )
   t.push(...doc('build', DISCLOSURE_DOC_ID, disclosureDocV1))
   t.push({

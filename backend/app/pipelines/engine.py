@@ -29,7 +29,7 @@ from typing import Any, Awaitable, Callable, Mapping
 from ulid import ULID
 
 from ..db import database as db
-from ..services import assembler, llm
+from ..services import assembler, llm, progress
 from ..services.sse import hub
 
 logger = logging.getLogger(__name__)
@@ -147,17 +147,57 @@ class Ctx:
 
     async def chat_delta(self, text: str) -> None:
         """会话叙述通道流式增量（高频，不落库；llm_done 时机由调用方掌握）。"""
+        # 每个 token 都是「还活着」的实证：刷新进度的最后变化时间，
+        # 否则一次 20 分钟的正常撰写会被心跳判成卡死
+        progress.touch(self.case_id)
         await self.emit(
             "llm_delta", {"step_key": self.step_key, "channel": "chat", "text": text}, persist=False
         )
 
     async def doc_delta(self, doc_id: str, text: str) -> None:
         """文档正文通道流式增量（高频，不落库）。"""
+        progress.touch(self.case_id)
         await self.emit(
             "llm_delta",
             {"step_key": self.step_key, "channel": "doc", "doc_id": doc_id, "text": text},
             persist=False,
         )
+
+    async def progress(
+        self,
+        phase: str = "",
+        *,
+        index: int | None = None,
+        total: int | None = None,
+        detail: str = "",
+        waiting_for: str = "",
+    ) -> None:
+        """报告步骤内进度并立即推给前端。
+
+        `index/total` **只接受代码里真实存在的循环变量**（第 i 个文件、第 i 幅图、
+        第 i 次调用）。不要按时间估算百分比：假进度条停在 90% 不动时，
+        用户失去的是对整个系统的信任。给不出真实分子的步骤就别传这两个参数。
+
+        `waiting_for` 写「当前在等谁」（模型 / 附图脚本 / 国知局 / Word），
+        它是卡住提示里唯一能让用户据以行动的信息。
+        """
+        p = progress.current(self.case_id)
+        if p is None:
+            return
+        if phase:
+            p.phase = phase
+        if index is not None:
+            p.index = index
+        if total is not None:
+            p.total = total
+        if waiting_for:
+            p.waiting_for = waiting_for
+        p.touch(detail)
+        await self.emit("step_progress", p.snapshot(), persist=False)
+
+    def tick(self, detail: str = "") -> None:
+        """廉价地记一次「有进展」（不发事件，等心跳带出去）。"""
+        progress.touch(self.case_id, detail)
 
     async def chat_done(self) -> None:
         """会话通道流式结束（落库，供重放判段落边界）。"""
@@ -433,11 +473,35 @@ async def run_pipeline(
             _tasks.pop(case_id, None)
 
 
+async def _progress_heartbeat(case_id: str) -> None:
+    """每 BEAT_SEC 推一次当前步骤的进度快照。
+
+    这是「在跑还是卡死」唯一可靠的答案来源：只要心跳还在来，前端就知道进程活着；
+    快照里的 idle_ms 又能区分「活着且在出活」与「活着但等了很久没反应」。
+    没有它，一个 26 分钟的正常步骤和一个真的死掉的步骤，在界面上长得一模一样。
+    """
+    try:
+        while True:
+            await asyncio.sleep(progress.BEAT_SEC)
+            snap = progress.snapshot(case_id)
+            if snap is None:
+                continue
+            try:
+                await hub.emit(
+                    case_id, "step_progress", snap, persist=False, step_key=snap["step_key"]
+                )
+            except Exception:  # noqa: BLE001 —— 心跳发不出去不能拖垮步骤本身
+                logger.debug("进度心跳发送失败 case=%s", case_id, exc_info=True)
+    except asyncio.CancelledError:
+        raise
+
+
 async def _run_step(ctx: Ctx, step: StepDef, attempt: int) -> bool:
     """执行单个步骤（一次 attempt = 一行 pipeline_runs）；返回是否成功。"""
     case_id = ctx.case_id
     run_id = str(ULID())
     ctx.step_key, ctx.attempt, ctx.gate = step.key, attempt, step.gate
+    progress.begin(case_id, step.key, step.name_zh)
 
     await db.arun(_insert_run, run_id, case_id, ctx.run_group, step.key, attempt)
     await db.arun(_save_case, case_id, {"status": "running", "current_step": step.key})
@@ -451,6 +515,11 @@ async def _run_step(ctx: Ctx, step: StepDef, attempt: int) -> bool:
     async def _await_user(interaction: InteractionRequest) -> Any:
         pend = _Pending(step_key=step.key, run_id=run_id, interaction=interaction)
         _pending[case_id] = pend
+        # 等用户不是卡住，是设计好的停顿——心跳照发，但不报「无响应」
+        if (p := progress.current(case_id)) is not None:
+            p.suspended = True
+            p.waiting_for = "你的确认"
+            p.touch("等待人工确认")
         await db.arun(_update_run, run_id, {"status": "waiting_user"})
         await db.arun(_save_case, case_id, {"status": "waiting_user"})
         await hub.emit(
@@ -482,6 +551,10 @@ async def _run_step(ctx: Ctx, step: StepDef, attempt: int) -> bool:
             {"status": "running", "user_input_json": json.dumps(pend.payload, ensure_ascii=False)},
         )
         await db.arun(_save_case, case_id, {"status": "running"})
+        if (p := progress.current(case_id)) is not None:
+            p.suspended = False
+            p.waiting_for = ""
+            p.touch("已收到确认，继续执行")
         await hub.emit(
             case_id,
             "step_status",
@@ -491,6 +564,9 @@ async def _run_step(ctx: Ctx, step: StepDef, attempt: int) -> bool:
         return pend.payload
 
     ctx._await_user_cb = _await_user
+    # 心跳在这里才建：上面那几步一旦抛异常就不会走到 finally，
+    # 提前建会漏下一个仍在给已结束案件发心跳的任务
+    beat = asyncio.create_task(_progress_heartbeat(case_id))
     try:
         result = await step.handler(ctx)
     except asyncio.CancelledError:
@@ -515,6 +591,8 @@ async def _run_step(ctx: Ctx, step: StepDef, attempt: int) -> bool:
         return False
     finally:
         ctx._await_user_cb = None
+        beat.cancel()
+        progress.end(case_id, step.key)
 
     if isinstance(result, StepResult):
         output = result.output

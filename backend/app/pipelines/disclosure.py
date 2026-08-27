@@ -510,8 +510,17 @@ async def material_scan(ctx: Ctx) -> dict[str, Any]:
             continue
         name = str(row["orig_name"])
         chunks = _split_chunks(text)
+        # 分子是 index+1，分母是 len(rows)：两个都是这段循环里真实存在的量
+        await ctx.progress(
+            f"消化材料《{name}》", index=index + 1, total=len(rows), waiting_for="模型"
+        )
         parsed: list[MaterialDigest] = []
         for k, chunk in enumerate(chunks, 1):
+            if len(chunks) > 1:
+                await ctx.progress(
+                    f"消化材料《{name}》",
+                    detail=f"长材料分片处理：第 {k}/{len(chunks)} 片",
+                )
             tag = f"digest.{index}" if len(chunks) == 1 else f"digest.{index}.p{k}"
             system = assembler.assemble(
                 DIGEST_PARTS,

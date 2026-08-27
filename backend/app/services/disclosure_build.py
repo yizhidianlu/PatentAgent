@@ -1412,6 +1412,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
     preview_md = str((state.get("preview") or {}).get("markdown") or "")
 
     # ---------- G0 骨架 ----------
+    await ctx.progress("产出骨架（案件名称 / 模块 / 流程步骤 / 章节大纲）", index=1, total=8, waiting_for="模型")
     await ctx.emit("log", {"message": "开始成文：先产出骨架（案件名称 / 模块 / 流程步骤 / 章节大纲）。"})
     skeleton, g0_report = await generate_skeleton(
         ctx,
@@ -1450,6 +1451,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
         return sensitive_lint(text, sensitive, keep=[*title_terms, case_title])
 
     # ---------- G1 一 + 二章 ----------
+    await ctx.progress("撰写第一、二章（技术领域与背景技术）", index=2, total=8, waiting_for="模型")
     g1_user = G1_USER_HEAD + ("" if searched else G1_UNSEARCHED) + (
         "\n\n【查新笔记（1.1 的唯一事实来源）】\n" + prior_art_notes_text(notes)
     )
@@ -1477,6 +1479,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
     reports.append(g1.report())
 
     # ---------- G2 3.1–3.3 ----------
+    await ctx.progress("撰写 3.1–3.3（技术方案总体与模块框图）", index=3, total=8, waiting_for="模型")
     g2 = await generate_chapter(
         ctx,
         key="g2",
@@ -1504,6 +1507,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
     reports.append(g2.report())
 
     # ---------- G3 3.4 ----------
+    await ctx.progress("撰写 3.4（核心流程）", index=4, total=8, waiting_for="模型")
     g3 = await generate_chapter(
         ctx,
         key="g3",
@@ -1532,6 +1536,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
     reports.append(g3.report())
 
     # ---------- G4 公式门禁 ----------
+    await ctx.progress("公式门禁（范式选型与数值复算）", index=5, total=8, waiting_for="模型")
     formula_plan: FormulaPlan | None = None
     formula_gate: dict[str, Any] = {"needed": False}
     want_formula = state.get("formula")
@@ -1582,6 +1587,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
             )
 
     # ---------- G5 3.4.1 + 3.5 ----------
+    await ctx.progress("撰写 3.4.1 与 3.5（符号表与实现细节）", index=6, total=8, waiting_for="模型")
     plan_dump = formula_plan.model_dump() if formula_plan is not None else None
     g5_extra: dict[str, Any] = {"chapter_34_digest": text_digest(chapters["g3"])}
     if plan_dump is not None:
@@ -1609,6 +1615,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
     reports.append(g5.report())
 
     # ---------- G6 四 + 五章 ----------
+    await ctx.progress("撰写第四、五章（有益效果与权利要求要点）", index=7, total=8, waiting_for="模型")
     prev_digests = {CHAPTER_NAMES[k]: text_digest(chapters[k]) for k in ("g1", "g2", "g3", "g5")}
     g6 = await generate_chapter(
         ctx,
@@ -1629,6 +1636,7 @@ async def build_invention(ctx: Any) -> dict[str, Any]:
     reports.append(g6.report())
 
     # ---------- G7 六章 ----------
+    await ctx.progress("撰写第六章（附图说明与收尾）", index=8, total=8, waiting_for="模型")
     g7_extra: dict[str, Any] = {
         "previous_chapters_digest": {
             **prev_digests, CHAPTER_NAMES["g6"]: text_digest(chapters["g6"])
@@ -1850,6 +1858,7 @@ async def _claim_form_audit(ctx: Any, card: Mapping[str, Any], text: str, round_
 
 async def build_utility_model(ctx: Any) -> dict[str, Any]:
     """实用新型交底书分章成文：返回合并进 `cases.state_json` 的产物。"""
+    await ctx.progress("产出骨架", index=1, total=5, waiting_for="模型")
     state = getattr(ctx, "state", None) or {}
     card = case_card(ctx)
     sensitive = [str(t) for t in (state.get("sensitive_terms") or [])]
@@ -1918,6 +1927,7 @@ async def build_utility_model(ctx: Any) -> dict[str, Any]:
         return uncertain_lint(text, uncertain)
 
     # ---------- G1 一 + 二章 ----------
+    await ctx.progress("撰写第一、二章", index=2, total=5, waiting_for="模型")
     u1_user = U1_USER_HEAD + ("" if searched else G1_UNSEARCHED) + (
         "\n\n【查新笔记（1.1 的唯一事实来源）】\n" + prior_art_notes_text(notes)
     )
@@ -1946,6 +1956,7 @@ async def build_utility_model(ctx: Any) -> dict[str, Any]:
     reports.append(u1.report())
 
     # ---------- G2 3.1–3.3（对齐 parts / relations / figure_plan） ----------
+    await ctx.progress("撰写 3.1–3.3（部件与连接关系）", index=3, total=5, waiting_for="模型")
     u2 = await generate_chapter(
         ctx,
         key="u2",
@@ -1985,6 +1996,7 @@ async def build_utility_model(ctx: Any) -> dict[str, Any]:
     reports.append(u2.report())
 
     # ---------- G3 3.4 + 3.5 ----------
+    await ctx.progress("撰写 3.4 与 3.5", index=4, total=5, waiting_for="模型")
     want_35 = any(
         str((p if isinstance(p, Mapping) else {}).get("material_hint") or "").strip()
         not in ("", "unknown", "未知")
@@ -2028,6 +2040,7 @@ async def build_utility_model(ctx: Any) -> dict[str, Any]:
     reports.append(u3.report())
 
     # ---------- G4 四 + 五 + 六章（第五章书式：正则 + AUDIT 双查） ----------
+    await ctx.progress("撰写第四、五、六章", index=5, total=5, waiting_for="模型")
     audit_round = {"n": 0}
 
     async def claim_form_check(text: str) -> list[str]:
@@ -2181,6 +2194,7 @@ def design_skeleton_lint(appearance: Mapping[str, Any]) -> Callable[[Skeleton], 
 
 async def build_design(ctx: Any) -> dict[str, Any]:
     """外观设计交底底稿分章成文：返回合并进 `cases.state_json` 的产物。"""
+    await ctx.progress("产出骨架", index=1, total=3, waiting_for="模型")
     state = getattr(ctx, "state", None) or {}
     card = case_card(ctx)
     sensitive = [str(t) for t in (state.get("sensitive_terms") or [])]
@@ -2244,6 +2258,7 @@ async def build_design(ctx: Any) -> dict[str, Any]:
         return uncertain_lint(text, uncertain)
 
     # ---------- G1 一 + 二 + 三章（含视图说明） ----------
+    await ctx.progress("撰写第一、二、三章（含视图说明）", index=2, total=3, waiting_for="模型")
     d1 = await generate_chapter(
         ctx,
         key="d1",
@@ -2288,6 +2303,7 @@ async def build_design(ctx: Any) -> dict[str, Any]:
     reports.append(d1.report())
 
     # ---------- G2 四 + 五章 ----------
+    await ctx.progress("撰写第四、五章", index=3, total=3, waiting_for="模型")
     d2_user = D2_USER + (
         "" if searched else "\n\n**本案未进行专利检索**：第四章须如实写明未进行系统性检索，"
         "只据材料中已知的常见外观作对比，**严禁编造**在先外观、公开号或链接。"

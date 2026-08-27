@@ -19,6 +19,7 @@ import type {
   Stage,
   StageStatus,
   StreamItem,
+  StepProgressEvent,
 } from '../types/stream'
 import { isCaseSseEventName } from '../types/stream'
 
@@ -74,6 +75,15 @@ export interface CaseSessionState {
   versions: DocVersionEvent[]
   artifacts: Artifact[]
   lastError: { message: string; retryable: boolean } | null
+  /**
+   * 当前步骤的实时进度（step_progress 心跳）。
+   *
+   * 步骤切换 / 流水线结束时清空 —— 留着上一步的进度比没有进度更误导：
+   * 用户会以为系统还停在那一步。
+   */
+  progress: StepProgressEvent | null
+  /** 最近一次收到心跳的本地时刻（毫秒）。用来判断「事件流本身是不是断了」。 */
+  progressAt: number | null
 }
 
 export function emptySession(): CaseSessionState {
@@ -89,6 +99,8 @@ export function emptySession(): CaseSessionState {
     versions: [],
     artifacts: [],
     lastError: null,
+    progress: null,
+    progressAt: null,
   }
 }
 
@@ -406,11 +418,29 @@ function reduceEvent(caseId: string, event: string, data: unknown): void {
       return
     }
 
+    case 'step_progress': {
+      const d = data as CaseSseEventMap['step_progress']
+      if (!d?.step_key) return
+      // 不 flushNow()：心跳每 5 秒一拍，为它打断 delta 缓冲会让流式渲染变卡
+      updateSession(caseId, (session) => ({
+        ...session,
+        progress: d,
+        progressAt: Date.now(),
+      }))
+      return
+    }
+
     case 'step_status': {
       flushNow()
       const d = data as CaseSseEventMap['step_status']
       if (!d?.step_key) return
-      updateSession(caseId, (session) => upsertStep(session, d))
+      updateSession(caseId, (session) => {
+        const next = upsertStep(session, d)
+        // 换步骤或本步已结束 → 丢掉旧进度。留着它会让用户以为还停在上一步
+        const stale =
+          d.status !== 'running' || session.progress?.step_key !== d.step_key
+        return stale ? { ...next, progress: null, progressAt: null } : next
+      })
       return
     }
 
@@ -538,6 +568,8 @@ function reduceEvent(caseId: string, event: string, data: unknown): void {
           ...session,
           docs,
           pipeline: { ...session.pipeline, currentKey: null, done: true },
+          progress: null,
+          progressAt: null,
         }
       })
       return
@@ -651,7 +683,10 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
   hydratePipeline: (caseId, state) => {
     get().ensureSession(caseId)
     updateSession(caseId, (session) => {
-      let next = session
+      // 心跳每 5 秒一拍：刷新后先用快照把进度填上，别让最长的那一步显示成空白
+      let next = state.progress
+        ? { ...session, progress: state.progress, progressAt: Date.now() }
+        : session
       for (const step of state.steps) {
         next = upsertStep(next, {
           step_key: step.key,

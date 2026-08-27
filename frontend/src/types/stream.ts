@@ -193,6 +193,31 @@ export interface PipelineDoneEvent {
   status?: 'done' | 'failed' | 'cancelled'
 }
 
+/**
+ * step_progress：当前步骤内的实时进度（心跳，不落库）。
+ *
+ * 三层反馈里的 L2+L3：`phase` 与 `index/total` 回答「做到第几件」，
+ * `detail` 与 `idle_ms` 回答「最近一次真实变化是什么、离现在多久」。
+ * `index/total` 由后端的真实循环变量喂出，前端不得再自行估算百分比。
+ */
+export interface StepProgressEvent {
+  step_key: string
+  name_zh?: string
+  phase?: string
+  /** 真实循环变量；缺失表示这一步给不出可信的分子，只显示阶段名与耗时。 */
+  index?: number
+  total?: number
+  detail?: string
+  elapsed_ms: number
+  /** 距上一次真实变化多久 —— 「卡住」按这个判，不按 elapsed_ms 判。 */
+  idle_ms: number
+  stalled: boolean
+  /** 门控挂起中：等的是用户，不该当成异常。 */
+  suspended?: boolean
+  waiting_for?: string
+  stall_hint?: string
+}
+
 export interface PingEvent {
   t: string
 }
@@ -200,6 +225,7 @@ export interface PingEvent {
 /** 事件名 → 载荷类型映射（canonical 事件表）。 */
 export interface CaseSseEventMap {
   step_status: StepStatusEvent
+  step_progress: StepProgressEvent
   llm_delta: LlmDeltaEvent
   llm_done: LlmDoneEvent
   doc_version: DocVersionEvent
@@ -223,6 +249,7 @@ export type CaseSseEvent = {
 /** 事件名集合（运行时判别用）。 */
 export const CASE_SSE_EVENT_NAMES: readonly CaseSseEventName[] = [
   'step_status',
+  'step_progress',
   'llm_delta',
   'llm_done',
   'doc_version',

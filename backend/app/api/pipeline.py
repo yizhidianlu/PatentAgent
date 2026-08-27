@@ -24,6 +24,7 @@ from ..models.pipeline import (
     PipelineStateOut,
     StepStateOut,
 )
+from ..services import progress as progress_service
 from ..pipelines import engine, registry
 from .deps import client_ip, current_user, enforce_quota, resolve_case_sync
 
@@ -120,6 +121,7 @@ async def pipeline_state(
         run_group=run_group,
         steps=steps,
         pending_interaction=PendingInteractionOut(**pending) if pending else None,
+        progress=progress_service.snapshot(case_id),
     )
 
 

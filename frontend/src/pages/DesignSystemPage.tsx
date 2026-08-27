@@ -18,12 +18,22 @@ import { Dropdown, DropdownItem } from '../components/ui/Dropdown'
 import { ThemeToggle } from '../components/theme/ThemeToggle'
 import { Composer } from '../components/composer/Composer'
 import { SendButton } from '../components/composer/SendButton'
+import { LiveProgress } from '../components/pipeline/LiveProgress'
 import { StepProgress } from '../components/pipeline/StepProgress'
 import { StreamItemView } from '../components/pipeline/StreamItemView'
 import { emptySession } from '../stores/sessionStore'
 import { useComposerStore } from '../stores/composerStore'
 import { DsPatterns } from './designSystem/DsPatterns'
 import { DsStageGallery } from './designSystem/DsStageGallery'
+
+/**
+ * 展示页的「刚刚」。
+ *
+ * 必须是真实时刻：LiveProgress 用 `Date.now() - progressAt` 判断是不是掉线了，
+ * 给个写死的常量会让所有卡片直接进掉线态。取模块加载时刻即可——
+ * 它在 render 之外，既真实又稳定。
+ */
+const DS_NOW = Date.now()
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -328,6 +338,81 @@ export function DesignSystemPage() {
       <Stack title="页面级模式（步骤条 / 流条目 / 版本历史 / 空态 / 骨架 / 富文本溢出）">
         <DsPatterns />
       </Stack>
+
+      {/* ===== 步骤内实时进度：四种状态必须一眼可辨 ===== */}
+      <LightDark title="亮暗并排 · 步骤内实时进度（正常 / 无分子 / 等用户 / 卡住 / 掉线）">
+        <div className="space-y-3">
+          <LiveProgress
+            progress={{
+              step_key: 'build',
+              phase: '撰写 3.1–3.3（技术方案总体与模块框图）',
+              index: 3,
+              total: 8,
+              detail: '已输出 3,214 字',
+              elapsed_ms: 121_000,
+              idle_ms: 900,
+              stalled: false,
+              waiting_for: '模型',
+            }}
+            progressAt={DS_NOW}
+            connection="open"
+          />
+          {/* 给不出真实分子时只画流动条：它表示「在跑」，不表示「跑了多少」 */}
+          <LiveProgress
+            progress={{
+              step_key: 'rules_check',
+              phase: '规则校验与忠实性审计',
+              elapsed_ms: 260_000,
+              idle_ms: 1_200,
+              stalled: false,
+              waiting_for: '模型',
+            }}
+            progressAt={DS_NOW}
+            connection="open"
+          />
+          <LiveProgress
+            progress={{
+              step_key: 'preview',
+              phase: '等待方向确认',
+              elapsed_ms: 640_000,
+              idle_ms: 600_000,
+              stalled: false,
+              suspended: true,
+            }}
+            progressAt={DS_NOW}
+            connection="open"
+          />
+          <LiveProgress
+            progress={{
+              step_key: 'drawings',
+              phase: '生成说明书附图',
+              index: 2,
+              total: 4,
+              elapsed_ms: 430_000,
+              idle_ms: 214_000,
+              stalled: true,
+              waiting_for: '附图脚本',
+              stall_hint:
+                '已有 214 秒没有收到附图脚本的任何新反馈。若持续无响应，可在下方取消本步骤后重试；重试不会丢失已完成的步骤。',
+            }}
+            progressAt={DS_NOW}
+            connection="open"
+          />
+          <LiveProgress
+            progress={{
+              step_key: 'build',
+              phase: '撰写第四、五章（有益效果与权利要求要点）',
+              index: 7,
+              total: 8,
+              elapsed_ms: 900_000,
+              idle_ms: 4_000,
+              stalled: false,
+            }}
+            progressAt={DS_NOW - 40_000}
+            connection="reconnecting"
+          />
+        </div>
+      </LightDark>
 
       <LightDark title="亮暗并排 · 流水线失败卡与步骤条">
         <div className="space-y-3">

@@ -3,6 +3,8 @@
  * 后端为 pydantic snake_case，前端类型 1:1 镜像字段名，不做驼峰转换。
  */
 
+import type { StepProgressEvent } from './stream'
+
 /** 四大模块（backend models/case.py: Module）。 */
 export type Module = 'disclosure' | 'paper2patent' | 'reader' | 'oa'
 
@@ -178,6 +180,11 @@ export interface PipelineState {
     schema?: unknown
     prompt?: string
   } | null
+  /**
+   * 当前运行步骤的进度快照。刷新 / 重连后心跳要等下一拍才来，
+   * 先用它把界面填上，否则用户会在最长的那一步上盯着一片空白。
+   */
+  progress?: StepProgressEvent | null
 }
 
 /** POST /cases/{id}/pipeline/input 请求体。 */

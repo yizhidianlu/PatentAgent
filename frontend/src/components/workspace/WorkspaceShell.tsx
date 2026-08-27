@@ -46,6 +46,7 @@ import {
   type DisplayStep,
   type DisplayStepPreset,
 } from '../pipeline/StepProgress'
+import { LiveProgress } from '../pipeline/LiveProgress'
 import { CrossUserBanner } from './CrossUserBanner'
 import type { InteractionRequiredEvent } from '../../types/stream'
 import type { PipelineStepState } from '../../stores/sessionStore'
@@ -591,6 +592,12 @@ export function WorkspaceShell({
         {/* 管理员查看他人案件：置顶 amber 提示（§4.2，后端已记 cross_user_read 审计） */}
         <CrossUserBanner caseDetail={detailQuery.data} />
         <StepProgress steps={displaySteps} />
+        {/* 步骤条只答「第几步」；这条答「这一步在做什么、跑了多久、是不是卡住了」 */}
+        <LiveProgress
+          progress={session?.progress ?? null}
+          progressAt={session?.progressAt ?? null}
+          connection={session?.connection ?? 'idle'}
+        />
 
         {bannerText && (
           <div

@@ -36,6 +36,7 @@ from ..models.settings import (
     load_tolerant,
 )
 from .sse import hub
+from . import progress
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,9 @@ async def _notify(
     """
     if not case_id:
         return
+    # 限流退避、长思维链心跳都是「确实在动」的证据：刷新进度的最后变化时间，
+    # 否则一次 5 分钟的思考期会被流水线心跳判成卡死
+    progress.touch(case_id, message if kind == "progress" else "")
     data: dict[str, Any] = {"message": message}
     if kind:
         data["kind"] = kind

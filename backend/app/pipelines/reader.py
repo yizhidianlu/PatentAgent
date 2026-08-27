@@ -1061,6 +1061,7 @@ async def note(ctx: Ctx) -> dict[str, Any]:
     paragraphs = _paragraph_context(structure, PARAGRAPH_BUDGET_CHARS)
 
     # ① 结构节（三、四、五、六）
+    await ctx.progress("撰写结构节（权要树与特征对照）", index=1, total=3, waiting_for="模型")
     structure_system = assembler.assemble(WRITER_PARTS, runtime_ctx=base_ctx)
     structure_md = await _stream_gen(
         ctx,
@@ -1080,6 +1081,7 @@ async def note(ctx: Ctx) -> dict[str, Any]:
     )
 
     # ② 叙事节（一、二、七、八、九）
+    await ctx.progress("撰写叙事节（一句话与场景落地）", index=2, total=3, waiting_for="模型")
     narrative_ctx = {
         **base_ctx,
         "extra": {
@@ -1104,6 +1106,7 @@ async def note(ctx: Ctx) -> dict[str, Any]:
     )
 
     # ③ 附录（十、十一）
+    await ctx.progress("撰写附录（术语与行业坐标）", index=3, total=3, waiting_for="模型")
     appendix_ctx = {
         **base_ctx,
         "extra": {

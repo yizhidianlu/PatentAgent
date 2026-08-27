@@ -618,7 +618,12 @@ async def retrieve(ctx: Ctx) -> dict[str, Any]:
     per_issue: list[dict[str, Any]] = []
     modes: list[str] = []
     viewer = case_viewer(ctx)
-    for issue in issues:
+    for position, issue in enumerate(issues, start=1):
+        await ctx.progress(
+            "为每条审查意见检索相似案例",
+            index=position, total=len(issues),
+            waiting_for="案例库检索",
+        )
         result = await _search_issue(issue, patent_type, viewer)
         modes.append(str(result.get("mode") or "keyword"))
         per_issue.append(
@@ -825,7 +830,13 @@ async def strategy(ctx: Ctx) -> dict[str, Any]:
     issues = list(notice.get("issues") or [])
     plans: list[dict[str, Any]] = []
     reports: list[dict[str, Any]] = []
-    for issue in issues:
+    for position, issue in enumerate(issues, start=1):
+        await ctx.progress(
+            "为每条审查意见拟策略",
+            index=position, total=len(issues),
+            detail=f"第 {position} 条：{str(issue.get('statute') or issue.get('id') or '')}"[:60],
+            waiting_for="模型",
+        )
         plan, report = await _issue_strategy(ctx, issue)
         plans.append(plan.model_dump())
         reports.append({"issue_id": plan.issue_id, **report})
@@ -1060,8 +1071,14 @@ async def draft(ctx: Ctx) -> dict[str, Any]:
     base_claims = {int(k): v for k, v in (ctx.state.get("base_claims") or {}).items()}
 
     drafts: list[dict[str, Any]] = []
-    for issue in issues:
+    for position, issue in enumerate(issues, start=1):
         issue_id = str(issue.get("id") or "")
+        await ctx.progress(
+            "逐条撰写意见陈述",
+            index=position, total=len(issues),
+            detail=f"第 {position} 条：{str(issue.get('statute') or issue_id)}"[:60],
+            waiting_for="模型",
+        )
         choice = choices.get(issue_id) or {"strategy": "argue_only"}
         drafts.append(await _draft_issue(ctx, issue, choice, base_claims))
 

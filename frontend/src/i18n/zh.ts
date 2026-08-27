@@ -408,6 +408,22 @@ export const zh = {
     retryRequested: '已重新提交该步骤',
     retryFailed: '重试失败，请稍后再试',
     notRetryableHint: '该错误无法自动重试，请调整输入或在设置中检查模型服务配置后重新开始。',
+
+    /** 步骤内实时进度（step_progress 心跳）。 */
+    live: {
+      label: '当前进度',
+      running: '正在执行',
+      elapsed: (text: string) => `已用时 ${text}`,
+      ofTotal: (index: number, total: number) => `${index}/${total}`,
+      /** 等待外部响应但尚未到「卡住」阈值时的柔和提示。 */
+      waitingFor: (who: string) => `等待${who}响应`,
+      idleFor: (text: string) => `已 ${text} 无新进展`,
+      suspended: '已暂停，等待你在下方确认后继续',
+      stalledTitle: '长时间没有新进展',
+      offlineTitle: '实时连接中断，进度暂时停止更新',
+      offlineHint:
+        '流水线仍在服务器上继续跑，重连后会自动补上这段时间的进度；此刻看不到进度不代表任务已经停止。',
+    },
   },
 
   upload: {
