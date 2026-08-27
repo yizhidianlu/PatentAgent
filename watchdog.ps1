@@ -47,10 +47,51 @@ $Py         = Join-Path $Backend '.venv\Scripts\python.exe'
 $TunnelConf = if ($TunnelConfig) { $TunnelConfig }
               else { Join-Path $env:USERPROFILE ".cloudflared\$TunnelName.yml" }
 $LogFile    = Join-Path $Root 'data\watchdog.log'
-$HealthUrl  = "http://127.0.0.1:$Port/api/v1/system/health"
+# 自报身份：把 PID 与守护端口写在这里，供 deploy\update.ps1 准确找到「本仓库的看门狗」。
+# 靠命令行匹配不可靠——相对路径启动（文档里给的就是 `watchdog.ps1 -Port 8000`）在命令行里
+# 不会展开成绝对路径，任何按绝对路径的匹配都必然失配；于是更新时该停的看门狗没被停掉，
+# 它会在依赖安装/前端构建进行中把旧代码拉起来，把整个更新带进假成功。
+$PidFile    = Join-Path $Root 'data\watchdog.pid'
+$script:PortFromEnv = $false
 
+# --------------------------------------------------------------------------
+# 端口来源：显式 -Port > backend\.env 的 PORT > 默认 8000
+#
+# 契约文档把「端口」列为部署端可通过改 .env 自主调整的本机配置，两份 .env 模板
+# 也都列了 PORT。但脚本此前只认 -Port 参数，全文没有一处读 .env：改了 .env 再按
+# 文档用不带 -Port 的计划任务重启，服务仍在 8000，而 .env 与对外回报的端口都是新值，
+# 零告警。若据此改了隧道 ingress，对外立刻 502，排障时唯一的事实源还是错的。
+# --------------------------------------------------------------------------
+function Get-EnvFilePort {
+    $envFile = Join-Path $Backend '.env'
+    if (-not (Test-Path -LiteralPath $envFile)) { return 0 }
+    try {
+        foreach ($raw in (Get-Content -LiteralPath $envFile -ErrorAction Stop)) {
+            $line = $raw.Trim()
+            if (-not $line -or $line.StartsWith('#')) { continue }
+            if ($line -match '^\s*PORT\s*=\s*"?''?(\d+)"?''?\s*$') {
+                $v = [int] $Matches[1]
+                if ($v -ge 1 -and $v -le 65535) { return $v }
+            }
+        }
+    } catch { }
+    return 0
+}
+
+if (-not $PSBoundParameters.ContainsKey('Port')) {
+    $envPort = Get-EnvFilePort
+    if ($envPort -gt 0 -and $envPort -ne $Port) {
+        $Port = $envPort
+        $script:PortFromEnv = $true
+    }
+}
+
+# HealthUrl 依赖 $Port，必须在端口定下来之后再拼
+$HealthUrl  = "http://127.0.0.1:$Port/api/v1/system/health"
 $script:AppFails    = 0
 $script:TunnelFails = 0
+# $null = 尚未探测；探测一次后固定为 $true/$false，决定隧道健康的判据
+$script:MetricsUsable = $null
 
 function Write-Log {
     param([string] $Level, [string] $Message)
@@ -72,8 +113,25 @@ function Write-Log {
 }
 
 function Get-AppProcess {
+    <# 找出「本仓库、本端口」的应用进程，返回 PID 数组。
+
+       只按 `*uvicorn app.main*` 认人有两个真实后果：
+         * 同机另一个端口上跑着的本项目实例（比如按提示改用 -Port 8080 起的那个）
+           会被这个看门狗当成自己的，健康检查一失败就把人家 Force kill 掉；
+         * 操作员在前台跑 start.ps1 排障时，进程会被无声杀掉、端口被隐藏的替身占住，
+           再起就报端口占用，如此循环。
+       所以判据必须和 deploy\update.ps1 一致：先看谁在监听本端口，
+       再以本仓库 .venv 的解释器兜底（进程已崩到不监听、或刚起还没绑上端口）。
+    #>
+    $pids = [System.Collections.Generic.HashSet[int]]::new()
+    try {
+        Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            ForEach-Object { [void] $pids.Add([int] $_.OwningProcess) }
+    } catch { }
     Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*uvicorn app.main*' }
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Py*" -and $_.CommandLine -like '*uvicorn*' } |
+        ForEach-Object { [void] $pids.Add([int] $_.ProcessId) }
+    return @($pids)
 }
 
 function Get-TunnelProcess {
@@ -92,21 +150,45 @@ function Test-AppHealthy {
 }
 
 function Test-TunnelHealthy {
+    <# 进程在 + 边缘连接数 >= 1 才算健康。
+
+       原先 metrics 抓不到时直接 return $true（fail-open），与 Test-AppHealthy 的
+       fail-closed 方向相反：「进程还在、边缘连接掉到 0」正是本脚本要兜的那种故障，
+       却会被判成健康。但一律 fail-closed 也不行——cloudflared 没带 --metrics 时
+       端口本就不存在，那会变成每 30 秒重启一次隧道。
+
+       折中：首次探测决定后续判据。metrics 可用则严格按连接数判；
+       不可用则说明这台机器的隧道没开 metrics，退化为只看进程存活，并说明一次。
+    #>
     if (-not (Get-TunnelProcess)) { return $false }
     try {
         $m = Invoke-WebRequest -Uri "http://127.0.0.1:$TunnelMetricsPort/metrics" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        if ($null -eq $script:MetricsUsable) {
+            $script:MetricsUsable = $true
+            Write-Log 'INFO' "隧道 metrics 可用（$TunnelMetricsPort），按边缘连接数判定健康"
+        }
         foreach ($l in ($m.Content -split "`n")) {
             if ($l -match '^cloudflared_tunnel_ha_connections\s+(\d+)') {
                 if ([int]$Matches[1] -lt 1) { return $false }
             }
         }
-    } catch { }
-    return $true
+        return $true
+    } catch {
+        if ($null -eq $script:MetricsUsable) {
+            $script:MetricsUsable = $false
+            Write-Log 'WARN' ("隧道 metrics 不可达（$TunnelMetricsPort）：隧道健康将只按进程存活判定，" +
+                              '「进程在但边缘连接掉到 0」这类故障探不出来。' +
+                              '若隧道确实开了 metrics，请用 -TunnelMetricsPort 指明端口。')
+        }
+        # metrics 从可用变为不可达，通常意味着隧道进程出了问题——按不健康处理
+        if ($script:MetricsUsable) { return $false }
+        return $true
+    }
 }
 
 function Restart-App {
     Write-Log 'FIX' '重启应用...'
-    Get-AppProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Get-AppProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 3
     $argList = @('-m','uvicorn','app.main:app','--host','127.0.0.1','--port',"$Port",'--proxy-headers','--forwarded-allow-ips','127.0.0.1')
     Start-Process -FilePath $Py -ArgumentList $argList -WorkingDirectory $Backend -WindowStyle Hidden
@@ -180,11 +262,31 @@ if ($Once) {
     exit 1
 }
 
-while ($true) {
-    try {
-        [void](Invoke-Check)
-    } catch {
-        Write-Log 'ERR' ('体检异常：' + $_.Exception.Message)
+# 只有常驻模式才登记身份；-Once 是一次性体检，不该被当成正在守护的实例。
+try {
+    $pidDir = Split-Path -Parent $PidFile
+    if (-not (Test-Path $pidDir)) { New-Item -ItemType Directory -Force $pidDir | Out-Null }
+    Set-Content -Path $PidFile -Encoding utf8 -Value @(
+        "pid=$PID"
+        "port=$Port"
+        "root=$Root"
+        "started=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    )
+} catch {
+    Write-Log 'WARN' ('无法写入 ' + $PidFile + '：' + $_.Exception.Message + '；update.ps1 可能认不出本进程')
+}
+
+try {
+    while ($true) {
+        try {
+            [void](Invoke-Check)
+        } catch {
+            Write-Log 'ERR' ('体检异常：' + $_.Exception.Message)
+        }
+        Start-Sleep -Seconds $IntervalSeconds
     }
-    Start-Sleep -Seconds $IntervalSeconds
+} finally {
+    # 被 Stop-Process -Force 杀掉时 finally 不执行，会留下过期的 pid 文件；
+    # 所以读取方必须核对该 PID 是否还活着，不能只看文件在不在。
+    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }

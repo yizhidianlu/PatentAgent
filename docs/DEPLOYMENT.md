@@ -260,15 +260,20 @@ patent.yourcompany.com {
 
 ## 6. 备份与恢复
 
-**备份**（建议每日）：停服务后整体复制 `DATA_DIR`；若要热备，先执行 SQLite 的一致性备份再拷贝其余目录：
+**备份**（建议每日）：用 `deployackup.ps1`，它会自动定位 `DATA_DIR`（与更新脚本同一套判据），
+数据库走 SQLite 的 backup API 热备，服务不必停：
 
 ```powershell
-# 热备 app.db（WAL 模式下不能直接拷文件）
-.\backend\.venv\Scripts\python.exe -c "import sqlite3,os; s=sqlite3.connect(os.environ['DATA_DIR']+r'\app.db'); d=sqlite3.connect(r'D:\backup\app.db'); s.backup(d); d.close(); s.close()"
-# 再拷贝 uploads/ 与 outputs/
-robocopy $env:DATA_DIR\uploads D:\backup\uploads /MIR
-robocopy $env:DATA_DIR\outputs D:\backup\outputs /MIR
+.\deployackup.ps1 -Destination D:ackup\PatentAgent
+
+# 只备份数据库，跳过可能很大的 uploads/ 与 outputs/
+.\deployackup.ps1 -Destination D:ackup\PatentAgent -SkipMedia
 ```
+
+挂进计划任务即可每日自动备份。数据库备份默认保留最近 30 份（`-Keep` 可调）。
+
+> 别用 `os.environ['DATA_DIR']` 取数据目录——`DATA_DIR` 是 pydantic-settings 从
+> `backend\.env` 读进配置**字段**的，不会回写进程环境变量，那样只会拿到 `KeyError`。
 
 **恢复**：停服务 → 用备份覆盖 `DATA_DIR` → 启动。
 

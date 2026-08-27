@@ -18,7 +18,10 @@
 ### 1.1 可以做的
 
 - 跑 `deploy\update.ps1` 同步更新
-- 改 `backend\.env`（端口、域名、管理员、API Key 等**本机配置**）
+- 改 `backend\.env`（端口、域名、管理员、API Key 等**本机配置**）。
+  端口的优先级是：命令行 `-Port` > `.env` 的 `PORT` > 默认 8000；
+  `start.ps1` 与 `watchdog.ps1` 都按这个顺序取，改了 `.env` 不必再改计划任务。
+  端口取自 `.env` 时启动日志会写明来源。
 - 管理本机的服务进程、看门狗、cloudflared 隧道
 - 查日志、备份、排障
 
@@ -64,14 +67,29 @@
   （不一致就意味着回滚恢复不了数据库）
 - 看门狗常驻，按这台机器的隧道形态选一种：
 
-  | 情况 | 命令 |
+  | 情况 | 追加参数 |
   |---|---|
-  | 隧道是本项目的独立进程 | `watchdog.ps1 -Port 8000 -TunnelName <隧道名> -TunnelMetricsPort <端口>` |
-  | 隧道由 cloudflared 服务管（token 托管模式） | `watchdog.ps1 -Port 8000 -NoTunnel` |
-  | 不对外 / 隧道不归本项目管 | `watchdog.ps1 -Port 8000 -NoTunnel` |
+  | 隧道是本项目的独立进程 | `-TunnelName <隧道名> -TunnelMetricsPort <端口>` |
+  | 隧道由 cloudflared 服务管（token 托管模式） | `-NoTunnel` |
+  | 不对外 / 隧道不归本项目管 | `-NoTunnel` |
 
-  选错的后果：默认形态下若找不到隧道配置，看门狗会直接以退出码 2 停下并说明原因，
-  不会静默空转。
+  ```powershell
+  # 用绝对路径启动 —— 见下方说明，这不是可有可无的讲究
+  powershell -NoProfile -ExecutionPolicy Bypass `
+      -File C:\<部署目录>\watchdog.ps1 -Port 8000 -NoTunnel
+  ```
+
+  > **务必用绝对路径。** `update.ps1` 更新前要先停掉本仓库的看门狗，否则它会在
+  > 依赖安装/前端构建进行中把旧代码拉起来占住端口，之后的健康检查打在它身上照样
+  > 返回 200，整个更新以假成功收场。而它认人时不能按 `*watchdog.ps1*` 宽匹配——
+  > 同机很可能有别的项目也用这个文件名（部署机上就有一个 `C:\PB_watchdog\watchdog.ps1`），
+  > 宽匹配会把别人的守护进程一起杀掉。
+  >
+  > 现在有两道保险：看门狗启动时会把 PID 写进 `data\watchdog.pid` 供准确识别；
+  > 命令行用绝对路径则是第二道。两者都在时最稳。
+
+  隧道形态选错的后果：默认形态下若找不到隧道配置，看门狗会直接以退出码 2 停下
+  并说明原因，不会静默空转。
 
 装完请把这些回报给维护端：部署路径、端口、对外域名、`revision`。
 
@@ -118,6 +136,18 @@ PowerShell 在启动时就把整个脚本解析进内存了。如果这次更新
 
 若日志最后一行是「回滚后服务仍不健康，需要人工介入」，说明自动回滚也没救回来。
 这时按顺序处理：
+
+> **动手排障前，先把看门狗停掉。** 它每 30 秒体检一次，你在前台跑 `start.ps1`
+> 调试时，进程会被它判定异常并 Force kill，端口再被它拉起的隐藏实例占住，
+> 于是你再起就报端口占用——如此循环，而看门狗日志里只有三行重复内容。
+>
+> ```powershell
+> # data\watchdog.pid 里记着 PID
+> Get-Content .\data\watchdog.pid
+> Stop-Process -Id <pid> -Force
+> ```
+>
+> 排障完成后再按前面表格里的形态把它起回来。
 
 ```powershell
 # 1. 确认代码在日志记录的旧 commit 上

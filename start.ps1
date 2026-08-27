@@ -63,6 +63,40 @@ $Py       = Join-Path $Venv 'Scripts\python.exe'
 $Dist     = Join-Path $Frontend 'dist\index.html'
 $NodeMods = Join-Path $Frontend 'node_modules'
 $DataDir  = Join-Path $Root 'data'
+$script:PortFromEnv = $false
+
+# --------------------------------------------------------------------------
+# 端口来源：显式 -Port > backend\.env 的 PORT > 默认 8000
+#
+# 契约文档把「端口」列为部署端可通过改 .env 自主调整的本机配置，两份 .env 模板
+# 也都列了 PORT。但脚本此前只认 -Port 参数，全文没有一处读 .env：改了 .env 再按
+# 文档用不带 -Port 的计划任务重启，服务仍在 8000，而 .env 与对外回报的端口都是新值，
+# 零告警。若据此改了隧道 ingress，对外立刻 502，排障时唯一的事实源还是错的。
+# --------------------------------------------------------------------------
+function Get-EnvFilePort {
+    $envFile = Join-Path $Backend '.env'
+    if (-not (Test-Path -LiteralPath $envFile)) { return 0 }
+    try {
+        foreach ($raw in (Get-Content -LiteralPath $envFile -ErrorAction Stop)) {
+            $line = $raw.Trim()
+            if (-not $line -or $line.StartsWith('#')) { continue }
+            if ($line -match '^\s*PORT\s*=\s*"?''?(\d+)"?''?\s*$') {
+                $v = [int] $Matches[1]
+                if ($v -ge 1 -and $v -le 65535) { return $v }
+            }
+        }
+    } catch { }
+    return 0
+}
+
+if (-not $PSBoundParameters.ContainsKey('Port')) {
+    $envPort = Get-EnvFilePort
+    if ($envPort -gt 0 -and $envPort -ne $Port) {
+        $Port = $envPort
+        $script:PortFromEnv = $true
+    }
+}
+
 
 # --------------------------------------------------------------------------
 # 控制台 UTF-8（保证中文与日志不乱码）
@@ -215,6 +249,7 @@ if (-not (Test-Path -LiteralPath $Backend -PathType Container)) {
 # 1. 端口
 # --------------------------------------------------------------------------
 Write-Step "检查端口 $Port"
+if ($script:PortFromEnv) { Write-Info "端口取自 backend\.env 的 PORT" }
 if (Test-PortInUse $Port) {
     $owner = Get-PortOwner $Port
     $hints = @()
@@ -225,9 +260,16 @@ if (Test-PortInUse $Port) {
         $hints += "端口 $Port 已被其它程序占用"
     }
     $hints += "或换个端口启动：.\start.ps1 -Port 8080"
-    Stop-WithHelp "端口 $Port 不可用" $hints
+    if ($SetupOnly) {
+        # -SetupOnly 只做环境准备与自检，不会去监听端口。服务正跑着时想做一次
+        # 只读复查是很正常的诉求（报错提示里也是这么建议的），不该被端口占用挡回。
+        Write-Note "端口 $Port 已被占用；-SetupOnly 不启动服务，继续自检"
+    } else {
+        Stop-WithHelp "端口 $Port 不可用" $hints
+    }
+} else {
+    Write-Ok "端口 $Port 可用"
 }
-Write-Ok "端口 $Port 可用"
 
 # --------------------------------------------------------------------------
 # 2. Python 环境
@@ -263,19 +305,50 @@ if (-not $venvReady) {
     Write-Ok "虚拟环境就绪"
 }
 
-# 依赖自检：venv 存在但依赖缺失（如中途装到一半）时自动补装。
-# 用 find_spec 只查「有没有」而不真的 import —— 缺依赖时**不会吐 Traceback**，
-# 免得正常的首次安装流程里先闪一屏吓人的红字。
-# 外层双引号 + 内层单引号：PS 5.1 向原生程序传参会吞掉内嵌的双引号。
+# 依赖自检：venv 存在但依赖缺失（如中途装到一半、或版本升级后新增了依赖）时自动补装。
+#
+# 早先这里只 find_spec 四个包（fastapi/uvicorn/pydantic/openai），而 pyproject.toml
+# 声明了二十多个运行时依赖。只要这四个在就判定「依赖就绪」，于是最该起作用的场景
+# ——维护端新增了一个依赖、部署端拉到新代码——恰好探不出来：-SetupOnly 报环境正常，
+# 服务起来后在运行时 ImportError。
+#
+# 改为比对 pyproject.toml 的指纹：装成功后把它的 SHA256 记在 venv 里，
+# 内容一变就重装。这跟 update.ps1 按 pyproject 的 diff 决定装不装是同一套判据。
+$DepsStamp = Join-Path $Backend '.venv\.deps-fingerprint'
+$PyProject = Join-Path $Backend 'pyproject.toml'
+
+function Get-PyProjectHash {
+    if (-not (Test-Path -LiteralPath $PyProject)) { return '' }
+    return (Get-FileHash -LiteralPath $PyProject -Algorithm SHA256).Hash
+}
+
+$wantHash = Get-PyProjectHash
+$haveHash = ''
+if (Test-Path -LiteralPath $DepsStamp) {
+    $haveHash = (Get-Content -LiteralPath $DepsStamp -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if ($null -eq $haveHash) { $haveHash = '' }
+    $haveHash = $haveHash.Trim()
+}
+
+# 指纹之外仍探一次核心包：venv 目录被手工删过、或指纹文件是旧版本留下的，
+# 光比指纹会漏。两个判据任一不满足就装。
 $ProbeCode = "import importlib.util as u,sys;sys.exit(0 if all(u.find_spec(m) for m in ['fastapi','uvicorn','pydantic','openai']) else 1)"
 & $Py -c $ProbeCode
-$depsOk = ($LASTEXITCODE -eq 0)
+$coreOk = ($LASTEXITCODE -eq 0)
+$depsOk = $coreOk -and $wantHash -and ($haveHash -eq $wantHash)
+if ($coreOk -and -not $depsOk) {
+    Write-Note "依赖清单已变化（pyproject.toml），需要同步依赖…"
+}
 
 if (-not $depsOk) {
     if ($venvReady) { Write-Note "虚拟环境存在但后端依赖不完整，开始补装…" }
     Write-Info "安装后端依赖（首次约 2-5 分钟）…"
     & $Py -m pip install --upgrade pip --quiet --disable-pip-version-check
     & $Py -m pip install -e $Backend --quiet --disable-pip-version-check
+    if ($LASTEXITCODE -eq 0 -and $wantHash) {
+        # 记下这次装的是哪份 pyproject，下次据此判断要不要重装
+        Set-Content -LiteralPath $DepsStamp -Value $wantHash -Encoding ascii -ErrorAction SilentlyContinue
+    }
     if ($LASTEXITCODE -ne 0) {
         Stop-WithHelp "安装后端依赖失败" @(
             "请检查网络连接（需要访问 PyPI）",

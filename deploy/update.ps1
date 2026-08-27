@@ -76,6 +76,7 @@ $BackupDir  = $null
 $Py         = Join-Path $Backend '.venv\Scripts\python.exe'
 $HealthUrl  = "http://127.0.0.1:$Port/api/v1/system/health"
 $WatchdogPs = Join-Path $Root 'watchdog.ps1'
+$PidFile    = Join-Path $LogDir 'watchdog.pid'
 
 $script:StashRef = $null   # 有本地改动且 -Force 时记下 stash，回滚时还原
 
@@ -159,21 +160,81 @@ function Get-AppProcesses {
 }
 
 function Get-WatchdogProcesses {
-    <# 只认守护「本仓库」的看门狗。
+    <# 找出守护「本仓库」的看门狗，返回 PID 数组。
 
-       别按 *watchdog.ps1* 这种宽泛模式匹配：同一台机器上可能还跑着另一份
-       部署（或本项目的另一个副本）的看门狗，宽匹配会把它们一起停掉，
-       于是另一个服务失去守护而没人知道。按脚本绝对路径认人。
+       以 watchdog.ps1 启动时写下的 data\watchdog.pid 为准。命令行匹配在这里
+       两头不讨好：宽匹配（*watchdog.ps1*）会连同机另一份部署的看门狗一起停掉；
+       严匹配（绝对路径）又认不出相对路径启动的实例——而文档里给的正是
+       `watchdog.ps1 -Port 8000` 这种写法，Windows 保存的是原始命令行、不展开
+       相对路径，于是必然失配。失配的后果不是「少停一个进程」这么轻：
+       看门狗会在依赖安装/前端构建进行中把旧代码拉起来占住端口，
+       之后的健康检查打在它身上依然返回 200，整个更新以假成功收场。
+
+       pid 文件只是线索，不是凭据：进程被 Force kill 时 finally 不执行，
+       文件会残留。所以逐条核对该 PID 是否还活着、且确实是个 watchdog 进程。
     #>
+    $pids = [System.Collections.Generic.HashSet[int]]::new()
+
+    if (Test-Path $PidFile) {
+        $rec = @{}
+        foreach ($line in (Get-Content $PidFile -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*([a-z]+)\s*=\s*(.+?)\s*$') { $rec[$Matches[1]] = $Matches[2] }
+        }
+        # pid 文件必须是本仓库写的；别人的仓库写的不算数
+        if ($rec['root'] -eq $Root -and $rec['pid'] -match '^\d+$') {
+            $candidate = [int] $rec['pid']
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$candidate" -ErrorAction SilentlyContinue
+            if ($proc -and $proc.CommandLine -and $proc.CommandLine -like '*watchdog.ps1*') {
+                $confirmed = $false
+                if ($proc.CommandLine -like "*$WatchdogPs*") {
+                    # 命令行里就是本仓库的脚本路径，直接坐实
+                    $confirmed = $true
+                } elseif ($rec['started']) {
+                    # 相对路径启动时命令行看不出仓库，改用启动时间对齐。
+                    # 这一步是防 PID 复用：本仓库的看门狗被 Force kill 后 pid 文件会残留
+                    # （finally 不执行），那个 PID 可能已被别的进程占用。同机就有一个
+                    # 真实例子——PB_System 的计划任务 PB_Watchdog 跑的是
+                    # C:\PB_watchdog\watchdog.ps1，命令行同样含 "watchdog.ps1"。
+                    # 认错人就会把别的项目的守护进程杀掉，而且两边日志都不会提这件事。
+                    $started = [datetime]::MinValue
+                    if ([datetime]::TryParse($rec['started'], [ref] $started)) {
+                        $confirmed = ([math]::Abs((($proc.CreationDate) - $started).TotalSeconds) -le 120)
+                    }
+                }
+                if ($confirmed) {
+                    [void] $pids.Add($candidate)
+                } else {
+                    Write-Log 'WARN' "pid 文件记录的 $candidate 与实际进程对不上（可能是残留记录，PID 已被复用），已忽略"
+                }
+            }
+        }
+    }
+
+    # 兜底：pid 文件不存在（老版本看门狗、或写文件失败）时退回命令行匹配，
+    # 但**必须**限定在本仓库的绝对路径上。这里绝不能放宽成 *watchdog.ps1*：
+    # 部署机上就有一个叫 C:\PB_watchdog\watchdog.ps1 的守护进程（另一个项目的
+    # 计划任务），宽匹配会把它一起 Force kill，它要等下一个触发周期才回来，
+    # 期间那个项目无人守护，且两边日志都不会提到这件事。
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue -Filter "Name='powershell.exe' OR Name='pwsh.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$WatchdogPs*" }
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$WatchdogPs*" } |
+        ForEach-Object { [void] $pids.Add([int] $_.ProcessId) }
+
+    return @($pids)
 }
 
 function Stop-Watchdog {
-    $procs = @(Get-WatchdogProcesses)
-    if ($procs.Count -eq 0) { Write-Log 'INFO' '看门狗未运行'; return $false }
-    foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-    Write-Log 'OK' "已停看门狗（$($procs.Count) 个进程）"
+    $pids = @(Get-WatchdogProcesses)
+    if ($pids.Count -eq 0) {
+        # 更新期间应用会被停掉几分钟。若此刻其实有个看门狗在跑而我们没认出来，
+        # 它会在构建过程中把旧代码拉起来占住端口——这正是本脚本要防的事，
+        # 所以「没找到」值得一句 WARN，而不是淹没在 INFO 里。
+        Write-Log 'WARN' '未发现本仓库的看门狗；若确有守护进程在跑，请先手动停止再更新'
+        return $false
+    }
+    foreach ($processId in $pids) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
+    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+    Write-Log 'OK' "已停看门狗（$($pids.Count) 个进程）"
     return $true
 }
 
@@ -206,13 +267,42 @@ function Stop-App {
 }
 
 function Start-App {
+    <# 起应用并记下 PID，供随后核对端口属主。
+
+       Start-Process 是 fire-and-forget：端口已被别人占住时，新进程撞
+       WinError 10048 立刻退出，而这里不会有任何异常。若此刻端口上蹲着的是
+       看门狗用旧代码拉起来的进程，后续健康检查照样返回 200、revision 读的是
+       .git（已 merge 完），比对也能过——更新于是以「成功」收场，实际跑的还是旧代码。
+       所以必须回头确认：端口属主到底是不是我刚起的这个。
+    #>
     $argList = @(
         '-m', 'uvicorn', 'app.main:app',
         '--host', '127.0.0.1', '--port', $Port,
         '--proxy-headers', '--forwarded-allow-ips', '127.0.0.1'
     )
-    Start-Process -FilePath $Py -ArgumentList $argList -WorkingDirectory $Backend -WindowStyle Hidden
-    Write-Log 'INFO' '应用启动中...'
+    $proc = Start-Process -FilePath $Py -ArgumentList $argList -WorkingDirectory $Backend `
+                          -WindowStyle Hidden -PassThru
+    Write-Log 'INFO' "应用启动中（pid=$($proc.Id)）..."
+    return $proc.Id
+}
+
+function Assert-PortOwnedBy {
+    <# 端口的监听者必须是我们刚起的那个进程，否则说明端口被别人占着。 #>
+    param([int] $ExpectedPid)
+    $owners = @()
+    try {
+        $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+    } catch { }
+    if ($owners.Count -eq 0) {
+        # 拿不到属主信息（cmdlet 不可用等）时不阻断更新，健康检查仍是主判据
+        Write-Log 'WARN' "无法确认端口 $Port 的属主进程，跳过归属校验"
+        return
+    }
+    if ($owners -notcontains $ExpectedPid) {
+        throw ("端口 $Port 的监听者是 pid=$($owners -join ',')，而本次启动的是 pid=$ExpectedPid。" +
+               '通常意味着有看门狗或残留进程抢先占用了端口，当前服务跑的不是刚更新的代码。')
+    }
 }
 
 function Test-Healthy {
@@ -406,9 +496,11 @@ try {
     Update-Dependencies -FromCommit $oldCommit -ToCommit $newCommit
     Build-Frontend
 
-    Start-App
+    $appPid = Start-App
     $rev = Test-Healthy -TimeoutSeconds 90
     if (-not $rev) { throw '应用启动后 90 秒内未通过健康检查' }
+    # 健康检查过了不等于「跑的是我起的那个进程」——先确认端口归属再下结论
+    Assert-PortOwnedBy -ExpectedPid $appPid
 
     $expect = $newCommit.Substring(0, 7)
     if ($rev -ne $expect) {
@@ -431,10 +523,11 @@ catch {
         # 回退后依赖与前端产物都得跟着回到旧版本
         Update-Dependencies -FromCommit $newCommit -ToCommit $oldCommit
         Build-Frontend
-        Start-App
+        $appPid = Start-App
 
         $rev = Test-Healthy -TimeoutSeconds 90
         if ($rev) {
+            Assert-PortOwnedBy -ExpectedPid $appPid
             Write-Log 'OK' "=== 已回滚并恢复服务（revision=$rev）==="
         } else {
             Write-Log 'ERR' '=== 回滚后服务仍不健康，需要人工介入 ==='
