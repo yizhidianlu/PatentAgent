@@ -110,10 +110,27 @@ def run_migrations() -> list[int]:
                 continue
             sql = path.read_text(encoding="utf-8")
             logger.info("应用数据库迁移 %s ...", path.name)
-            conn.executescript(sql)
-            conn.execute("DELETE FROM schema_version")
-            conn.execute("INSERT INTO schema_version(version) VALUES (?)", (version,))
-            conn.commit()
+            # 迁移期间必须关外键。SQLite 改不了表约束，只能「建新表→复制→DROP 旧表」，
+            # 而 DROP 会触发 ON DELETE CASCADE：实测重建 users 表把 sessions 与
+            # usage_counters 一起清空了——用户被强制登出还只是麻烦，用量计数归零
+            # 意味着配额失效、统计断档，而且不会有任何报错。
+            # 关掉之后用 foreign_key_check 兜底，有悬空引用就回滚，不让脏数据落地。
+            conn.commit()                      # PRAGMA foreign_keys 在事务内是空操作
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.executescript(sql)
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    conn.rollback()
+                    raise RuntimeError(
+                        f"迁移 {path.name} 产生了 {len(violations)} 处外键悬空引用，已回滚："
+                        f"{violations[:5]}"
+                    )
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version(version) VALUES (?)", (version,))
+                conn.commit()
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
             applied.append(version)
             current = version
     if applied:

@@ -181,8 +181,12 @@ def create_user(
     quota: Quota | None = None,
     must_change_password: bool = True,
     created_by: str | None = None,
+    status: str = "active",
 ) -> dict[str, Any]:
-    """建号；用户名重复抛 ValueError。"""
+    """建号；用户名重复抛 ValueError。
+
+    status 默认 active（管理员建号即刻可用）；自行注册传 pending 等待审核。
+    """
     uname = username.strip().lower()
     if get_user_row_by_username(uname):
         raise ValueError(f"用户名「{uname}」已存在")
@@ -192,15 +196,56 @@ def create_user(
         """
         INSERT INTO users(id, username, display_name, password_hash, role, status,
                           must_change_password, quota_json, created_by, created_at, updated_at)
-        VALUES (?,?,?,?,?,'active',?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
-        (user_id, uname, display_name or uname, hash_password(password), role,
+        (user_id, uname, display_name or uname, hash_password(password), role, status,
          1 if must_change_password else 0, (quota or Quota()).model_dump_json(),
          created_by, now, now),
     )
     row = get_user_row(user_id)
     assert row is not None
     return row
+
+
+def registration_open() -> bool:
+    """是否允许自行注册（管理员可在后台关掉）。"""
+    policy = db.get_setting_json("auth") or {}
+    value = policy.get("allow_registration")
+    return True if value is None else bool(value)
+
+
+def set_registration_open(allowed: bool) -> None:
+    policy = db.get_setting_json("auth") or {}
+    policy["allow_registration"] = bool(allowed)
+    db.set_setting_json("auth", policy)
+
+
+def count_pending() -> int:
+    """待审核账号数——后台入口上要挂角标，不然没人会想起来去看。"""
+    row = db.query_one("SELECT COUNT(*) AS n FROM users WHERE status='pending'")
+    return int(row["n"]) if row else 0
+
+
+def register_user(username: str, password: str, display_name: str = "") -> dict[str, Any]:
+    """自行注册：建一个 pending 账号，等管理员放行。
+
+    有意不签发会话、不返回用户对象——注册这一步不该带来任何权限。
+    用户名已存在时抛 AuthError；这里不做「不泄露账号是否存在」的处理，
+    因为注册接口本来就必须告诉用户「这个名字被占了」，藏也藏不住。
+    """
+    if not registration_open():
+        raise AuthError("管理员已关闭自助注册，请联系管理员开通账号。", code="registration_closed")
+    if get_user_row_by_username(username):
+        raise AuthError("该用户名已被占用，请换一个。", code="username_taken")
+    return create_user(
+        username=username,
+        password=password,
+        role="user",
+        display_name=display_name or username,
+        must_change_password=False,
+        status="pending",
+        created_by=None,      # 无创建者 = 自行注册，与管理员建号区分开
+    )
 
 
 def set_password(user_id: str, password: str, *, must_change: bool = False) -> None:
@@ -357,7 +402,12 @@ def authenticate(username: str, password: str) -> dict[str, Any]:
             )
         raise AuthError(LOGIN_FAILED_MESSAGE)
 
-    if (row.get("status") or "active") != "active":
+    status = row.get("status") or "active"
+    if status == "pending":
+        # 待审核与停用要分开讲：前者是「还没轮到你」，后者是「你被停了」。
+        # 说成一样的，用户会以为自己被拒了，转头就来问管理员。
+        raise AuthError("账号正在等待管理员审核，审核通过后即可登录。", code="pending")
+    if status != "active":
         raise AuthError("账号已被停用，请联系管理员。", code="disabled")
 
     # 密码正确：顺带做哈希参数升级

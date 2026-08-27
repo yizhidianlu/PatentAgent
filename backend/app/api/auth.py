@@ -14,7 +14,15 @@ from fastapi.responses import JSONResponse
 
 from ..config import get_config
 from ..db import database as db
-from ..models.auth import ChangePasswordIn, LoginIn, LoginOut, UserOut
+from ..models.auth import (
+    ChangePasswordIn,
+    LoginIn,
+    LoginOut,
+    RegisterIn,
+    RegisterOut,
+    RegistrationStateOut,
+    UserOut,
+)
 from ..models.common import Ok, OkMessage
 from ..services import auth as auth_service
 from .deps import client_ip, current_user
@@ -89,6 +97,44 @@ async def login(body: LoginIn, request: Request, response: Response) -> Any:
         actor_id=row["id"], actor_name=row["username"], ip=ip,
     )
     return LoginOut(user=_user_out(row, with_usage=True), csrf_token=session["csrf_token"])
+
+
+@router.get("/registration-open", response_model=RegistrationStateOut, summary="是否开放自助注册")
+async def registration_state() -> RegistrationStateOut:
+    """登录页据此决定要不要显示「注册」入口。公开接口，不含任何账号信息。"""
+    return RegistrationStateOut(open=await db.arun(auth_service.registration_open))
+
+
+@router.post("/register", response_model=RegisterOut, status_code=201, summary="自助注册")
+async def register(body: RegisterIn, request: Request) -> Any:
+    """自助注册一个待审核账号。
+
+    有意**不签发会话**：注册这一步不该带来任何权限，账号要等管理员放行。
+    注册接口必须如实告知「用户名被占用」——那是用户改名的唯一依据，
+    藏也藏不住（换个名字再试一次就知道了），所以这里不做登录那套模糊化处理。
+    """
+    ip = client_ip(request)
+    try:
+        row = await db.arun(
+            auth_service.register_user, body.username, body.password, body.display_name,
+        )
+    except auth_service.AuthError as exc:
+        await db.arun(
+            auth_service.audit, "register_rejected",
+            actor_name=body.username, detail={"code": exc.code, "reason": str(exc)}, ip=ip,
+        )
+        return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=400)
+    except ValueError as exc:   # create_user 的用户名冲突兜底
+        return JSONResponse({"detail": str(exc), "code": "username_taken"}, status_code=400)
+
+    await db.arun(
+        auth_service.audit, "register",
+        actor_id=row["id"], actor_name=row["username"], ip=ip,
+    )
+    return RegisterOut(
+        status="pending",
+        message="注册成功。账号需管理员审核通过后才能登录，请稍后再试或联系管理员。",
+    )
 
 
 @router.post("/logout", response_model=Ok, summary="登出")

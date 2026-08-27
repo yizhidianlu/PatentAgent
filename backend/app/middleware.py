@@ -26,12 +26,17 @@ API_PREFIX = "/api/"
 # 无需登录即可访问的 API 路径（精确匹配）
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
     "/api/v1/auth/login",
+    # 自助注册与「是否开放注册」都必须在登录之前可达
+    "/api/v1/auth/register",
+    "/api/v1/auth/registration-open",
     "/api/v1/system/health",
 })
 
 # 免 CSRF 校验的路径：登录本身（此时还没有会话）
 CSRF_EXEMPT_PATHS: frozenset[str] = frozenset({
     "/api/v1/auth/login",
+    # 注册时还没有会话，自然也没有 CSRF token 可带
+    "/api/v1/auth/register",
 })
 
 SAFE_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})

@@ -74,6 +74,27 @@ class RegisterIn(BaseModel):
     display_name: str = Field(default="", max_length=64)
 
 
+class RegistrationPolicyIn(BaseModel):
+    """管理员开关自助注册。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_registration: bool
+
+
+class RegistrationPolicyOut(BaseModel):
+    """自助注册策略 + 待审数量（后台入口上要挂角标，否则没人想起来去看）。"""
+
+    allow_registration: bool
+    pending_count: int = 0
+
+
+class RegistrationStateOut(BaseModel):
+    """是否开放自助注册。登录页据此决定显不显示注册入口。"""
+
+    open: bool
+
+
 class RegisterOut(BaseModel):
     """注册结果。审核制下不签发会话，只告诉用户接下来会发生什么。"""
 

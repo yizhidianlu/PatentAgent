@@ -20,6 +20,8 @@ from ..models.auth import (
     UserCreateIn,
     UserOut,
     UserUpdateIn,
+    RegistrationPolicyIn,
+    RegistrationPolicyOut,
 )
 from ..models.common import OkMessage, Page
 from ..services import auth as auth_service
@@ -45,11 +47,51 @@ def _admin_count_sync() -> int:
 # ---------------------------------------------------------------------------
 
 
+@router.get("/registration", response_model=RegistrationPolicyOut, summary="自助注册策略")
+async def get_registration(
+    admin: dict[str, Any] = Depends(require_admin),
+) -> RegistrationPolicyOut:
+    def _run() -> RegistrationPolicyOut:
+        return RegistrationPolicyOut(
+            allow_registration=auth_service.registration_open(),
+            pending_count=auth_service.count_pending(),
+        )
+
+    return await db.arun(_run)
+
+
+@router.put("/registration", response_model=RegistrationPolicyOut, summary="开关自助注册")
+async def set_registration(
+    body: RegistrationPolicyIn,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> RegistrationPolicyOut:
+    """关掉之后登录页不再显示注册入口，注册接口也直接拒绝。
+
+    已经处于待审的账号不受影响——关闭注册是「不再收新的」，
+    不是「把排队的人赶走」，那是两件事，混在一起会让管理员误伤。
+    """
+    def _run() -> RegistrationPolicyOut:
+        auth_service.set_registration_open(body.allow_registration)
+        auth_service.audit(
+            "registration_policy_changed",
+            actor_id=admin["id"], actor_name=admin["username"],
+            detail={"allow_registration": body.allow_registration},
+            ip=client_ip(request),
+        )
+        return RegistrationPolicyOut(
+            allow_registration=auth_service.registration_open(),
+            pending_count=auth_service.count_pending(),
+        )
+
+    return await db.arun(_run)
+
+
 @router.get("/users", response_model=Page[UserOut], summary="用户列表")
 async def list_users(
     q: str | None = Query(default=None, description="按用户名或显示名模糊搜索"),
     role: str | None = Query(default=None, pattern="^(admin|user)$"),
-    status: str | None = Query(default=None, pattern="^(active|disabled)$"),
+    status: str | None = Query(default=None, pattern="^(active|disabled|pending)$"),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> Page[UserOut]:
