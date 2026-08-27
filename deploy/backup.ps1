@@ -57,18 +57,27 @@ if (-not (Test-Path $Py)) {
     exit 1
 }
 
-# 数据目录问应用要，不在这里复刻一份 .env 解析
-$code = 'import sys; sys.path.insert(0, r"' + $Backend + '"); from app.config import get_config; print(get_config().data_dir)'
+# 数据目录问应用要，不在这里复刻一份 .env 解析。
+# 代码放在 _datadir.py 里，这里只传文件名——`python -c "..."` 在 PS 5.1 上必然失败：
+# 内嵌双引号会被吞掉，r"C:\path" 变成 rC:\path 直接 SyntaxError；换单引号又撞上
+# 路径里的 \U 转义。这个脚本早先正是栽在这里，每次都在这一步 exit 1，一个字节也备不出来。
+$dataDirScript = Join-Path $PSScriptRoot '_datadir.py'
+if (-not (Test-Path $dataDirScript)) {
+    Write-Line 'ERR' "缺少 $dataDirScript，无法确定数据目录"
+    exit 1
+}
 $prev = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 try {
     $global:LASTEXITCODE = 0
-    $out = & $Py -c $code 2>$null
+    $raw = & $Py $dataDirScript 2>&1 | ForEach-Object { "$_" }
+    $out = @($raw | Where-Object { $_ -and $_.Trim() })
 } finally {
     $ErrorActionPreference = $prev
 }
 if ($LASTEXITCODE -ne 0 -or -not $out) {
     Write-Line 'ERR' '读不到应用配置的 DATA_DIR，无法确定要备份哪个目录'
+    foreach ($l in @($out | Select-Object -Last 5)) { Write-Line 'ERR' "  $l" }
     exit 1
 }
 $DataDir = "$(@($out) | Select-Object -Last 1)".Trim()
@@ -86,7 +95,7 @@ if (Test-Path $db) {
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $target = Join-Path $Destination "app-$stamp.db"
     # WAL 模式下 app.db 之外还有 -wal/-shm，冷拷会拿到不一致的快照
-    $script = @"
+    $backupPy = @"
 import sqlite3, sys
 src = sqlite3.connect(sys.argv[1])
 dst = sqlite3.connect(sys.argv[2])
@@ -95,10 +104,21 @@ with dst:
 dst.close(); src.close()
 "@
     $tmp = Join-Path $env:TEMP "pa-backup-$stamp.py"
-    Set-Content -Path $tmp -Value $script -Encoding utf8
+    Set-Content -Path $tmp -Value $backupPy -Encoding utf8
     try {
         & $Py $tmp $db $target
         if ($LASTEXITCODE -ne 0) { throw "sqlite backup 退出码 $LASTEXITCODE" }
+        if (-not (Test-Path $target) -or (Get-Item $target).Length -eq 0) {
+            throw 'sqlite backup 未产出有效文件'
+        }
+    } catch {
+        # 半成品必须删掉。源库被并发写占住时会抛 database is locked，此时目标目录里
+        # 已经留下一个 0 字节的 app-<时间戳>.db；它按时间戳是「最近一份」，
+        # 恢复时照着取就会拿到空文件，同时还挤占 -Keep 的保留窗口。
+        Remove-Item $target -Force -ErrorAction SilentlyContinue
+        Write-Line 'ERR' "数据库备份失败：$($_.Exception.Message)"
+        Write-Line 'ERR' '（若提示 database is locked，请稍后重试或先停服务）'
+        exit 1
     } finally {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     }
@@ -124,7 +144,10 @@ if (-not $SkipMedia) {
         $dst = Join-Path $Destination $name
         # /MIR 会让目标镜像源目录（含删除）。只在源确实存在时才走到这里，
         # 所以不会出现「源不存在导致目标被清空」的情况。
-        & robocopy $src $dst /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+        # /R /W 必须显式给：默认是「重试 100 万次、每次等 30 秒」，
+        # uploads 里只要有一个文件被杀软实时扫描或 Word COM 占住，
+        # 备份就会挂死约 347 天，日志停在上一行、看着像还在跑。
+        & robocopy $src $dst /MIR /R:2 /W:5 /NFL /NDL /NJH /NJS /NP | Out-Null
         # robocopy 的退出码 0-7 都算成功（8 及以上才是错误）
         if ($LASTEXITCODE -ge 8) {
             Write-Line 'ERR' "$name\ 复制失败（robocopy exit=$LASTEXITCODE）"

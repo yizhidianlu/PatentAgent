@@ -123,15 +123,32 @@ function Get-AppProcess {
        所以判据必须和 deploy\update.ps1 一致：先看谁在监听本端口，
        再以本仓库 .venv 的解释器兜底（进程已崩到不监听、或刚起还没绑上端口）。
     #>
-    $pids = [System.Collections.Generic.HashSet[int]]::new()
+    # 端口监听者
+    $byPort = [System.Collections.Generic.HashSet[int]]::new()
     try {
         Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-            ForEach-Object { [void] $pids.Add([int] $_.OwningProcess) }
+            ForEach-Object { [void] $byPort.Add([int] $_.OwningProcess) }
     } catch { }
-    Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Py*" -and $_.CommandLine -like '*uvicorn*' } |
-        ForEach-Object { [void] $pids.Add([int] $_.ProcessId) }
-    return @($pids)
+
+    # 本仓库 .venv 解释器跑的 uvicorn
+    $byVenv = @(
+        Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Py*" -and $_.CommandLine -like '*uvicorn*' } |
+            ForEach-Object { [int] $_.ProcessId }
+    )
+
+    # 两条判据取**交集**，不是并集。并集会误伤：本看门狗守 8000，而同机可能还跑着
+    # `.\start.ps1 -Port 8080` 起的另一个健康实例（端口占用时的官方建议就是换端口），
+    # 它同样是本仓库 .venv 的 uvicorn——并集会在 8000 不健康时把 8080 那个一起 Force kill。
+    $both = @($byVenv | Where-Object { $byPort.Contains($_) })
+    if ($both.Count -gt 0) { return $both }
+
+    # 交集为空的两种情形，都只该动本端口上的那个：
+    #   * 进程崩到不再监听（byPort 空）→ 用 byVenv 里的？不行，那可能是别的端口上的实例。
+    #     只有当 byVenv 只有一个、且本端口无人监听时，才能确定它就是我们的。
+    #   * 端口被非本仓库进程占着（byVenv 空）→ 交给上层报错，不在这里杀。
+    if ($byPort.Count -eq 0 -and $byVenv.Count -eq 1) { return $byVenv }
+    return @()
 }
 
 function Get-TunnelProcess {
@@ -201,7 +218,10 @@ function Restart-Tunnel {
     Write-Log 'FIX' '重启隧道...'
     Get-TunnelProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 3
-    $argList = @('tunnel','--config',$TunnelConf,'run')
+    # --metrics 必须带上：不带的话 cloudflared 会退回默认行为，metrics 不在我们探的
+    # 端口上；而 Test-TunnelHealthy 首次探测成功后已切到 fail-closed，于是探不到就判
+    # 不健康 → 再重启 → 还是不带 --metrics……每 60 秒重启一次本来健康的隧道，永不收敛。
+    $argList = @('tunnel','--config',$TunnelConf,'--metrics',"127.0.0.1:$TunnelMetricsPort",'run')
     Start-Process -FilePath 'cloudflared' -ArgumentList $argList -WindowStyle Hidden
     Start-Sleep -Seconds 12
     if (Test-TunnelHealthy) { Write-Log 'OK' '隧道已恢复' } else { Write-Log 'ERR' '隧道重启后仍不健康' }
@@ -266,11 +286,22 @@ if ($Once) {
 try {
     $pidDir = Split-Path -Parent $PidFile
     if (-not (Test-Path $pidDir)) { New-Item -ItemType Directory -Force $pidDir | Out-Null }
+    # args 行记下完整启动参数：update.ps1 停掉看门狗后要原样把它拉回来。
+    # 只记 port 是不够的——隧道形态的几个开关丢掉后，重启的看门狗会静默回落到
+    # 默认形态，轻则盯错隧道，重则撞上配置缺失的闸门当场退出，服务从此无人守护。
+    $savedArgs = @('-Port', "$Port", '-IntervalSeconds', "$IntervalSeconds")
+    if ($NoTunnel) {
+        $savedArgs += '-NoTunnel'
+    } else {
+        $savedArgs += @('-TunnelName', $TunnelName, '-TunnelMetricsPort', "$TunnelMetricsPort")
+        if ($TunnelConfig) { $savedArgs += @('-TunnelConfig', $TunnelConfig) }
+    }
     Set-Content -Path $PidFile -Encoding utf8 -Value @(
         "pid=$PID"
         "port=$Port"
         "root=$Root"
         "started=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        "args=$($savedArgs -join '|')"
     )
 } catch {
     Write-Log 'WARN' ('无法写入 ' + $PidFile + '：' + $_.Exception.Message + '；update.ps1 可能认不出本进程')

@@ -260,14 +260,14 @@ patent.yourcompany.com {
 
 ## 6. 备份与恢复
 
-**备份**（建议每日）：用 `deployackup.ps1`，它会自动定位 `DATA_DIR`（与更新脚本同一套判据），
+**备份**（建议每日）：用 `deploy\backup.ps1`，它会自动定位 `DATA_DIR`（与更新脚本同一套判据），
 数据库走 SQLite 的 backup API 热备，服务不必停：
 
 ```powershell
-.\deployackup.ps1 -Destination D:ackup\PatentAgent
+.\deploy\backup.ps1 -Destination D:\backup\PatentAgent
 
 # 只备份数据库，跳过可能很大的 uploads/ 与 outputs/
-.\deployackup.ps1 -Destination D:ackup\PatentAgent -SkipMedia
+.\deploy\backup.ps1 -Destination D:\backup\PatentAgent -SkipMedia
 ```
 
 挂进计划任务即可每日自动备份。数据库备份默认保留最近 30 份（`-Keep` 可调）。

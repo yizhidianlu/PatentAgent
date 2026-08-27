@@ -79,6 +79,14 @@ $WatchdogPs = Join-Path $Root 'watchdog.ps1'
 $PidFile    = Join-Path $LogDir 'watchdog.pid'
 
 $script:StashRef = $null   # 有本地改动且 -Force 时记下 stash，回滚时还原
+$script:SavedWatchdogArgs = @()   # 停看门狗前记下它的启动参数，重启时原样还原
+$script:WatchdogFailed = $false   # 看门狗没能起回来 → 影响退出码，不能静默 exit 0
+
+# PS 5.1 按控制台 OEM 代码页（简体中文机器上是 GBK）解码原生命令的输出，
+# git log 里 UTF-8 的中文提交标题会就此损坏，写进更新日志就成了乱码——
+# 而「这次更新改了什么」正是排障时最先要看的一行。
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch { }
+$env:PYTHONIOENCODING = 'utf-8'
 
 # --- 日志 -------------------------------------------------------------------
 function Write-Log {
@@ -222,7 +230,18 @@ function Get-WatchdogProcesses {
     return @($pids)
 }
 
+function Save-WatchdogArgs {
+    <# 把 pid 文件里记的启动参数存下来，重启时原样还原 #>
+    if (-not (Test-Path $PidFile)) { return }
+    foreach ($line in (Get-Content $PidFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*args\s*=\s*(.+?)\s*$') {
+            $script:SavedWatchdogArgs = @($Matches[1] -split '\|' | Where-Object { $_ -ne '' })
+        }
+    }
+}
+
 function Stop-Watchdog {
+    Save-WatchdogArgs
     $pids = @(Get-WatchdogProcesses)
     if ($pids.Count -eq 0) {
         # 更新期间应用会被停掉几分钟。若此刻其实有个看门狗在跑而我们没认出来，
@@ -240,13 +259,24 @@ function Stop-Watchdog {
 
 function Start-Watchdog {
     if (-not (Test-Path $WatchdogPs)) { Write-Log 'WARN' '找不到 watchdog.ps1，跳过'; return }
-    # watchdog.ps1 只认 -IntervalSeconds / -Port / -Once。多传一个它不认识的参数，
-    # PowerShell 会直接报错退出，服务就此失去守护且没有任何提示。
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $WatchdogPs, '-Port', $Port)
+    # 原样还原停掉之前的启动参数。只传 -Port 是不够的：
+    # 隧道相关的 -NoTunnel / -TunnelName / -TunnelConfig / -TunnelMetricsPort 丢掉后，
+    # 看门狗会静默回落到默认隧道形态——本机没有那个配置文件时它撞上 exit 2 当场自杀，
+    # 于是每更新一次就把唯一的自愈守护永久删掉一次；配置文件恰好存在时更隐蔽，
+    # 它会开始盯着一条错的隧道。参数由 watchdog.ps1 写在 pid 文件的 args 行里。
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $WatchdogPs)
+    if ($script:SavedWatchdogArgs -and $script:SavedWatchdogArgs.Count -gt 0) {
+        $argList += $script:SavedWatchdogArgs
+        Write-Log 'INFO' "还原看门狗参数：$($script:SavedWatchdogArgs -join ' ')"
+    } else {
+        $argList += @('-Port', $Port)
+        Write-Log 'WARN' "未记录到原启动参数，按 -Port $Port 启动；若原先用了 -NoTunnel/-TunnelName，请手动重启看门狗"
+    }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 4
     if (@(Get-WatchdogProcesses).Count -eq 0) {
         Write-Log 'ERR' '看门狗启动后立即退出，服务当前无人守护——请手动检查 watchdog.ps1'
+        $script:WatchdogFailed = $true
     } else {
         Write-Log 'OK' '看门狗已启动'
     }
@@ -331,17 +361,31 @@ function Resolve-DataDir {
        DATA_DIR 可来自环境变量或 .env，还涉及引号、相对路径、大小写等细节。
        与其在 PowerShell 里复刻一份必然有偏差的解析，不如直接让应用告诉我们。
     #>
-    $code = 'import sys; sys.path.insert(0, r"' + $Backend + '"); from app.config import get_config; print(get_config().data_dir)'
+    # 代码放在 deploy\_datadir.py 里，这里只传文件名。
+    # 别改回 `python -c "..."`：PS 5.1 会吞掉内嵌双引号，r"C:\path" 到 Python 手里
+    # 变成 rC:\path 直接 SyntaxError；换单引号又会撞上路径里的 \U 转义。两条路都堵死，
+    # 而 2>$null 会把这个 SyntaxError 一并吞掉，只剩一句笼统的 WARN——
+    # 于是函数每次都静默走兜底，看日志还以为一切正常。
+    $script = Join-Path $PSScriptRoot '_datadir.py'
+    if (-not (Test-Path $script)) {
+        Write-Log 'WARN' "缺少 $script，无法确定数据目录"
+        return (Join-Path $Root 'data')
+    }
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $errText = ''
     try {
         $global:LASTEXITCODE = 0
-        $out = & $Py -c $code 2>$null
+        $raw = & $Py $script 2>&1 | ForEach-Object { "$_" }
+        $out = @($raw | Where-Object { $_ -and $_.Trim() })
+        if ($LASTEXITCODE -ne 0) { $errText = ($out | Select-Object -Last 3) -join '; ' }
     } catch {
         $out = $null
+        $errText = $_.Exception.Message
     } finally {
         $ErrorActionPreference = $prev
     }
+    if ($errText) { Write-Log 'WARN' "定位数据目录失败：$errText" }
     if ($LASTEXITCODE -eq 0 -and $out) {
         $p = "$(@($out) | Select-Object -Last 1)".Trim()
         if ($p -and (Test-Path $p)) { return $p }
@@ -548,4 +592,9 @@ finally {
 }
 
 if ($rolledBack) { exit 1 }
+if ($script:WatchdogFailed) {
+    # 代码是新的、服务也在跑，但自愈守护没了——这不该报告成完全成功。
+    Write-Log 'WARN' '更新已完成，但看门狗未能启动：服务当前无人守护，请手动处理'
+    exit 3
+}
 exit 0
