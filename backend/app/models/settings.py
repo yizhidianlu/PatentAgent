@@ -145,6 +145,16 @@ class LlmTestRequest(BaseModel):
     temperature: float | None = Field(default=None, ge=TEMPERATURE_MIN, le=TEMPERATURE_MAX)
 
 
+class ModelCapability(BaseModel):
+    """从服务商 /v1/models 探测到的模型能力（探测不到的字段留空）。"""
+
+    context_length: int | None = None
+    max_output_tokens: int | None = None
+    supports_reasoning: bool | None = None
+    #: 上面两项若为服务端推荐而非厂商明示，置 true，前端据此措辞
+    estimated: bool = False
+
+
 class LlmTestResult(BaseModel):
     """LLM 连接测试结果。"""
 
@@ -152,6 +162,8 @@ class LlmTestResult(BaseModel):
     model: str | None = None
     latency_ms: int | None = None
     error: str | None = None
+    #: 顺带探测到的模型规格，供前端一键填入「上下文窗口 / 最大输出」
+    capability: ModelCapability | None = None
 
 
 class EmbeddingTestRequest(BaseModel):

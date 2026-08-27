@@ -18,6 +18,7 @@ import re
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 from ulid import ULID
@@ -30,6 +31,7 @@ from ..models.settings import (
     ImageGenTestResult,
     LlmSettings,
     LlmTestResult,
+    ModelCapability,
     load_tolerant,
 )
 from .sse import hub
@@ -878,6 +880,99 @@ async def structured(
 # 连接测试（设置页用）
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 模型能力探测
+#
+# OpenAI 兼容服务商多在 /v1/models 暴露上下文窗口，但字段名各家不一
+# （context_length / context_window / max_context_length …），逐一兼容。
+# 输出上限鲜有明示，探测不到时按上下文给一个保守推荐值并标记 estimated。
+# ---------------------------------------------------------------------------
+
+_CONTEXT_KEYS = (
+    "context_length", "context_window", "max_context_length",
+    "max_context_tokens", "max_input_tokens", "context_size",
+)
+_OUTPUT_KEYS = (
+    "max_output_tokens", "max_completion_tokens", "max_tokens",
+    "max_output", "completion_token_limit",
+)
+
+
+def _pick_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    """从模型描述里取第一个合法正整数字段（含 top_provider 等常见嵌套）。"""
+    scopes: list[dict[str, Any]] = [payload]
+    for nested in ("top_provider", "architecture", "limits", "capabilities"):
+        v = payload.get(nested)
+        if isinstance(v, dict):
+            scopes.append(v)
+    for scope in scopes:
+        for k in keys:
+            v = scope.get(k)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+            if isinstance(v, str) and v.isdigit() and int(v) > 0:
+                return int(v)
+    return None
+
+
+def recommend_output_tokens(context_length: int, *, reasoning: bool) -> int:
+    """服务商未明示输出上限时的推荐值。
+
+    取上下文的 1/8 并封顶：留足输入余量，又不至于让长文生成频繁被截断。
+    推理模型的思维链同样计入输出，故给更高的下限。
+    """
+    guess = max(4096, context_length // 8)
+    cap = 65536 if reasoning else 32768
+    return int(min(guess, cap))
+
+
+async def probe_model_capability(override: dict[str, Any] | None = None) -> ModelCapability | None:
+    """查询服务商 /v1/models，提取当前模型的上下文与输出上限。
+
+    任何失败都返回 None —— 这只是锦上添花的能力，绝不能拖垮连接测试。
+    """
+    cfg = load_llm_settings(override)
+    if not cfg.model:
+        return None
+    base = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=TEST_TIMEOUT) as client:
+            resp = await client.get(
+                f"{base}/models",
+                headers={"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.info("模型能力探测跳过（%s）：%s", cfg.model, str(exc)[:120])
+        return None
+
+    items = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        return None
+    entry = next((m for m in items if isinstance(m, dict) and m.get("id") == cfg.model), None)
+    if entry is None:
+        return None
+
+    ctx = _pick_int(entry, _CONTEXT_KEYS)
+    out = _pick_int(entry, _OUTPUT_KEYS)
+    reasoning = bool(entry.get("supports_reasoning") or entry.get("reasoning"))
+    estimated = False
+    if out is None and ctx:
+        out = recommend_output_tokens(ctx, reasoning=reasoning)
+        estimated = True
+    if ctx is None and out is None:
+        return None
+    return ModelCapability(
+        context_length=ctx,
+        max_output_tokens=out,
+        supports_reasoning=reasoning or None,
+        estimated=estimated,
+    )
+
+
 async def test_llm(override: dict[str, Any] | None = None) -> LlmTestResult:
     """用当前（或请求体临时）配置发一次最小 chat，返回 {ok, model, latency_ms, error}。"""
     try:
@@ -898,7 +993,8 @@ async def test_llm(override: dict[str, Any] | None = None) -> LlmTestResult:
         _record_call(case_id=None, step_key="settings.llm_test", model=cfg.model,
                      prompt_tokens=None, completion_tokens=None,
                      duration_ms=latency, status="ok")
-        return LlmTestResult(ok=True, model=model_name, latency_ms=latency)
+        cap = await probe_model_capability(override)
+        return LlmTestResult(ok=True, model=model_name, latency_ms=latency, capability=cap)
     except Exception as exc:  # noqa: BLE001
         latency = int((time.perf_counter() - started) * 1000)
         _record_call(case_id=None, step_key="settings.llm_test", model=cfg.model,

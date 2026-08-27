@@ -125,7 +125,7 @@ export function ApiKeyInput({ id, value, onChange, placeholder }: ApiKeyInputPro
 
 export type TestStatus =
   | { kind: 'idle' }
-  | { kind: 'ok'; text: string }
+  | { kind: 'ok'; text: string; detail?: string | null }
   | { kind: 'error'; text: string; detail?: string | null }
 
 /** 连接测试结果：成功 emerald 徽章 / 失败 red 徽章 + 错误详情 text-xs。 */
@@ -146,6 +146,9 @@ export function TestResult({ status }: { status: TestStatus }) {
         <Icon className="w-3.5 h-3.5" strokeWidth={1.5} />
         {status.text}
       </span>
+      {status.kind === 'ok' && status.detail && (
+        <p className="text-xs text-gray-500 dark:text-gray-400 break-words">{status.detail}</p>
+      )}
       {status.kind === 'error' && status.detail && (
         <p className="text-xs text-red-500 dark:text-red-400 break-all line-clamp-3">
           {status.detail}

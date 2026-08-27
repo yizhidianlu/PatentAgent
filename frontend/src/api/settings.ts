@@ -31,11 +31,21 @@ export interface LlmSettings {
   supports_json_mode: boolean
 }
 
+/** 从服务商 /v1/models 探测到的模型规格（探测不到的字段为 null）。 */
+export interface ModelCapability {
+  context_length: number | null
+  max_output_tokens: number | null
+  supports_reasoning: boolean | null
+  /** true 表示该值是服务端按上下文推荐的，而非厂商明示 */
+  estimated: boolean
+}
+
 export interface LlmTestResult {
   ok: boolean
   model: string | null
   latency_ms: number | null
   error: string | null
+  capability?: ModelCapability | null
 }
 
 /** 连接测试请求体：全部可选，缺省字段回落已存配置。 */

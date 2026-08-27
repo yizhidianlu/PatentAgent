@@ -876,6 +876,9 @@ export const zh = {
       jsonMode: '支持 JSON 模式',
       jsonModeHint: '端点支持 response_format=json_object 时开启，可提升结构化输出稳定性。',
       testSuccess: (ms: number) => `连接成功 · ${ms}ms`,
+      capabilityApplied: (ctx: number, out: number) =>
+        `已按模型上限填入：上下文窗口 ${ctx.toLocaleString()}、最大输出 ${out.toLocaleString()}`,
+      capabilityEstimated: '（最大输出为按上下文推算的推荐值，厂商未明示上限）',
       testFailed: '连接失败',
       testFailedNoDetail: '连接失败，请检查 Base URL / Key / 模型名',
     },

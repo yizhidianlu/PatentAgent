@@ -111,11 +111,33 @@ export function ModelSection() {
         model: form.model,
         temperature: clamp(form.temperature, LIMITS.temperature),
       })
-      setStatus(
-        result.ok
-          ? { kind: 'ok', text: zh.settings.model.testSuccess(result.latency_ms ?? 0) }
-          : { kind: 'error', text: zh.settings.model.testFailed, detail: result.error },
-      )
+      if (result.ok) {
+        // 连接通了顺带带回模型规格：直接把上下文窗口 / 最大输出填成该模型的上限。
+        // 这两个值填小了会让平台无谓地切片长文、把长章节生成截断，而用户几乎无从
+        // 得知模型真实上限，故由探测结果代填（探测不到就保持原值）。
+        const cap = result.capability
+        const patchFromCap: Partial<typeof form> = {}
+        if (cap?.context_length && cap.context_length > 0) {
+          patchFromCap.context_window = cap.context_length
+        }
+        if (cap?.max_output_tokens && cap.max_output_tokens > 0) {
+          patchFromCap.max_output_tokens = cap.max_output_tokens
+        }
+        const applied = Object.keys(patchFromCap).length > 0
+        if (applied) patch(patchFromCap)
+        setStatus({
+          kind: 'ok',
+          text: zh.settings.model.testSuccess(result.latency_ms ?? 0),
+          detail: applied
+            ? zh.settings.model.capabilityApplied(
+                patchFromCap.context_window ?? form.context_window,
+                patchFromCap.max_output_tokens ?? form.max_output_tokens,
+              ) + (cap?.estimated ? zh.settings.model.capabilityEstimated : '')
+            : undefined,
+        })
+      } else {
+        setStatus({ kind: 'error', text: zh.settings.model.testFailed, detail: result.error })
+      }
     } catch (e) {
       setStatus({
         kind: 'error',
