@@ -28,9 +28,6 @@
 .PARAMETER Branch
     跟踪的分支，默认 main。
 
-.PARAMETER TunnelConfig
-    cloudflared 配置文件路径。给了就一并把隧道纳入看门狗守护。
-
 .PARAMETER Force
     工作区有未提交改动时也继续（改动会被 stash 保留，不会丢）。
     默认遇到本地改动直接停——部署端不该有本地改动，有就说明出了别的事。
@@ -58,7 +55,6 @@ param(
     [ValidateRange(1, 65535)]
     [int]    $Port          = 8000,
     [string] $Branch        = 'main',
-    [string] $TunnelConfig  = '',
     [switch] $Force,
     [switch] $CheckOnly,
     [switch] $SkipBackup
@@ -83,6 +79,11 @@ $script:StashRef = $null   # 有本地改动且 -Force 时记下 stash，回滚�
 # --- 日志 -------------------------------------------------------------------
 function Write-Log {
     param([string] $Level, [string] $Message)
+    # 错误摘要常是多行；逐行加前缀，否则日志里挤成超长的一行没法看
+    if ($Message -match "[`r`n]") {
+        foreach ($one in ($Message -split "`r?`n")) { Write-Log $Level $one }
+        return
+    }
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     $color = switch ($Level) {
         'OK'   { 'Green' }
@@ -99,15 +100,36 @@ function Write-Log {
 }
 
 function Invoke-Step {
-    <# 跑一条外部命令，失败即抛出，输出并入日志 #>
+    <# 跑一条外部命令，只以退出码判定成败，输出并入日志。
+
+       这里必须临时把 ErrorActionPreference 放回 Continue。PowerShell 5.1 下
+       `2>&1` 会把原生命令写到 stderr 的每一行包装成 ErrorRecord，在 Stop 模式
+       下当场变成终止错误——哪怕命令退出码是 0。npm/vite 把「chunk 体积偏大」
+       这类警告写在 stderr，构建明明成功也会被判成失败，进而触发一次没必要的
+       回滚。判定成败只看 $LASTEXITCODE。
+    #>
     param([string] $What, [scriptblock] $Body)
     Write-Log 'STEP' $What
-    $out = & $Body 2>&1
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        $out = & $Body 2>&1 | ForEach-Object { "$_" }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
     if ($LASTEXITCODE -ne 0) {
-        $tail = ($out | Select-Object -Last 12) -join "`n"
-        throw "$What 失败（exit=$LASTEXITCODE）：`n$tail"
+        throw "$What 失败（exit=$LASTEXITCODE）：`n$(Format-Tail $out)"
     }
     return $out
+}
+
+function Format-Tail {
+    <# 取输出末尾若干行做错误摘要；剥掉 ANSI 色码，否则日志里全是乱码转义序列 #>
+    param($Lines, [int] $Count = 12)
+    $esc = [char] 27
+    return (@($Lines) | Select-Object -Last $Count |
+        ForEach-Object { $_ -replace "$esc\[[0-9;]*[a-zA-Z]", '' }) -join "`n"
 }
 
 # --- 进程控制 ---------------------------------------------------------------
@@ -134,8 +156,14 @@ function Get-AppProcesses {
 }
 
 function Get-WatchdogProcesses {
+    <# 只认守护「本仓库」的看门狗。
+
+       别按 *watchdog.ps1* 这种宽泛模式匹配：同一台机器上可能还跑着另一份
+       部署（或本项目的另一个副本）的看门狗，宽匹配会把它们一起停掉，
+       于是另一个服务失去守护而没人知道。按脚本绝对路径认人。
+    #>
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue -Filter "Name='powershell.exe' OR Name='pwsh.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine -like '*watchdog.ps1*' }
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$WatchdogPs*" }
 }
 
 function Stop-Watchdog {
@@ -148,10 +176,16 @@ function Stop-Watchdog {
 
 function Start-Watchdog {
     if (-not (Test-Path $WatchdogPs)) { Write-Log 'WARN' '找不到 watchdog.ps1，跳过'; return }
+    # watchdog.ps1 只认 -IntervalSeconds / -Port / -Once。多传一个它不认识的参数，
+    # PowerShell 会直接报错退出，服务就此失去守护且没有任何提示。
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $WatchdogPs, '-Port', $Port)
-    if ($TunnelConfig) { $argList += @('-TunnelConfig', $TunnelConfig) }
     Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden
-    Write-Log 'OK' '看门狗已启动'
+    Start-Sleep -Seconds 3
+    if (@(Get-WatchdogProcesses).Count -eq 0) {
+        Write-Log 'ERR' '看门狗启动后立即退出，服务当前无人守护——请手动检查 watchdog.ps1'
+    } else {
+        Write-Log 'OK' '看门狗已启动'
+    }
 }
 
 function Stop-App {
