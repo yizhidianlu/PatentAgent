@@ -321,12 +321,20 @@ if ($NoBuild) {
     Push-Location $Frontend
     try {
         if (-not (Test-Path -LiteralPath $NodeMods -PathType Container)) {
-            Write-Info "安装前端依赖（首次约 1-3 分钟）…"
-            & $npm install --no-fund --no-audit
+            # 有 lock 文件时一律用 npm ci：`npm install` 会顺手改写 package-lock.json
+            # （npm 11 会规范化可选依赖的 libc 字段，能改掉几十行），装完工作区就是脏的。
+            # 在部署端这直接导致 deploy\update.ps1 以退出码 2 拒绝执行——
+            # 「部署端不应有本地改动」的检查被自家安装脚本触发，每台新机器都会撞上。
+            # ci 还严格按 lock 装，两端依赖版本才真正一致。
+            $useCi = Test-Path -LiteralPath (Join-Path $Frontend 'package-lock.json') -PathType Leaf
+            $cmd = if ($useCi) { 'ci' } else { 'install' }
+            Write-Info "安装前端依赖（npm $cmd，首次约 1-3 分钟）…"
+            & $npm $cmd --no-fund --no-audit
             if ($LASTEXITCODE -ne 0) {
-                Stop-WithHelp "npm install 失败" @(
+                Stop-WithHelp "npm $cmd 失败" @(
                     "请检查网络连接",
-                    "国内网络可换镜像源后重试：npm config set registry https://registry.npmmirror.com"
+                    "国内网络可换镜像源后重试：npm config set registry https://registry.npmmirror.com",
+                    $(if ($useCi) { "若报 lock 与 package.json 不一致，请联系维护端更新 package-lock.json" } else { "" })
                 )
             }
         }

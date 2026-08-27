@@ -55,11 +55,23 @@
 
 首次部署必须落实的几件事（`DEPLOYMENT.md` 有详细说明，这里只列不能漏的）：
 
-- `.env` 里 `SESSION_COOKIE_SECURE=true`（生产走 HTTPS，Cookie 不能明文传）
+- `.env` 里 `COOKIE_SECURE=true`（生产走 HTTPS，Cookie 不能明文传）。
+  注意键名——写错的键会被 pydantic 静默忽略，虽然启动日志现在会告警，但别指望它兜底。
 - `.env` 里 `ALLOWED_ORIGINS` 收紧到实际域名
 - 管理员密码首次启动后立即改掉
-- 看门狗常驻：`powershell -File watchdog.ps1 -Port 8000`
 - **`.env` 与 `data\` 都不入 git**，备份要单独做（见 `DEPLOYMENT.md` §6）
+- `DATA_DIR` 若指到了数据盘，确认 `update.ps1` 启动时打印的「数据目录」与之一致
+  （不一致就意味着回滚恢复不了数据库）
+- 看门狗常驻，按这台机器的隧道形态选一种：
+
+  | 情况 | 命令 |
+  |---|---|
+  | 隧道是本项目的独立进程 | `watchdog.ps1 -Port 8000 -TunnelName <隧道名> -TunnelMetricsPort <端口>` |
+  | 隧道由 cloudflared 服务管（token 托管模式） | `watchdog.ps1 -Port 8000 -NoTunnel` |
+  | 不对外 / 隧道不归本项目管 | `watchdog.ps1 -Port 8000 -NoTunnel` |
+
+  选错的后果：默认形态下若找不到隧道配置，看门狗会直接以退出码 2 停下并说明原因，
+  不会静默空转。
 
 装完请把这些回报给维护端：部署路径、端口、对外域名、`revision`。
 

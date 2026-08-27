@@ -67,9 +67,12 @@ Set-StrictMode -Version Latest
 $Root       = Split-Path -Parent $PSScriptRoot
 $Backend    = Join-Path $Root 'backend'
 $Frontend   = Join-Path $Root 'frontend'
-$DataDir    = Join-Path $Root 'data'
-$BackupDir  = Join-Path $DataDir 'backups'
-$LogFile    = Join-Path $DataDir 'update.log'
+# 更新日志记的是「这份代码副本的更新历史」，固定放仓库内，与业务数据无关。
+# 数据库备份则必须跟数据库同源，位置由下面的 Resolve-DataDir 决定。
+$LogDir     = Join-Path $Root 'data'
+$LogFile    = Join-Path $LogDir 'update.log'
+$DataDir    = $null   # 主流程开始时解析
+$BackupDir  = $null
 $Py         = Join-Path $Backend '.venv\Scripts\python.exe'
 $HealthUrl  = "http://127.0.0.1:$Port/api/v1/system/health"
 $WatchdogPs = Join-Path $Root 'watchdog.ps1'
@@ -94,7 +97,7 @@ function Write-Log {
     }
     Write-Host $line -ForegroundColor $color
     try {
-        if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Force $DataDir | Out-Null }
+        if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force $LogDir | Out-Null }
         Add-Content -Path $LogFile -Value $line -Encoding utf8
     } catch { }   # 日志写不了不该拖垮更新本身
 }
@@ -226,11 +229,50 @@ function Test-Healthy {
     return $null
 }
 
-# --- 数据库备份 -------------------------------------------------------------
+# --- 数据目录与备份 ---------------------------------------------------------
+function Resolve-DataDir {
+    <# 问应用自己要数据目录，而不是在这里重新解析一遍 .env。
+
+       DEPLOYMENT.md §2.2 建议把 DATA_DIR 指到数据盘（如 D:\PatentAgentData），
+       照做之后仓库内的 data\ 就是个空壳。若这里仍按仓库内路径去备份，
+       Backup-Database 会发现「库不存在」而跳过——于是「失败自动回滚会恢复数据库」
+       这条保证在全新部署上静默失效，且看日志一切正常。
+
+       DATA_DIR 可来自环境变量或 .env，还涉及引号、相对路径、大小写等细节。
+       与其在 PowerShell 里复刻一份必然有偏差的解析，不如直接让应用告诉我们。
+    #>
+    $code = 'import sys; sys.path.insert(0, r"' + $Backend + '"); from app.config import get_config; print(get_config().data_dir)'
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        $out = & $Py -c $code 2>$null
+    } catch {
+        $out = $null
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($LASTEXITCODE -eq 0 -and $out) {
+        $p = "$(@($out) | Select-Object -Last 1)".Trim()
+        if ($p -and (Test-Path $p)) { return $p }
+        if ($p) {
+            Write-Log 'WARN' "应用配置的 DATA_DIR 指向 $p，但该目录不存在"
+            return $p
+        }
+    }
+    Write-Log 'WARN' "读不到应用配置的 DATA_DIR，回退到仓库内 data\；若 .env 指定了别的位置，本次备份与回滚将不起作用"
+    return (Join-Path $Root 'data')
+}
+
 function Backup-Database {
     <# WAL 模式下必须走 sqlite backup API，冷拷 app.db 会得到不一致快照 #>
     $db = Join-Path $DataDir 'app.db'
-    if (-not (Test-Path $db)) { Write-Log 'INFO' '尚无数据库，跳过备份'; return $null }
+    if (-not (Test-Path $db)) {
+        # 全新部署确实还没有库；但更常见的是 DATA_DIR 配错、指到了空目录。
+        # 这时没有备份可回滚，必须让人看见，不能用 INFO 混在正常输出里。
+        Write-Log 'WARN' "$DataDir 下没有 app.db，本次更新没有可回滚的数据库备份"
+        return $null
+    }
     if (-not (Test-Path $BackupDir)) { New-Item -ItemType Directory -Force $BackupDir | Out-Null }
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $target = Join-Path $BackupDir "app-$stamp.db"
@@ -307,6 +349,12 @@ Write-Log 'STEP' "=== 同步更新开始（分支 $Branch，端口 $Port）==="
 # 0. 前置检查
 if (-not (Test-Path (Join-Path $Root '.git'))) { throw "不是 git 仓库：$Root。请按 docs\DEPLOYMENT.md 用 git clone 部署。" }
 if (-not (Test-Path $Py)) { throw "找不到虚拟环境 $Py。请先跑 .\start.ps1 -SetupOnly 完成安装。" }
+
+# 数据目录取自应用配置（可能被 .env 的 DATA_DIR 指到数据盘）。
+# 明确打进日志：备份到底落在哪、回滚能不能恢复，看这一行就知道。
+$DataDir   = Resolve-DataDir
+$BackupDir = Join-Path $DataDir 'backups'
+Write-Log 'INFO' "数据目录：$DataDir"
 
 $dirty = @(& git -C $Root status --porcelain)
 if ($dirty.Count -gt 0) {

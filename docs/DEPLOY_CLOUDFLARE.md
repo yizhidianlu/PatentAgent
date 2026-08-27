@@ -127,6 +127,32 @@ cloudflared tunnel run patent-agent
 
 ### cloudflared 注册为服务（隧道本身无 Session 0 问题）
 
+> **先确认这台机器上没有别的 cloudflared 服务。**
+> Windows 上 cloudflared 服务是**全机唯一**的，`service install` 会覆盖已存在的那一个。
+> 若这台机器还跑着别的项目的隧道（尤其是 token 托管模式——服务命令行形如
+> `tunnel run --token ...`、本地没有 `~\.cloudflared` 目录），执行下面这条会
+> **直接把那条隧道顶掉**，而且不会有任何提示。
+>
+> ```powershell
+> # 装之前先看一眼
+> Get-Service cloudflared -ErrorAction SilentlyContinue
+> Get-CimInstance Win32_Service -Filter "Name='cloudflared'" | Select-Object PathName
+> ```
+>
+> 已经有了就**不要** `service install`，改用独立进程 + 独立配置文件：
+>
+> ```powershell
+> # 各自一份 config，metrics 端口也要错开，否则两条隧道抢同一个端口
+> cloudflared tunnel --config C:\Users\<你>\.cloudflared\yintu-patent.yml `
+>                    --metrics 127.0.0.1:20242 run
+> ```
+>
+> 这种形态下让看门狗认得自己那条隧道：
+> `watchdog.ps1 -TunnelName yintu-patent -TunnelMetricsPort 20242`。
+> 若隧道压根不归本项目管，用 `watchdog.ps1 -NoTunnel` 只守护应用。
+
+机器上只有本项目一条隧道时，才用服务形态：
+
 ```powershell
 cloudflared service install
 Start-Service cloudflared

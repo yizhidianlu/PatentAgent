@@ -21,6 +21,19 @@
 param(
     [int]    $IntervalSeconds = 30,
     [int]    $Port            = 8000,
+    # 隧道形态因机器而异，必须可配：
+    #   -NoTunnel            只守护应用，完全不碰 cloudflared。
+    #                        同机已有别的 cloudflared 服务（尤其是 token 托管模式，
+    #                        本地没有 .cloudflared 目录）时必须用这个，否则本脚本
+    #                        会认不出那条隧道、判定掉线，然后反复拿一个不存在的
+    #                        配置文件去拉新进程，永久空转刷日志。
+    #   -TunnelName          用于在 cloudflared 进程命令行里认出「自己那条」隧道。
+    #   -TunnelConfig        隧道配置文件；留空则取 ~\.cloudflared\<TunnelName>.yml。
+    #   -TunnelMetricsPort   cloudflared 的 metrics 端口，用来读边缘连接数。
+    [switch] $NoTunnel,
+    [string] $TunnelName        = 'yintu-patent',
+    [string] $TunnelConfig      = '',
+    [int]    $TunnelMetricsPort = 20242,
     [switch] $Once
 )
 
@@ -31,7 +44,8 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } c
 $Root       = $PSScriptRoot
 $Backend    = Join-Path $Root 'backend'
 $Py         = Join-Path $Backend '.venv\Scripts\python.exe'
-$TunnelConf = Join-Path $env:USERPROFILE '.cloudflared\yintu-patent.yml'
+$TunnelConf = if ($TunnelConfig) { $TunnelConfig }
+              else { Join-Path $env:USERPROFILE ".cloudflared\$TunnelName.yml" }
 $LogFile    = Join-Path $Root 'data\watchdog.log'
 $HealthUrl  = "http://127.0.0.1:$Port/api/v1/system/health"
 
@@ -64,7 +78,7 @@ function Get-AppProcess {
 
 function Get-TunnelProcess {
     Get-CimInstance Win32_Process -Filter "Name='cloudflared.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*yintu-patent*' }
+        Where-Object { $_.CommandLine -like "*$TunnelName*" }
 }
 
 function Test-AppHealthy {
@@ -80,7 +94,7 @@ function Test-AppHealthy {
 function Test-TunnelHealthy {
     if (-not (Get-TunnelProcess)) { return $false }
     try {
-        $m = Invoke-WebRequest -Uri 'http://127.0.0.1:20242/metrics' -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        $m = Invoke-WebRequest -Uri "http://127.0.0.1:$TunnelMetricsPort/metrics" -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
         foreach ($l in ($m.Content -split "`n")) {
             if ($l -match '^cloudflared_tunnel_ha_connections\s+(\d+)') {
                 if ([int]$Matches[1] -lt 1) { return $false }
@@ -123,6 +137,10 @@ function Invoke-Check {
         if ($script:AppFails -ge 2) { Restart-App }
     }
 
+    # -NoTunnel：这台机器的隧道不归本脚本管（比如是 token 托管模式的服务，
+    # 或者压根没对外），只守护应用。
+    if ($NoTunnel) { return $appOk }
+
     $tunOk = Test-TunnelHealthy
     if ($tunOk) {
         if ($script:TunnelFails -gt 0) { Write-Log 'OK' '隧道自行恢复' }
@@ -137,7 +155,20 @@ function Invoke-Check {
     return $false
 }
 
-Write-Log 'INFO' "守护进程启动（每 $IntervalSeconds 秒体检，端口 $Port）"
+if ($NoTunnel) {
+    Write-Log 'INFO' "守护进程启动（每 $IntervalSeconds 秒体检，端口 $Port；不守护隧道）"
+} else {
+    # 配置文件不存在还硬跑，只会每 30 秒拿一个不存在的路径去拉进程，永久空转。
+    # 同机已有 token 托管模式的 cloudflared 服务时，本地不会有 .cloudflared 目录，
+    # 正是这种情况——那时应当用 -NoTunnel。
+    if (-not (Test-Path -LiteralPath $TunnelConf)) {
+        Write-Log 'ERR' "隧道配置不存在：$TunnelConf"
+        Write-Log 'ERR' '若本机隧道由 cloudflared 服务（token 托管模式）管理，请改用 -NoTunnel 只守护应用；'
+        Write-Log 'ERR' '若用独立进程 + 独立配置，请用 -TunnelName / -TunnelConfig / -TunnelMetricsPort 指明。'
+        exit 2
+    }
+    Write-Log 'INFO' "守护进程启动（每 $IntervalSeconds 秒体检，端口 $Port；隧道 $TunnelName，metrics $TunnelMetricsPort）"
+}
 
 if ($Once) {
     $ok = Invoke-Check

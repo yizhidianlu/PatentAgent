@@ -76,6 +76,34 @@ class AppConfig(BaseSettings):
             p.mkdir(parents=True, exist_ok=True)
 
 
+def unknown_env_keys() -> list[str]:
+    """backend/.env 里写了、但本配置并不认识的键。
+
+    ``extra="ignore"`` 让拼错的键被静默丢弃：把 COOKIE_SECURE 写成
+    SESSION_COOKIE_SECURE，得到的是一个 Cookie 不带 Secure 的生产环境，
+    而启动日志里一句提示都没有。配置项的名字只在文档里出现过一次，
+    这种错很难靠肉眼发现，所以在启动时主动报出来。
+
+    只看 .env 文件本身——进程环境变量里本就有大量与本应用无关的键。
+    """
+    env_file = PROJECT_ROOT / "backend" / ".env"
+    if not env_file.is_file():
+        return []
+    known = {k.upper() for k in AppConfig.model_fields}
+    unknown: list[str] = []
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip().upper()
+            if key and key not in known and key not in unknown:
+                unknown.append(key)
+    except OSError:
+        return []
+    return unknown
+
+
 @lru_cache(maxsize=1)
 def get_config() -> AppConfig:
     """取全局配置单例（测试可先设环境变量再 cache_clear()）。"""

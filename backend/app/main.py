@@ -35,7 +35,7 @@ from .api import render as render_api
 from .api import search as search_api
 from .api import settings as settings_api
 from .api import system as system_api
-from .config import get_config
+from .config import get_config, unknown_env_keys
 from .db import database as db
 from .middleware import AuthMiddleware, SecurityHeadersMiddleware
 from .pipelines import engine as pipeline_engine
@@ -52,6 +52,13 @@ async def lifespan(app: FastAPI):
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # .env 里拼错的键会被 pydantic 静默忽略——生产上最典型的后果是
+    # COOKIE_SECURE 写错，Cookie 不带 Secure 却毫无提示。启动时报出来。
+    if (unknown := unknown_env_keys()):
+        logger.warning(
+            "backend/.env 中有 %d 个无法识别的配置项，已被忽略（请核对拼写）：%s",
+            len(unknown), "、".join(unknown),
+        )
     cfg.ensure_dirs()
     await anyio.to_thread.run_sync(db.init_db)
     # 首次启动引导：库中无用户时创建管理员（随机密码在日志里醒目打印一次）
