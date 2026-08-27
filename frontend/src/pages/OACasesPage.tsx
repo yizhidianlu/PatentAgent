@@ -35,6 +35,7 @@ import { Select } from '../components/ui/Select'
 import { Skeleton } from '../components/ui/Skeleton'
 import { Spinner } from '../components/ui/Spinner'
 import { Dropzone } from '../components/upload/Dropzone'
+import { SelectedFiles } from '../components/upload/SelectedFiles'
 import { MarkdownBlock } from '../components/markdown/MarkdownBlock'
 
 const OUTCOME_KEYS = ['granted', 'amended_then_granted', 'rejected', 'pending', 'withdrawn', 'unknown']
@@ -594,17 +595,21 @@ export function OACasesPage() {
             accept=".pdf,.doc,.docx,.md,.txt"
             title={zh.oaCases.importDrop}
             hint={zh.oaCases.importAccept}
-            onFiles={(files) => setImportFiles(files)}
+            onFiles={(files) =>
+              // 追加而非替换：分两次选文件时，替换会把前一批悄悄丢掉。
+              // 同名同大小视为同一个文件，避免重复选中同一份。
+              setImportFiles((prev) => {
+                const seen = new Set(prev.map((f) => `${f.name}:${f.size}`))
+                return [...prev, ...files.filter((f) => !seen.has(`${f.name}:${f.size}`))]
+              })
+            }
           />
-          {importFiles.length > 0 && (
-            <ul className="space-y-1 text-[12px] text-gray-600 dark:text-gray-300">
-              {importFiles.map((file) => (
-                <li key={file.name} className="truncate">
-                  {file.name}
-                </li>
-              ))}
-            </ul>
-          )}
+          <SelectedFiles
+            files={importFiles}
+            onRemove={(index) =>
+              setImportFiles((prev) => prev.filter((_, i) => i !== index))
+            }
+          />
           <label className="block space-y-1">
             <span className="block text-[12px] text-gray-500 dark:text-gray-400">
               {zh.oaCases.filterOutcome}

@@ -11,7 +11,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 Role = Literal["admin", "user"]
-UserStatus = Literal["active", "disabled"]
+# pending：自行注册后等待管理员审核，可登录接口会明确拒绝并说明原因。
+# 单独一态而不是复用 disabled，是因为两者的运维含义不同：
+# disabled 是「管理员停用了它」，pending 是「还没人看过它」——
+# 后台要能把待审的挑出来，也不该让停用过的账号混进待审列表。
+UserStatus = Literal["active", "disabled", "pending"]
 
 # 用户名规则：3-32 位，字母开头，仅允许字母/数字/下划线/连字符/点
 USERNAME_PATTERN = r"^[A-Za-z][A-Za-z0-9_.-]{2,31}$"
@@ -54,6 +58,28 @@ class UserOut(BaseModel):
     usage: UsageSnapshot | None = None
     created_at: str
     updated_at: str
+
+
+class RegisterIn(BaseModel):
+    """自行注册请求体。
+
+    校验规则与管理员建号完全一致（同一套 USERNAME_PATTERN 与 MIN_PASSWORD_LEN），
+    免得出现「注册能过、管理员改不了」这类两套标准打架的情况。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(pattern=USERNAME_PATTERN, max_length=32)
+    password: str = Field(min_length=MIN_PASSWORD_LEN, max_length=256)
+    display_name: str = Field(default="", max_length=64)
+
+
+class RegisterOut(BaseModel):
+    """注册结果。审核制下不签发会话，只告诉用户接下来会发生什么。"""
+
+    ok: bool = True
+    status: UserStatus
+    message: str
 
 
 class LoginIn(BaseModel):

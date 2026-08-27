@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { ArrowUpTrayIcon, DocumentTextIcon } from '@heroicons/react/24/outline'
+import { ArrowUpTrayIcon } from '@heroicons/react/24/outline'
 import { zh } from '../../i18n/zh'
-import { formatFileSize } from '../../lib/format'
+import { SelectedFiles } from '../upload/SelectedFiles'
 import { uploadCaseFiles, type UploadedFile } from '../../api/uploads'
 import { useUiStore } from '../../stores/uiStore'
 import { Dropzone } from '../upload/Dropzone'
@@ -57,31 +57,11 @@ export function MaterialUploadCard({ caseId, stage, submit, skip, busy }: StageC
           </div>
         )}
 
-        {files.length > 0 && (
-          <div className="space-y-1.5">
-            <p className="text-xs font-medium text-gray-500 dark:text-gray-400">
-              {zh.stages.materialUpload.listTitle}
-            </p>
-            {files.map((file) => (
-              <div
-                key={file.id}
-                className="flex items-center gap-2.5 rounded-lg border border-gray-200 dark:border-gray-700 px-3 py-2"
-              >
-                <span className="w-7 h-7 rounded bg-gray-100 dark:bg-gray-700 flex items-center justify-center shrink-0">
-                  <DocumentTextIcon className="w-4 h-4 text-gray-500 dark:text-gray-300" strokeWidth={1.5} />
-                </span>
-                <span className="text-xs font-medium text-gray-800 dark:text-gray-100 truncate flex-1 min-w-0">
-                  {file.orig_name}
-                </span>
-                {file.size !== null && (
-                  <span className="text-[10px] text-gray-400 shrink-0">
-                    {formatFileSize(file.size)}
-                  </span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
+        {/* 与导入弹窗共用同一套样式：两处分头写过一次，结果一处有图标一处是裸文本 */}
+        <SelectedFiles
+          title={zh.stages.materialUpload.listTitle}
+          files={files.map((f) => ({ name: f.orig_name, size: f.size }))}
+        />
       </div>
     </StageCardShell>
   )
