@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import {
   ArrowPathIcon,
+  CheckCircleIcon,
   EllipsisHorizontalIcon,
   FolderOpenIcon,
   KeyIcon,
@@ -21,7 +22,8 @@ import {
   useResetUserPassword,
   useUpdateUser,
   type PasswordIssued,
-} from '../../api/admin'
+  useRegistrationPolicy,
+  useSetRegistrationPolicy,} from '../../api/admin'
 import { useCurrentUser } from '../../stores/authStore'
 import { useUiStore } from '../../stores/uiStore'
 import { Badge } from '../../components/ui/Badge'
@@ -32,6 +34,7 @@ import { EmptyState } from '../../components/ui/EmptyState'
 import { Input } from '../../components/ui/Input'
 import { Modal } from '../../components/ui/Modal'
 import { Select } from '../../components/ui/Select'
+import { ToggleSwitch } from '../../components/ui/ToggleSwitch'
 import { Skeleton } from '../../components/ui/Skeleton'
 import { Spinner } from '../../components/ui/Spinner'
 import { RoleBadge } from '../../components/layout/UserMenu'
@@ -43,8 +46,11 @@ import { UserCasesModal } from './UserCasesModal'
 const t = zh.admin.users
 
 function StatusBadge({ status }: { status: UserStatus }) {
+  // pending 单独用 amber：它是「等你处理」，与 disabled 的「已处理过」不是一回事，
+  // 混用同一个灰色会让待审账号淹没在停用账号里。
+  const variant = status === 'active' ? 'emerald' : status === 'pending' ? 'amber' : 'neutral'
   return (
-    <Badge variant={status === 'active' ? 'emerald' : 'neutral'}>
+    <Badge variant={variant}>
       {zh.auth.statuses[status] ?? status}
     </Badge>
   )
@@ -98,6 +104,8 @@ export function AdminUsersPage() {
   const query = useAdminUsers({ q: keyword.trim(), role, status })
   const updateUser = useUpdateUser()
   const resetPassword = useResetUserPassword()
+  const regPolicy = useRegistrationPolicy()
+  const setRegPolicy = useSetRegistrationPolicy()
 
   const users = useMemo(() => query.data?.items ?? [], [query.data])
   const filtering = Boolean(keyword.trim() || role || status)
@@ -141,6 +149,34 @@ export function AdminUsersPage() {
         </Button>
       </header>
 
+      {/* 自助注册策略 —— 待审数量必须挂在这里，否则没人会想起来去看有没有人在排队 */}
+      {regPolicy.data && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-800/40 px-3.5 py-2.5">
+          <ToggleSwitch
+            checked={regPolicy.data.allow_registration}
+            onChange={(next) => setRegPolicy.mutate(next)}
+            disabled={setRegPolicy.isPending}
+          />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium text-gray-800 dark:text-gray-100">
+              {t.registration.title}
+            </p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">
+              {regPolicy.data.allow_registration ? t.registration.on : t.registration.off}
+            </p>
+          </div>
+          {regPolicy.data.pending_count > 0 && (
+            <button
+              type="button"
+              onClick={() => setStatus('pending')}
+              className="shrink-0 inline-flex items-center gap-1.5 rounded-full bg-amber-100 dark:bg-amber-500/15 px-2.5 py-1 text-xs font-medium text-amber-700 dark:text-amber-300 hover:bg-amber-200 dark:hover:bg-amber-500/25 transition-colors"
+            >
+              {t.registration.pending(regPolicy.data.pending_count)}
+            </button>
+          )}
+        </div>
+      )}
+
       {/* 搜索与筛选 */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 min-w-[12rem]">
@@ -173,6 +209,7 @@ export function AdminUsersPage() {
           className="w-32"
         >
           <option value="">{`${t.filterStatus}：${t.filterAll}`}</option>
+          <option value="pending">{zh.auth.statuses.pending}</option>
           <option value="active">{zh.auth.statuses.active}</option>
           <option value="disabled">{zh.auth.statuses.disabled}</option>
         </Select>
@@ -309,20 +346,49 @@ export function AdminUsersPage() {
                                   {user.role === 'admin' ? t.actions.demote : t.actions.promote}
                                 </span>
                               </DropdownItem>
-                              <DropdownItem
-                                disabled={isSelf}
-                                onClick={() => {
-                                  close()
-                                  patch(user, {
-                                    status: user.status === 'active' ? 'disabled' : 'active',
-                                  })
-                                }}
-                              >
-                                <NoSymbolIcon className="w-4 h-4 text-gray-400" strokeWidth={1.5} />
-                                <span className="flex-1">
-                                  {user.status === 'active' ? t.actions.disable : t.actions.enable}
-                                </span>
-                              </DropdownItem>
+                              {user.status === 'pending' ? (
+                                <>
+                                  {/* 待审账号是两个方向的决定，不是一个开关：
+                                      通过 → active 可登录；拒绝 → disabled 保留审计痕迹，
+                                      而不是删号（删掉就查不到谁申请过、被谁拒了）。 */}
+                                  <DropdownItem
+                                    onClick={() => {
+                                      close()
+                                      patch(user, { status: 'active' })
+                                    }}
+                                  >
+                                    <CheckCircleIcon
+                                      className="w-4 h-4 text-emerald-500"
+                                      strokeWidth={1.5}
+                                    />
+                                    <span className="flex-1">{t.actions.approve}</span>
+                                  </DropdownItem>
+                                  <DropdownItem
+                                    onClick={() => {
+                                      close()
+                                      patch(user, { status: 'disabled' })
+                                    }}
+                                  >
+                                    <NoSymbolIcon className="w-4 h-4 text-gray-400" strokeWidth={1.5} />
+                                    <span className="flex-1">{t.actions.reject}</span>
+                                  </DropdownItem>
+                                </>
+                              ) : (
+                                <DropdownItem
+                                  disabled={isSelf}
+                                  onClick={() => {
+                                    close()
+                                    patch(user, {
+                                      status: user.status === 'active' ? 'disabled' : 'active',
+                                    })
+                                  }}
+                                >
+                                  <NoSymbolIcon className="w-4 h-4 text-gray-400" strokeWidth={1.5} />
+                                  <span className="flex-1">
+                                    {user.status === 'active' ? t.actions.disable : t.actions.enable}
+                                  </span>
+                                </DropdownItem>
+                              )}
                               <DropdownItem
                                 onClick={() => {
                                   close()

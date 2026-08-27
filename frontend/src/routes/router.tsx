@@ -11,6 +11,7 @@ import { OACasesPage } from '../pages/OACasesPage'
 import { SettingsPage } from '../pages/SettingsPage'
 import { NotFoundPage } from '../pages/NotFoundPage'
 import { LoginPage } from '../pages/LoginPage'
+import { RegisterPage } from '../pages/RegisterPage'
 import { ChangePasswordPage } from '../pages/ChangePasswordPage'
 import { AdminPage } from '../pages/AdminPage'
 import { AdminUsersPage } from '../pages/admin/AdminUsersPage'
@@ -137,6 +138,7 @@ const protectedRoutes: RouteObject[] = [
 
 const routes: RouteObject[] = [
   { path: '/login', element: <LoginPage /> },
+  { path: '/register', element: <RegisterPage /> },
   {
     element: <RequireAuth />,
     children: [

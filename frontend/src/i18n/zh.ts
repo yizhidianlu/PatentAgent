@@ -1302,6 +1302,7 @@ export const zh = {
     statuses: {
       active: '启用',
       disabled: '已停用',
+      pending: '待审核',
     } as Record<string, string>,
 
     /** 会话过期 / 配额超限的全局提示。 */
@@ -1322,11 +1323,41 @@ export const zh = {
       missingFields: '请输入用户名与密码',
       failed: '登录失败，请稍后重试',
       welcome: (name: string) => `欢迎回来，${name}`,
-      /** 无注册入口说明（避免用户到处找"注册"）。 */
+      /** 关闭自助注册时的说明（避免用户到处找"注册"）。 */
       noSignupTitle: '账号由管理员统一创建',
-      noSignupDesc: '本平台不开放自助注册。需要账号、忘记密码或账号被锁定，请联系系统管理员。',
+      noSignupDesc: '本平台当前不开放自助注册。需要账号、忘记密码或账号被锁定，请联系系统管理员。',
+      /** 开放自助注册时的入口。 */
+      signupTitle: '还没有账号？',
+      signupDesc: '注册后需管理员审核通过才能登录。忘记密码或账号被锁定请联系管理员。',
+      signupAction: '注册新账号',
       lockedCountdown: (mmss: string) => `账号锁定中，${mmss} 后可再次尝试`,
       lockedRetryNow: '锁定已解除，可以重新登录',
+    },
+
+    /** §注册页。 */
+    register: {
+      title: '注册账号',
+      subtitle: '填写后提交，管理员审核通过即可登录',
+      username: '用户名',
+      usernamePlaceholder: '字母开头，3-32 位，可含数字、下划线、连字符、点',
+      usernameHint: '登录时使用，注册后不可更改',
+      displayName: '显示名称（可选）',
+      displayNamePlaceholder: '留空则与用户名相同',
+      password: '密码',
+      passwordPlaceholder: '至少 8 位',
+      passwordConfirm: '确认密码',
+      submit: '提交注册',
+      submitting: '提交中…',
+      backToLogin: '返回登录',
+      mismatch: '两次输入的密码不一致',
+      tooShort: '密码至少 8 位',
+      badUsername: '用户名需字母开头，3-32 位，仅可含字母、数字、下划线、连字符与点',
+      failed: '注册失败，请稍后重试',
+      /** 成功后不跳转、不登录——账号还在等审核。 */
+      doneTitle: '注册已提交',
+      doneHint: '账号需管理员审核通过后才能登录。审核完成前请勿重复注册。',
+      closedTitle: '当前未开放自助注册',
+      closedDesc: '管理员已关闭注册入口，请直接联系管理员开通账号。',
     },
 
     changePassword: {
@@ -1440,9 +1471,19 @@ export const zh = {
         demote: '降为普通用户',
         enable: '启用账号',
         disable: '停用账号',
+        approve: '通过审核',
+        reject: '拒绝并停用',
         resetPassword: '重置密码',
         viewCases: '查看其案件',
         delete: '删除用户',
+      },
+      /** 自助注册策略条。 */
+      registration: {
+        title: '自助注册',
+        on: '已开放：任何人可注册，但需在此审核通过后才能登录',
+        off: '已关闭：仅管理员可创建账号',
+        pending: (n: number) => `${n} 个账号待审核`,
+        filterPending: '只看待审核',
       },
       updateOk: '已更新',
       updateFailed: '更新失败，请重试',

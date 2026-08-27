@@ -216,6 +216,31 @@ export function useAuditLog(params: AuditParams = {}) {
   })
 }
 
+export interface RegistrationPolicy {
+  allow_registration: boolean
+  pending_count: number
+}
+
+/** 自助注册策略 + 待审数量。待审数量要挂在后台入口上，否则没人想起来去看。 */
+export function useRegistrationPolicy() {
+  return useQuery({
+    queryKey: ['admin', 'registration'],
+    queryFn: () => api.get<RegistrationPolicy>('/admin/registration'),
+    staleTime: 30_000,
+  })
+}
+
+export function useSetRegistrationPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (allow: boolean) =>
+      api.put<RegistrationPolicy>('/admin/registration', { allow_registration: allow }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['admin', 'registration'], data)
+    },
+  })
+}
+
 export function useAdminStats() {
   return useQuery({
     queryKey: adminKeys.stats,

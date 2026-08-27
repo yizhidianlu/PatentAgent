@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import {
   ExclamationCircleIcon,
   InformationCircleIcon,
   LockClosedIcon,
 } from '@heroicons/react/24/outline'
 import { zh } from '../i18n/zh'
-import { authErrorMessage, displayNameOf, useLogin } from '../api/auth'
+import { authErrorMessage, displayNameOf, useLogin, useRegistrationOpen } from '../api/auth'
 import { useAuthStore } from '../stores/authStore'
 import { useUiStore } from '../stores/uiStore'
 import { AuthShell } from '../components/auth/AuthShell'
@@ -44,6 +44,8 @@ export function LoginPage() {
   const navigate = useNavigate()
   const location = useLocation()
   const login = useLogin()
+  // 注册入口是否显示由后端策略决定，管理员随时可关
+  const registrationOpen = useRegistrationOpen().data?.open === true
   const pushToast = useUiStore((s) => s.pushToast)
   const authStatus = useAuthStore((s) => s.status)
 
@@ -128,8 +130,21 @@ export function LoginPage() {
             strokeWidth={1.5}
           />
           <div className="min-w-0">
-            <p className="font-medium text-gray-700 dark:text-gray-200">{t.noSignupTitle}</p>
-            <p className="mt-0.5 text-gray-500 dark:text-gray-400">{t.noSignupDesc}</p>
+            {/* 开放注册时给入口，关闭时仍给原来的说明——两种情况用户都需要知道下一步找谁 */}
+            <p className="font-medium text-gray-700 dark:text-gray-200">
+              {registrationOpen ? t.signupTitle : t.noSignupTitle}
+            </p>
+            <p className="mt-0.5 text-gray-500 dark:text-gray-400">
+              {registrationOpen ? t.signupDesc : t.noSignupDesc}
+            </p>
+            {registrationOpen && (
+              <Link
+                to="/register"
+                className="mt-1.5 inline-block font-medium text-[#492497] dark:text-[#61d0e2] hover:underline"
+              >
+                {t.signupAction}
+              </Link>
+            )}
           </div>
         </div>
       }
