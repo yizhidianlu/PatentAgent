@@ -22,6 +22,8 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -515,7 +517,12 @@ def test_upload_filename_path_traversal_is_contained(
     item = _upload(client, case_id, filename, b"payload", mime="text/plain")
 
     assert item["file"]["orig_name"] == expect_basename
-    stored = Path(item["file"]["stored_path"]).resolve()
+    # 库里存的是相对 DATA_DIR 的路径（换机可搬），落实成绝对路径走的是生产同一条通路
+    from app.services import paths as paths_service
+
+    raw = item["file"]["stored_path"]
+    assert not Path(raw).is_absolute(), f"stored_path 不该再是绝对路径：{raw}"
+    stored = paths_service.resolve(raw).resolve()
     case_dir = (get_config().uploads_dir / case_id).resolve()
     assert stored.is_relative_to(case_dir), f"{stored} 逃出了 {case_dir}"
     assert stored.read_bytes() == b"payload"
@@ -529,7 +536,7 @@ def test_upload_degenerate_filename_falls_back_to_unnamed(
     case_id = _new_case(client, "怪文件名")
     item = _upload(client, case_id, filename, b"x", mime="text/plain")
     assert item["file"]["orig_name"] == "unnamed"
-    assert Path(item["file"]["stored_path"]).is_file()
+    assert disk_path(item["file"]["stored_path"]).is_file()
 
 
 def test_upload_strips_windows_illegal_chars(client: TestClient) -> None:
@@ -537,7 +544,7 @@ def test_upload_strips_windows_illegal_chars(client: TestClient) -> None:
     case_id = _new_case(client, "非法字符")
     item = _upload(client, case_id, "报告<v2>:草稿|终稿?.md", b"# x")
     assert item["file"]["orig_name"] == "报告v2草稿终稿.md"
-    assert Path(item["file"]["stored_path"]).is_file()
+    assert disk_path(item["file"]["stored_path"]).is_file()
 
 
 @pytest.mark.parametrize(
@@ -562,7 +569,7 @@ def test_upload_chinese_and_special_filename(client: TestClient) -> None:
     case_id = _new_case(client, "中文名")
     item = _upload(client, case_id, "交底书（第 2 版）—— 王医生.md", "# 中文正文".encode())
     assert item["file"]["orig_name"] == "交底书（第 2 版）—— 王医生.md"
-    assert Path(item["file"]["stored_path"]).is_file()
+    assert disk_path(item["file"]["stored_path"]).is_file()
 
     got = client.get(f"{API}/files/{item['file']['id']}/content")
     assert got.status_code == 200
@@ -574,7 +581,7 @@ def test_upload_empty_file_is_accepted_without_crash(client: TestClient) -> None
     case_id = _new_case(client, "空文件")
     item = _upload(client, case_id, "empty.txt", b"", mime="text/plain")
     assert item["file"]["size"] == 0
-    assert Path(item["file"]["stored_path"]).is_file()
+    assert disk_path(item["file"]["stored_path"]).is_file()
 
 
 @pytest.mark.parametrize(
@@ -624,7 +631,7 @@ def test_upload_same_name_twice_never_overwrites(client: TestClient) -> None:
     first = _upload(client, case_id, "dup.md", b"# first")
     second = _upload(client, case_id, "dup.md", b"# second")
 
-    p1, p2 = Path(first["file"]["stored_path"]), Path(second["file"]["stored_path"])
+    p1, p2 = disk_path(first["file"]["stored_path"]), disk_path(second["file"]["stored_path"])
     assert p1 != p2
     assert p1.read_bytes() == b"# first" and p2.read_bytes() == b"# second"
 
@@ -648,7 +655,7 @@ def test_download_and_content_404_when_disk_file_gone(client: TestClient) -> Non
     item = _upload(client, case_id, "gone.md", b"# gone")
     file_id = item["file"]["id"]
 
-    Path(item["file"]["md_path"]).unlink()
+    disk_path(item["file"]["md_path"]).unlink()
     assert client.get(f"{API}/files/{file_id}/content").status_code == 404
     assert client.get(f"{API}/files/{file_id}/download").status_code == 404
 
@@ -656,7 +663,7 @@ def test_download_and_content_404_when_disk_file_gone(client: TestClient) -> Non
 def test_delete_file_removes_disk_artifacts(client: TestClient) -> None:
     case_id = _new_case(client, "删文件")
     item = _upload(client, case_id, "del.md", b"# del")
-    stored = Path(item["file"]["stored_path"])
+    stored = disk_path(item["file"]["stored_path"])
     assert stored.is_file()
 
     assert client.delete(f"{API}/files/{item['file']['id']}").status_code == 200
@@ -703,7 +710,7 @@ def test_artifact_versions_are_strictly_increasing_and_never_overwrite(
     assert [a.version for a in saved] == [1, 2, 3, 4, 5]
     assert len({a.filename for a in saved}) == 5
     for i, a in enumerate(saved):
-        assert Path(a.stored_path).read_text(encoding="utf-8") == f"# 第 {i} 版"
+        assert disk_path(a.stored_path).read_text(encoding="utf-8") == f"# 第 {i} 版"
 
     listed = client.get(f"{API}/cases/{case_id}/artifacts").json()
     assert [a["version"] for a in listed] == [5, 4, 3, 2, 1]
@@ -782,7 +789,7 @@ def test_artifact_export_rejects_invalid_format(client: TestClient) -> None:
 def test_artifact_export_404_when_source_file_missing(client: TestClient) -> None:
     case_id = _new_case(client, "源文件丢失")
     art = artifacts_service.save_artifact_sync(case_id, "disclosure_md", "# x", "md", title="X")
-    Path(art.stored_path).unlink()
+    disk_path(art.stored_path).unlink()
 
     assert client.post(f"{API}/artifacts/{art.id}/export", json={"format": "docx"}).status_code == 404
     assert client.get(f"{API}/artifacts/{art.id}/download").status_code == 404

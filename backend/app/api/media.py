@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse
 
 from ..config import get_config
 from ..db import database as db
+from ..services import paths as paths_service
 from .deps import client_ip, current_user, resolve_case_sync
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,11 @@ def resolve_media_path(case_id: str, raw: str) -> Path | None:
     tries: list[Path] = []
     if candidate.is_absolute():
         tries.append(candidate)
+        # 从别的机器/别的目录恢复过来的库，正文里留的是源机器的绝对路径。
+        # 交给 paths 按数据目录锚点重定位——包含判定在后面照做，边界不受影响。
+        relocated = paths_service.resolve(text)
+        if relocated is not None:
+            tries.append(relocated)
     else:
         for root in roots:
             tries.append(root / candidate)

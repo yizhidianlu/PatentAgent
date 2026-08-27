@@ -23,7 +23,8 @@ export interface DeleteUserModalProps {
 export function DeleteUserModal({ user, onClose }: DeleteUserModalProps) {
   const t = zh.admin.users.deleteModal
   const [typed, setTyped] = useState('')
-  const [purgeFiles, setPurgeFiles] = useState(true)
+  // 默认关：删账号是常见操作，删磁盘文件不可撤销，两者不该绑在一起默认发生
+  const [purgeFiles, setPurgeFiles] = useState(false)
   const [error, setError] = useState('')
   const deleteUser = useDeleteUser()
   const pushToast = useUiStore((s) => s.pushToast)

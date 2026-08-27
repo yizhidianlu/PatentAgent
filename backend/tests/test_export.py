@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import disk_path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -92,7 +94,7 @@ def test_export_md_to_docx(client: TestClient, case_id: str) -> None:
 
     from docx import Document
 
-    doc = Document(exported["stored_path"])
+    doc = Document(disk_path(exported["stored_path"]))
     texts = [p.text for p in doc.paragraphs]
     assert len([t for t in texts if t.strip()]) > 0
     assert any("技术方案" in t for t in texts)
@@ -115,7 +117,7 @@ def test_export_docx_to_pdf(client: TestClient) -> None:
         pytest.skip(f"docx→pdf 引擎不可用（Word COM/soffice）：{resp.text}")
     exported = resp.json()
     assert exported["kind"] == "disclosure_pdf"
-    pdf_bytes = Path(exported["stored_path"]).read_bytes()
+    pdf_bytes = disk_path(exported["stored_path"]).read_bytes()
     assert pdf_bytes[:5] == b"%PDF-"                 # PDF magic bytes
     assert exported["source_artifact_id"] == docx_art["id"]
 
@@ -142,9 +144,9 @@ def test_artifact_versioning(case_id: str) -> None:
     a2 = artifacts_service.save_artifact_sync(case_id, "revision_log_md", "第二次内容", "md", title="同名版本测试")
     assert a2.version == a1.version + 1
     assert a1.filename != a2.filename                # 禁覆盖：文件名必不同
-    assert Path(a1.stored_path).is_file() and Path(a2.stored_path).is_file()
-    assert Path(a1.stored_path).read_text(encoding="utf-8") == "第一次内容"
-    assert Path(a2.stored_path).read_text(encoding="utf-8") == "第二次内容"
+    assert disk_path(a1.stored_path).is_file() and disk_path(a2.stored_path).is_file()
+    assert disk_path(a1.stored_path).read_text(encoding="utf-8") == "第一次内容"
+    assert disk_path(a2.stored_path).read_text(encoding="utf-8") == "第二次内容"
 
 
 def test_artifact_content_endpoint(client: TestClient, case_id: str) -> None:

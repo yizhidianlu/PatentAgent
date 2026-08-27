@@ -1604,7 +1604,7 @@ export const zh = {
           `将永久删除「${name}」及其全部案件、上传件与交付物，操作不可恢复。`,
         confirmLabel: (name: string) => `请输入用户名「${name}」以确认删除`,
         placeholder: '输入用户名确认',
-        purgeFiles: '同时删除其磁盘文件（上传件与交付物）',
+        purgeFiles: '同时删除其磁盘文件（上传件与交付物，不可恢复）',
         submit: '永久删除',
         submitting: '删除中…',
         mismatch: '输入的用户名不匹配',

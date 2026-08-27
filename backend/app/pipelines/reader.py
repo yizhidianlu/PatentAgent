@@ -54,6 +54,7 @@ from ..models.reader import (
     ReportSection,
 )
 from ..services import artifacts as artifacts_service
+from ..services import paths as paths_service
 from ..services import assembler, assets_loader, patches, patent_fetch
 from ..services import convert as convert_service
 from ..services import disclosure_build as build_service
@@ -258,7 +259,7 @@ def _store_bytes_sync(
     stored_path.write_bytes(payload)
 
     result = convert_service.convert_upload(case_id, stored_path)
-    md_path = str(result.md_path) if result.md_path is not None else None
+    md_path = paths_service.to_stored(result.md_path) if result.md_path is not None else None
     file_id = str(ULID())
     db.execute(
         """
@@ -268,7 +269,8 @@ def _store_bytes_sync(
         """,
         (
             file_id, case_id, "upload", stored_path.name, mime, len(payload),
-            str(stored_path), md_path, json.dumps(result.meta, ensure_ascii=False), db.now_str(),
+            paths_service.to_stored(stored_path), md_path,
+            json.dumps(result.meta, ensure_ascii=False), db.now_str(),
         ),
     )
     return file_id, result.meta.get("convert_error")
@@ -285,8 +287,8 @@ def _read_file_md_sync(case_id: str, file_id: str) -> tuple[dict[str, Any], str]
         meta = json.loads(record.get("meta_json") or "{}")
         reason = meta.get("convert_error") or "该文件没有可用的文本"
         raise ValueError(f"《{record.get('orig_name')}》无法进入解读流水线：{reason}")
-    path = Path(md_path)
-    if not path.is_file():
+    path = paths_service.resolve_existing(md_path)
+    if path is None:
         raise ValueError(f"转换文本已不在磁盘：{md_path}")
     return record, path.read_text(encoding="utf-8", errors="replace")
 

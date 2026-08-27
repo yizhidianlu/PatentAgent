@@ -295,7 +295,10 @@ async def delete_user(
     user_id: str,
     request: Request,
     admin: dict[str, Any] = Depends(require_admin),
-    purge_files: bool = Query(default=True, description="同时删除其上传件与交付物"),
+    purge_files: bool = Query(
+        default=False,
+        description="同时物理删除其上传件与交付物目录（不可撤销，需显式开启）",
+    ),
 ) -> OkMessage:
     """删除用户及其全部数据（案件经外键级联清理）。"""
     def _run() -> dict[str, Any]:
@@ -309,6 +312,10 @@ async def delete_user(
 
         case_rows = db.query_all("SELECT id FROM cases WHERE user_id=?", (user_id,))
         case_ids = [r["id"] for r in case_rows]
+        # 默认不删盘：删账号是常见操作，磁盘上的原始材料与交付物却是不可再生的。
+        # 备份的媒体侧对已删文件只保留有限的历史窗口，一旦过窗就真没了；
+        # 「把删除做得更彻底」和「删除不可恢复」叠在一起，扩大的是不可逆损失面。
+        # 需要连盘一起清时显式传 purge_files=true。
         if purge_files:
             import shutil
 
@@ -323,7 +330,7 @@ async def delete_user(
 
         db.execute("DELETE FROM cases WHERE user_id=?", (user_id,))
         db.execute("DELETE FROM users WHERE id=?", (user_id,))
-        return {"username": row["username"], "cases": len(case_ids)}
+        return {"username": row["username"], "cases": len(case_ids), "purged_files": purge_files}
 
     info = await db.arun(_run)
     await db.arun(
@@ -331,7 +338,10 @@ async def delete_user(
         actor_id=admin["id"], actor_name=admin.get("username"),
         target_type="user", target_id=user_id, detail=info, ip=client_ip(request),
     )
-    return OkMessage(message=f"已删除用户「{info['username']}」及其 {info['cases']} 个案件")
+    tail = "，磁盘文件已一并删除" if purge_files else "；磁盘上的上传件与交付物已保留"
+    return OkMessage(
+        message=f"已删除用户「{info['username']}」及其 {info['cases']} 个案件{tail}"
+    )
 
 
 @router.get("/users/{user_id}/cases", summary="某用户的案件列表")

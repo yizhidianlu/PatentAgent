@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -889,7 +891,7 @@ def test_reader_note_artifact_and_docx_export(client: TestClient) -> None:
     assert notes, "未产出 reader_note_md 交付物"
     latest = notes[-1]
     assert latest["filename"].startswith(f"{PATENT_TITLE}_")
-    text = Path(latest["stored_path"]).read_text(encoding="utf-8")
+    text = disk_path(latest["stored_path"]).read_text(encoding="utf-8")
     assert text.startswith(f"# 专利解读：{PATENT_TITLE}")
     assert text.count("\n## ") == 11                       # 11 节齐全
     assert text == _run["state"]["report_markdown"]
@@ -902,7 +904,7 @@ def test_reader_note_artifact_and_docx_export(client: TestClient) -> None:
 
     from docx import Document
 
-    doc = Document(art["stored_path"])
+    doc = Document(disk_path(art["stored_path"]))
     texts = [p.text for p in doc.paragraphs]
     assert any("专利解读" in t for t in texts)
     assert any("免责声明" in t for t in texts)

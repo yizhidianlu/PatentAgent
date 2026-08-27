@@ -26,6 +26,7 @@ from ulid import ULID
 from ..config import get_config
 from ..db import database as db
 from ..models.artifact import ArtifactOut
+from . import paths as paths_service
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +158,7 @@ def save_artifact_sync(
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                artifact_id, case_id, version, kind, filename, str(path),
+                artifact_id, case_id, version, kind, filename, paths_service.to_stored(path),
                 run_group, iteration_type, summary, source_artifact_id, created_at,
             ),
         )
@@ -173,7 +174,7 @@ def save_artifact_sync(
     logger.info("交付物已落盘：case=%s kind=%s v%s → %s", case_id, kind, version, filename)
     return ArtifactOut(
         id=artifact_id, case_id=case_id, version=version, kind=kind,  # type: ignore[arg-type]
-        filename=filename, stored_path=str(path), run_group=run_group,
+        filename=filename, stored_path=paths_service.to_stored(path), run_group=run_group,
         iteration_type=iteration_type, summary=summary,  # type: ignore[arg-type]
         source_artifact_id=source_artifact_id, created_at=created_at,
     )

@@ -414,3 +414,56 @@ def test_normal_user_cannot_reach_admin_endpoints(client: AuthedClient) -> None:
         assert "管理员" in resp.json()["detail"]
     # 越权尝试没有把自己变成管理员
     assert client.get(f"{API}/auth/me").json()["role"] == "user"
+
+
+def test_delete_user_keeps_disk_files_by_default(admin_client, raw_client) -> None:
+    """删账号默认不删盘。
+
+    删账号是常见操作（离职、误建、改名重开），磁盘上的原始材料与交付物却是
+    不可再生的：备份的媒体侧对已删文件只保留有限的历史窗口，过窗就真没了。
+    要连盘一起清必须显式传 purge_files=true。
+    """
+    from app.config import get_config
+    from conftest import login_fresh_user
+
+    username = "keepdisk"
+    victim = login_fresh_user(raw_client, admin_client, username, "KeepDisk#2026")
+
+    r = victim.post(f"{API}/cases", json={"module": "disclosure", "title": "留档材料"})
+    case_id = r.json()["id"]
+    up = victim.post(
+        f"{API}/cases/{case_id}/files",
+        files=[("files", ("重要材料.md", b"# keep me", "text/markdown"))],
+    )
+    assert up.status_code == 201, up.text
+
+    case_dir = get_config().uploads_dir / case_id
+    assert case_dir.is_dir()
+
+    d = admin_client.delete(f"{API}/admin/users/{victim.user['id']}")
+    assert d.status_code == 200, d.text
+    assert case_dir.is_dir(), "默认删账号不该把磁盘上的材料一并删掉"
+
+
+def test_delete_user_purges_disk_when_asked(admin_client, raw_client) -> None:
+    """显式要求时仍然照删——默认关不等于做不到。"""
+    from app.config import get_config
+    from conftest import login_fresh_user
+
+    username = "purgedisk"
+    victim = login_fresh_user(raw_client, admin_client, username, "PurgeDisk#2026")
+
+    r = victim.post(f"{API}/cases", json={"module": "disclosure", "title": "该删的"})
+    case_id = r.json()["id"]
+    victim.post(
+        f"{API}/cases/{case_id}/files",
+        files=[("files", ("x.md", b"# bye", "text/markdown"))],
+    )
+    case_dir = get_config().uploads_dir / case_id
+    assert case_dir.is_dir()
+
+    d = admin_client.delete(
+        f"{API}/admin/users/{victim.user['id']}", params={"purge_files": "true"}
+    )
+    assert d.status_code == 200, d.text
+    assert not case_dir.exists()

@@ -53,6 +53,7 @@ from ..models.oa import (
     lint_notice_struct,
 )
 from ..services import artifacts as artifacts_service
+from ..services import paths as paths_service
 from ..services import assembler, assets_loader, claims_lint, oa_library, vector
 from ..services import disclosure_build as build_service
 from ..services import export_docx as export_docx_service
@@ -248,8 +249,8 @@ def _file_rows_sync(case_id: str) -> list[dict[str, Any]]:
 def _read_text_sync(path: str | None) -> str:
     if not path:
         return ""
-    p = Path(path)
-    if not p.is_file():
+    p = paths_service.resolve_existing(path)
+    if p is None:
         return ""
     return p.read_text(encoding="utf-8", errors="replace")
 

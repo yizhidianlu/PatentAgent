@@ -42,6 +42,7 @@ from .db import database as db
 from .middleware import AuthMiddleware, SecurityHeadersMiddleware
 from .pipelines import engine as pipeline_engine
 from .services import auth as auth_service
+from .services import paths as paths_service
 from .services.instance_lock import InstanceLock
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,19 @@ async def lifespan(app: FastAPI):
     instance_lock = InstanceLock(cfg.data_dir)
     app.state.instance_lock = instance_lock
     if instance_lock.acquire():
+        # 路径归一：把库里遗留的绝对路径就地改成相对 DATA_DIR 的形态。
+        # 幂等，一次就够——之后这个库换到任何目录都能直接用。
+        normalized = await anyio.to_thread.run_sync(_normalize_paths)
+        if normalized["rewritten"]:
+            logger.info(
+                "路径归一：%s 条绝对路径已改为相对数据目录（另有 %s 条落在数据目录之外，保持原值）",
+                normalized["rewritten"], normalized["left_alone"],
+            )
+        elif normalized["left_alone"]:
+            logger.warning(
+                "有 %s 条文件路径落在数据目录之外，换机恢复后会失效", normalized["left_alone"]
+            )
+
         recovered = await anyio.to_thread.run_sync(pipeline_engine.recover_interrupted)
         if recovered["runs_failed"] or recovered["cases_failed"]:
             logger.info(
@@ -93,6 +107,11 @@ async def lifespan(app: FastAPI):
     yield
     instance_lock.release()
     db.close_db()
+
+
+def _normalize_paths() -> dict[str, int]:
+    """在一次事务里跑完路径归一（同步，供 to_thread 调用）。"""
+    return db.transaction(paths_service.normalize_stored_paths)
 
 
 def _is_api_path(path: str) -> bool:

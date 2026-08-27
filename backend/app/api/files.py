@@ -27,6 +27,7 @@ from ..db import database as db
 from ..models.common import Ok
 from ..models.file import FileContentOut, FileOut, FileUploadResult
 from ..services import convert as convert_service
+from ..services import paths as paths_service
 from .deps import client_ip, current_user, resolve_case_sync, resolve_file_sync
 
 logger = logging.getLogger(__name__)
@@ -56,11 +57,15 @@ def _row_to_file(row: sqlite3.Row) -> FileOut:
 
 
 def _md_preview(md_path: str | None) -> str | None:
-    """读转换 md 的前 2KB（按字节截断后 UTF-8 宽容解码）。"""
-    if not md_path:
+    """读转换 md 的前 2KB（按字节截断后 UTF-8 宽容解码）。
+
+    入参是**入库形态**（相对 DATA_DIR），必须先落实成磁盘路径再打开。
+    """
+    resolved = paths_service.resolve(md_path)
+    if resolved is None:
         return None
     try:
-        with open(md_path, "rb") as fh:
+        with open(resolved, "rb") as fh:
             return fh.read(PREVIEW_BYTES).decode("utf-8", errors="ignore")
     except OSError:
         return None
@@ -76,7 +81,8 @@ def _save_and_convert(case_id: str, orig_name: str, mime: str | None, payload: b
     stored_path.write_bytes(payload)
 
     result = convert_service.convert_upload(case_id, stored_path)
-    md_path = str(result.md_path) if result.md_path is not None else None
+    # 入库存相对 DATA_DIR 的路径：绝对路径会让备份恢复到别的目录后全线静默失效
+    md_path = paths_service.to_stored(result.md_path) if result.md_path is not None else None
     convert_error = result.meta.get("convert_error")
 
     file_id = str(ULID())
@@ -88,7 +94,7 @@ def _save_and_convert(case_id: str, orig_name: str, mime: str | None, payload: b
         """,
         (
             file_id, case_id, "upload", orig_name, mime, len(payload),
-            str(stored_path), md_path,
+            paths_service.to_stored(stored_path), md_path,
             json.dumps(result.meta, ensure_ascii=False), now,
         ),
     )
@@ -129,8 +135,8 @@ async def download_file(
     user: dict[str, Any] = Depends(current_user),
 ) -> FileResponse:
     row = await db.arun(resolve_file_sync, file_id, user, ip=client_ip(request))
-    path = Path(row["stored_path"])
-    if not path.is_file():
+    path = paths_service.resolve_existing(row["stored_path"])
+    if path is None:
         raise HTTPException(status_code=404, detail="磁盘上找不到该文件（可能已被移动或删除）")
     return FileResponse(path, filename=row["orig_name"], media_type=row["mime"] or "application/octet-stream")
 
@@ -144,8 +150,8 @@ async def file_content(
     row = await db.arun(resolve_file_sync, file_id, user, ip=client_ip(request))
     if not row["md_path"]:
         raise HTTPException(status_code=404, detail="该文件没有可读文本（未转换或为二进制文件）")
-    path = Path(row["md_path"])
-    if not path.is_file():
+    path = paths_service.resolve_existing(row["md_path"])
+    if path is None:
         raise HTTPException(status_code=404, detail="转换文本已不存在于磁盘")
     text = await db.arun(lambda: path.read_text(encoding="utf-8", errors="replace"))
     return FileContentOut(id=row["id"], orig_name=row["orig_name"], content=text)
@@ -169,7 +175,10 @@ async def delete_file(
             """仅允许清理 uploads/ 之下的路径，防误删。"""
             if not raw:
                 return
-            p = Path(raw)
+            # 库里可能是相对路径（新）也可能是绝对路径（旧），统一由 paths 落实
+            p = paths_service.resolve(raw)
+            if p is None:
+                return
             try:
                 p.resolve().relative_to(uploads_root)
             except ValueError:

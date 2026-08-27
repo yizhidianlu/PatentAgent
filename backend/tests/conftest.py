@@ -195,3 +195,17 @@ def client(raw_client: TestClient, admin_client: AuthedClient) -> AuthedClient:
 def other_client(raw_client: TestClient, admin_client: AuthedClient) -> AuthedClient:
     """另一个已登录的普通用户（跨用户隔离穿透测试用）。"""
     return login_fresh_user(raw_client, admin_client, "tester2", "Tester2Pw#2026")
+
+
+def disk_path(value) -> Path:
+    """入库形态的路径 → 真实磁盘路径（测试里读文件用）。
+
+    `files.stored_path` / `artifacts.stored_path` 存的是**相对 DATA_DIR** 的路径，
+    这样备份恢复到别的目录后仍然有效。测试要读盘时得走与生产同一条落实通路，
+    不能直接 `Path(row["stored_path"])` —— 那样测的就不是产品的行为了。
+    """
+    from app.services import paths as paths_service
+
+    resolved = paths_service.resolve(value)
+    assert resolved is not None, f"路径落实失败：{value!r}"
+    return resolved

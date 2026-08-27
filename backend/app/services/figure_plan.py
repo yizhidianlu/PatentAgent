@@ -34,6 +34,7 @@ from typing import Any
 import yaml
 
 from ..db import database as db
+from . import paths as paths_service
 from ..models.disclosure import FigurePlan
 from . import assembler, assets_loader
 
@@ -86,7 +87,9 @@ def _image_rows_sync(case_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        path = Path(str(item.get("stored_path") or ""))
+        # 库里是相对 DATA_DIR 的路径；这里落实成绝对路径，
+        # 因为它会被写进 figure_plan.abs_path，导出 Word 时要按盘读
+        path = paths_service.resolve(item.get("stored_path")) or Path("")
         mime = str(item.get("mime") or "")
         if path.suffix.lower() not in IMAGE_EXTS and not mime.startswith("image/"):
             continue

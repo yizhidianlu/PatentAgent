@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -428,16 +430,16 @@ def test_merge_produces_new_version_without_overwriting() -> None:
     assert v2["source_artifact_id"] == v1["id"], "新版本应链回上一版"
 
     assert v1["filename"] != v2["filename"], "迭代必须落新时间戳文件名"
-    assert Path(v1["stored_path"]).is_file(), "旧稿被覆盖/删除了"
-    assert Path(v2["stored_path"]).is_file()
-    assert Path(v1["stored_path"]).read_text(encoding="utf-8") == _run["v1_markdown"]
-    assert Path(v2["stored_path"]).read_text(encoding="utf-8") == _run["v2_markdown"]
+    assert disk_path(v1["stored_path"]).is_file(), "旧稿被覆盖/删除了"
+    assert disk_path(v2["stored_path"]).is_file()
+    assert disk_path(v1["stored_path"]).read_text(encoding="utf-8") == _run["v1_markdown"]
+    assert disk_path(v2["stored_path"]).read_text(encoding="utf-8") == _run["v2_markdown"]
     assert _run["v2_markdown"] != _run["v1_markdown"]
 
     docxs = _artifacts(case_id, "disclosure_docx")
     assert len(docxs) >= 2 and docxs[1]["version"] == 2
     assert docxs[0]["filename"] != docxs[1]["filename"]
-    assert Path(docxs[0]["stored_path"]).is_file() and Path(docxs[1]["stored_path"]).is_file()
+    assert disk_path(docxs[0]["stored_path"]).is_file() and disk_path(docxs[1]["stored_path"]).is_file()
 
 
 def test_merge_touches_only_affected_chapter() -> None:
@@ -504,9 +506,9 @@ def test_correct_replaces_term_family() -> None:
     v3 = mds[2]
     assert v3["version"] == 3 and v3["iteration_type"] == "correction"
     assert v3["run_group"] == "iteration-2"
-    assert Path(v3["stored_path"]).is_file()
+    assert disk_path(v3["stored_path"]).is_file()
     assert mds[1]["filename"] != v3["filename"]
-    assert Path(mds[1]["stored_path"]).is_file(), "纠正轮覆盖了合并轮的文件"
+    assert disk_path(mds[1]["stored_path"]).is_file(), "纠正轮覆盖了合并轮的文件"
 
     text = _run["v3_markdown"]
     assert OLD_TERM not in text, "旧叫法仍残留在正文中"
@@ -584,7 +586,7 @@ def test_iteration_binary_artifacts() -> None:
             "initial", "initial", "merge", "merge", "correction", "correction"
         ]
         for item in pngs:
-            assert Path(item["stored_path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+            assert disk_path(item["stored_path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
     pdfs = _artifacts(case_id, "disclosure_pdf")
     files = _run["merge_state"]["iteration"]["deliver"]["files"]
@@ -593,7 +595,7 @@ def test_iteration_binary_artifacts() -> None:
     assert len(pdfs) == 3
     assert len({p["filename"] for p in pdfs}) == 3
     for item in pdfs:
-        assert Path(item["stored_path"]).read_bytes()[:5] == b"%PDF-"
+        assert disk_path(item["stored_path"]).read_bytes()[:5] == b"%PDF-"
     assert files.get("pdf_engine") in ("word", "soffice")
 
 
@@ -605,7 +607,7 @@ def test_revision_log_artifact_contains_two_rounds() -> None:
     assert logs[0]["filename"] != logs[1]["filename"]
     assert logs[0]["filename"].startswith("交底书修订对话记录_")
 
-    latest = Path(logs[1]["stored_path"]).read_text(encoding="utf-8")
+    latest = disk_path(logs[1]["stored_path"]).read_text(encoding="utf-8")
     assert latest.startswith("# 交底书修订对话记录")
     assert f"**案件名称**：{td.CASE_TITLE}" in latest
     assert "**累计轮次**：3" in latest
@@ -617,7 +619,7 @@ def test_revision_log_artifact_contains_two_rounds() -> None:
     for element in ("**记录时间**", "**类型**", "**用户说明摘要**", "**交付文件**", "**摘要摘录**"):
         assert element in latest, f"修订记录缺要素：{element}"
 
-    first = Path(logs[0]["stored_path"]).read_text(encoding="utf-8")
+    first = disk_path(logs[0]["stored_path"]).read_text(encoding="utf-8")
     assert "**累计轮次**：2" in first, "第一次导出应只有初稿 + 合并轮"
 
 

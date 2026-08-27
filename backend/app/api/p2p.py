@@ -35,6 +35,7 @@ from ..pipelines import engine
 from ..pipelines import paper2patent as p2p
 from ..services import assets_loader, claims_lint
 from ..services import drawings as drawings_service
+from ..services import paths as paths_service
 from .deps import client_ip, current_user, resolve_case_sync
 
 logger = logging.getLogger(__name__)
@@ -91,8 +92,8 @@ def _load_content_sync(
     if isinstance(content, dict) and content:
         return content, artifact
     if artifact is not None:
-        path = Path(artifact["stored_path"])
-        if path.is_file() and path.suffix.lower() == ".json":
+        path = paths_service.resolve_existing(artifact["stored_path"])
+        if path is not None and path.suffix.lower() == ".json":
             # 交付物落盘后可能被外部改坏 / 截断：报 422 说明哪一版坏了，别让它变成 500
             try:
                 parsed = json.loads(path.read_text(encoding="utf-8-sig"))

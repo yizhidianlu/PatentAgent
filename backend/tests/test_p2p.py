@@ -16,6 +16,8 @@ import asyncio
 import json
 import zipfile
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -471,7 +473,7 @@ def test_direct_content_artifact_valid(client: TestClient) -> None:
     items = _artifacts(case_id, "patent_content_json")
     assert items, "未产出 patent_content_json 交付物"
     latest = items[-1]
-    data = json.loads(Path(latest["stored_path"]).read_text(encoding="utf-8"))
+    data = json.loads(disk_path(latest["stored_path"]).read_text(encoding="utf-8"))
     content = PatentContent.model_validate(data)          # 契约校验
 
     assert content.invention_name == INVENTION_NAME
@@ -498,14 +500,14 @@ def test_direct_figures_generated() -> None:
     svgs = _artifacts(case_id, "figure_svg")
     assert len(svgs) >= 2, "至少应产出两幅 SVG 附图"
     for item in svgs:
-        text = Path(item["stored_path"]).read_text(encoding="utf-8")
+        text = disk_path(item["stored_path"]).read_text(encoding="utf-8")
         assert "<svg" in text
         assert "图1" not in text and "图2" not in text     # 图号/图题不得画进画布
 
     pngs = _artifacts(case_id, "figure_png")
     assert pngs, "未产出 PNG 兜底附图（Pillow 不可用？）"
     for item in pngs:
-        assert Path(item["stored_path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert disk_path(item["stored_path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
     validations = _direct["state"]["content"]["drawing_validation"]
     assert validations and all(v["passes"] for v in validations)
@@ -518,7 +520,7 @@ def test_direct_docx_generated() -> None:
     case_id = _direct["case_id"]
     docx_items = _artifacts(case_id, "patent_docx")
     assert docx_items, "未产出 patent_docx 交付物"
-    path = Path(docx_items[-1]["stored_path"])
+    path = disk_path(docx_items[-1]["stored_path"])
 
     doc = Document(str(path))
     texts = [p.text.strip() for p in doc.paragraphs]
@@ -538,7 +540,7 @@ def test_direct_pdf_generated() -> None:
     pdf_items = _artifacts(case_id, "patent_pdf")
     if not pdf_items:
         pytest.skip(f"PDF 全部引擎不可用，已记录：{build.get('pdf_error')}")
-    data = Path(pdf_items[-1]["stored_path"]).read_bytes()
+    data = disk_path(pdf_items[-1]["stored_path"]).read_bytes()
     assert data[:5] == b"%PDF-"
     assert build.get("pdf_engine") in ("word", "soffice", "pillow")
 
@@ -597,7 +599,7 @@ def test_drawings_degrade_to_prompt_only(client: TestClient) -> None:
 
     case_id = _new_case(client, "论文转专利 附图降级测试")
     source = _artifacts(_direct["case_id"], "patent_content_json")[-1]
-    content = json.loads(Path(source["stored_path"]).read_text(encoding="utf-8"))
+    content = json.loads(disk_path(source["stored_path"]).read_text(encoding="utf-8"))
     content["drawings"] = ["图1：一种示意图，其内容无法解析出步骤或模块。"]
     content.pop("drawing_assets", None)
     _merge_state_sync(case_id, {"content": content})
@@ -684,7 +686,7 @@ async def test_flash_mode_single_call(client: TestClient, fake_llm: FakeLLM) -> 
 
     items = _artifacts(case_id, "patent_content_json")
     assert len(items) == 1 and items[0]["filename"].endswith(".md")
-    text = Path(items[0]["stored_path"]).read_text(encoding="utf-8")
+    text = disk_path(items[0]["stored_path"]).read_text(encoding="utf-8")
     assert "一、说明书摘要" in text and "五、说明书附图" in text
     assert not _artifacts(case_id, "patent_docx")     # 快速档不进文件管线
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import disk_path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -133,7 +135,7 @@ def test_delete_file(client: TestClient, case_id: str, tmp_path: Path) -> None:
     src.write_text("删除测试内容", encoding="utf-8")
     item = _upload(client, case_id, src, "text/plain")
     file_id = item["file"]["id"]
-    stored = Path(item["file"]["stored_path"])
+    stored = disk_path(item["file"]["stored_path"])
     assert stored.is_file()
 
     assert client.delete(f"/api/v1/files/{file_id}").status_code == 200
@@ -151,4 +153,4 @@ def test_convert_error_not_fatal(client: TestClient, case_id: str, tmp_path: Pat
     )
     assert item["convert_error"]                 # 有明确错误信息
     assert item["file"]["md_path"] is None
-    assert Path(item["file"]["stored_path"]).is_file()
+    assert disk_path(item["file"]["stored_path"]).is_file()

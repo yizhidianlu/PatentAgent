@@ -43,6 +43,7 @@ from ..config import get_config
 from ..db import database as db
 from ..models.disclosure import MaterialDigest, SelfCheckReport
 from ..services import artifacts as artifacts_service
+from ..services import paths as paths_service
 from ..services import assembler, cnipa, revision_log, terminology
 from ..services import disclosure_build as build_service
 from ..services import export_docx as export_docx_service
@@ -1475,7 +1476,8 @@ async def _save_files(
         pdf_path = get_config().tmp_dir / f"{stem}_{ULID()}.pdf"
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            pdf_engine = await export_pdf_service.docx_to_pdf(Path(docx_artifact.stored_path), pdf_path)
+            docx_src = paths_service.resolve(docx_artifact.stored_path)
+            pdf_engine = await export_pdf_service.docx_to_pdf(docx_src, pdf_path)
         except export_pdf_service.PdfExportError as exc:
             pdf_error = str(exc)
             logger.info("迭代稿 PDF 导出不可用：%s", exc)

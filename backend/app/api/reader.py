@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..db import database as db
+from ..services import paths as paths_service
 from ..models.reader import (
     ClaimDeltas,
     ClaimTree,
@@ -71,8 +72,8 @@ def _load_report_sync(
 
     markdown = state.get("report_markdown")
     if not markdown and artifact is not None:
-        path = Path(artifact["stored_path"])
-        if path.is_file():
+        path = paths_service.resolve_existing(artifact["stored_path"])
+        if path is not None:
             markdown = path.read_text(encoding="utf-8", errors="replace")
 
     if not isinstance(report, dict) or not report.get("sections"):

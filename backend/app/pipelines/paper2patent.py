@@ -41,6 +41,7 @@ from ..models.paper2patent import (
     PatentContent,
 )
 from ..services import artifacts as artifacts_service
+from ..services import paths as paths_service
 from ..services import assembler, claims_lint, faithfulness
 from ..services import drawings as drawings_service
 from ..services import export_pdf as export_pdf_service
@@ -302,9 +303,9 @@ def _paper_file_row(case_id: str, file_id: str) -> dict[str, Any]:
 def _read_paper_sync(case_id: str, file_id: str) -> tuple[str, str, str]:
     """返回 (files.id, 论文标题, 论文 markdown 全文)。"""
     record = _paper_file_row(case_id, file_id)
-    path = Path(record["md_path"])
-    if not path.is_file():
-        raise ValueError(f"论文转换文本已不在磁盘：{path}")
+    path = paths_service.resolve_existing(record["md_path"])
+    if path is None:
+        raise ValueError(f"论文转换文本已不在磁盘：{record['md_path']}")
     text = path.read_text(encoding="utf-8", errors="replace")
     title = _paper_title(text) or Path(record["orig_name"]).stem
     return str(record["id"]), title, text

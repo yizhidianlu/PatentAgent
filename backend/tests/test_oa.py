@@ -24,6 +24,8 @@ import asyncio
 import json
 import time
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -477,7 +479,7 @@ async def test_oa_pipeline_runs_end_to_end(client: TestClient, fake_llm: FakeLLM
 
     # PDF→md 真跑：抽取文本须含条款号与对比文件
     assert notice["convert_error"] is None, notice
-    notice_md = Path(notice["file"]["md_path"]).read_text(encoding="utf-8")
+    notice_md = disk_path(notice["file"]["md_path"]).read_text(encoding="utf-8")
     assert "专利法第22条第3款" in notice_md
     assert "专利法第26条第4款" in notice_md
     assert "CN102222222A" in notice_md and "对比文件1" in notice_md
@@ -659,10 +661,10 @@ def test_cross_issue_consistency_and_deliverables() -> None:
     md_items = _artifacts(_oa["case_id"], "oa_response_md")
     docx_items = _artifacts(_oa["case_id"], "oa_response_docx")
     assert len(md_items) == 1 and len(docx_items) == 1, state["deliver"]["files"]
-    assert Path(md_items[0]["stored_path"]).read_text(encoding="utf-8") == document
+    assert disk_path(md_items[0]["stored_path"]).read_text(encoding="utf-8") == document
     assert docx_items[0]["source_artifact_id"] == md_items[0]["id"]
 
-    doc = Document(docx_items[0]["stored_path"])
+    doc = Document(disk_path(docx_items[0]["stored_path"]))
     texts = [p.text for p in doc.paragraphs]
     assert any("意见陈述书" in t for t in texts)
     # 「2. …」在 Word 里被有序列表的自动编号接管，段落文本只剩权项正文

@@ -173,7 +173,8 @@ export function useResetUserPassword() {
 export function useDeleteUser() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, purgeFiles = true }: { id: string; purgeFiles?: boolean }) =>
+    // 默认不删盘：磁盘上的原始材料与交付物不可再生，而备份对已删文件只保留有限窗口
+    mutationFn: ({ id, purgeFiles = false }: { id: string; purgeFiles?: boolean }) =>
       api.delete<{ ok?: boolean; message?: string }>(
         `/admin/users/${encodeURIComponent(id)}`,
         { query: { purge_files: purgeFiles } },

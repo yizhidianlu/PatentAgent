@@ -14,6 +14,8 @@ import threading
 import zipfile
 from pathlib import Path
 
+from conftest import disk_path
+
 import pytest
 
 from app.db import database as db
@@ -311,7 +313,7 @@ def test_docx_with_image_extracts_media(case_dir: Path, tmp_path: Path) -> None:
     res = _convert(case_dir, "带图.docx", _docx_bytes(build))
     assert res.meta.get("convert_error") is None
     assert res.meta.get("figure_count", 0) >= 1
-    media = Path(res.meta["media_dir"])
+    media = disk_path(res.meta["media_dir"])
     assert media.is_dir() and any(media.iterdir())
 
 
@@ -946,7 +948,7 @@ def test_artifact_concurrent_saves_never_overwrite(artifact_case: str) -> None:
     assert len({a.version for a in saved}) == n, "版本号必须唯一"
     assert len({a.filename for a in saved}) == n, "文件名必须唯一"
 
-    bodies = [Path(a.stored_path).read_text(encoding="utf-8").strip().splitlines()[-1] for a in saved]
+    bodies = [disk_path(a.stored_path).read_text(encoding="utf-8").strip().splitlines()[-1] for a in saved]
     assert len(set(bodies)) == n, "每条版本记录都必须指向自己那份内容，不能被别人覆盖"
 
     from app.config import get_config
@@ -960,8 +962,8 @@ def test_artifact_sequential_saves_increment_version(artifact_case: str) -> None
     a2 = artifacts_service.save_artifact_sync(artifact_case, "revision_log_md", "第二版", "md", title="顺序测试")
     assert a2.version == a1.version + 1
     assert a1.filename != a2.filename
-    assert Path(a1.stored_path).read_text(encoding="utf-8") == "第一版"
-    assert Path(a2.stored_path).read_text(encoding="utf-8") == "第二版"
+    assert disk_path(a1.stored_path).read_text(encoding="utf-8") == "第一版"
+    assert disk_path(a2.stored_path).read_text(encoding="utf-8") == "第二版"
 
 
 @pytest.mark.parametrize(
@@ -998,14 +1000,14 @@ def test_artifact_long_and_illegal_case_name_lands_on_disk(artifact_case: str) -
     a = artifacts_service.save_artifact_sync(
         artifact_case, "disclosure_md", "**案件名称**：" + "超" * 300 + "\n\n正文", "md"
     )
-    assert Path(a.stored_path).is_file()
+    assert disk_path(a.stored_path).is_file()
     # {≤80 字案件名}_{14 位时间戳}.md
     assert len(Path(a.filename).stem) <= artifacts_service.MAX_NAME_LEN + 15
 
     b = artifacts_service.save_artifact_sync(
         artifact_case, "disclosure_md", '**案件名称**：A/B:C*D?E"F<G>H|I\n\n正文', "md"
     )
-    assert Path(b.stored_path).is_file()
+    assert disk_path(b.stored_path).is_file()
     assert not set(Path(b.filename).stem) & set('\\/:*?"<>|')
 
 
@@ -1111,7 +1113,7 @@ def test_api_upload_very_long_filename(api_client, api_case: str) -> None:
     item = _api_upload(api_client, api_case, name, _pdf([("长文件名测试正文",)]), "application/pdf")
 
     assert item["convert_error"] is None
-    stored = Path(item["file"]["stored_path"])
+    stored = disk_path(item["file"]["stored_path"])
     assert stored.is_file()
     assert len(stored.name) <= convert_service.MAX_FILENAME_LEN
 
@@ -1137,7 +1139,7 @@ def test_api_upload_batch_survives_one_bad_file(api_client, api_case: str) -> No
     assert_readable_chinese_error(empty["convert_error"], must_contain=("0 字节",))
     # 原件一律落盘，用户还能下载回去
     for it in items:
-        assert Path(it["file"]["stored_path"]).is_file()
+        assert disk_path(it["file"]["stored_path"]).is_file()
 
 
 def test_api_upload_scanned_pdf_surfaces_reason(api_client, api_case: str) -> None:

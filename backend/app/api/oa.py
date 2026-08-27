@@ -48,6 +48,7 @@ from ..models.oa import (
 )
 from ..services import llm as llm_service
 from ..services import oa_library, vector
+from ..services import paths as paths_service
 from .deps import client_ip, current_user, require_admin, resolve_file_sync, viewer_of
 
 logger = logging.getLogger(__name__)
@@ -126,8 +127,8 @@ def _read_file_material_sync(
             status_code=422,
             detail=f"文件《{row['orig_name']}》没有可解析文本（未转换或为二进制文件）",
         )
-    path = Path(str(md_path))
-    if not path.is_file():
+    path = paths_service.resolve_existing(md_path)
+    if path is None:
         raise HTTPException(status_code=422, detail=f"文件《{row['orig_name']}》的转换文本已不存在于磁盘")
     return {
         "name": str(row["orig_name"]),

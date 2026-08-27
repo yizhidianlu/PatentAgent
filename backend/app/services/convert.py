@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import get_config
+from . import paths as paths_service
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +256,7 @@ def _script_convert(script: str, stored_path: Path, out_md: Path) -> ConvertResu
     # 脚本默认把图片抽到「{md 主干}_media/」；记录以便删除时清理
     media_dir = out_md.parent / f"{out_md.stem}_media"
     if media_dir.is_dir():
-        meta["media_dir"] = str(media_dir)
+        meta["media_dir"] = paths_service.to_stored(media_dir)
         meta["figure_count"] = sum(1 for p in media_dir.iterdir() if p.is_file())
     return ConvertResult(md_path=out_md, meta=meta)
 
@@ -386,7 +387,7 @@ def _pdf_convert(case_dir: Path, stored_path: Path, out_md: Path) -> ConvertResu
     meta["figure_captions"] = captions
     meta["figures"] = figures
     if figures:
-        meta["media_dir"] = str(figures_dir)
+        meta["media_dir"] = paths_service.to_stored(figures_dir)
 
     # 扫描件 / 图片版 PDF：一个字都抽不出来。必须显式告知，
     # 否则用户只会看到「上传成功」却发现后续功能全部不可用。

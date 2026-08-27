@@ -52,6 +52,7 @@ from ..models.disclosure import (
 )
 from ..models.search import AbstractDigests, SearchTermsPlan
 from ..services import artifacts as artifacts_service
+from ..services import paths as paths_service
 from ..services import skills as skills_service
 from ..services import assembler, assets_loader, cnipa, faithfulness, terminology
 from ..services import disclosure_build as build_service
@@ -388,8 +389,9 @@ def _material_rows_sync(case_id: str, file_ids: Sequence[str] | None = None) -> 
 
 
 def _read_md_sync(path: str) -> str:
-    p = Path(path)
-    if not p.is_file():
+    # 走 paths.resolve：库里可能是相对路径，也可能是换机前留下的绝对路径
+    p = paths_service.resolve_existing(path)
+    if p is None:
         return ""
     return p.read_text(encoding="utf-8", errors="replace")
 
@@ -2141,7 +2143,7 @@ async def _build_files(ctx: Ctx, markdown: str, case_title: str) -> dict[str, An
     pdf_engine: str | None = None
     pdf_error: str | None = None
     if docx_artifact is not None:
-        docx_path = Path(docx_artifact.stored_path)
+        docx_path = paths_service.resolve(docx_artifact.stored_path)
         pdf_path = get_config().tmp_dir / f"{stem}_{ULID()}.pdf"
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         try:

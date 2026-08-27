@@ -22,6 +22,8 @@ import asyncio
 import json
 import zipfile
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -866,7 +868,7 @@ def test_mermaid_png_artifacts() -> None:
         pytest.skip("mermaid 渲染不可用（本机浏览器/Playwright 问题）")
     assert len(pngs) == 2, "3.2 系统框图与 3.4 流程图应各出一幅 PNG"
     for item in pngs:
-        assert Path(item["stored_path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert disk_path(item["stored_path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 def test_md_and_docx_artifacts() -> None:
@@ -877,12 +879,12 @@ def test_md_and_docx_artifacts() -> None:
     mds = _artifacts(case_id, "disclosure_md")
     assert len(mds) == 1 and mds[0]["version"] == 1
     assert mds[0]["filename"].startswith(CASE_TITLE)
-    saved = Path(mds[0]["stored_path"]).read_text(encoding="utf-8")
+    saved = disk_path(mds[0]["stored_path"]).read_text(encoding="utf-8")
     assert saved == _run["state"]["final_markdown"]
 
     docxs = _artifacts(case_id, "disclosure_docx")
     assert len(docxs) == 1 and docxs[0]["version"] == 1
-    path = Path(docxs[0]["stored_path"])
+    path = disk_path(docxs[0]["stored_path"])
 
     doc = Document(str(path))
     texts = [p.text.strip() for p in doc.paragraphs]
@@ -906,7 +908,7 @@ def test_pdf_artifact_optional() -> None:
     files = _run["state"]["deliver"]["files"]
     if not pdfs:
         pytest.skip(f"docx→pdf 引擎不可用：{files.get('pdf_error')}")
-    assert Path(pdfs[-1]["stored_path"]).read_bytes()[:5] == b"%PDF-"
+    assert disk_path(pdfs[-1]["stored_path"]).read_bytes()[:5] == b"%PDF-"
     assert files.get("pdf_engine") in ("word", "soffice")
 
 

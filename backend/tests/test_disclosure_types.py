@@ -25,6 +25,8 @@ import json
 import struct
 import zlib
 from pathlib import Path
+
+from conftest import disk_path
 from typing import Any
 
 import pytest
@@ -946,12 +948,12 @@ def test_utility_docx_artifact() -> None:
     case_id = _um["case_id"]
     mds = _artifacts(case_id, "disclosure_md")
     assert len(mds) == 1 and mds[0]["version"] == 1
-    assert Path(mds[0]["stored_path"]).read_text(encoding="utf-8") == _um["state"]["final_markdown"]
+    assert disk_path(mds[0]["stored_path"]).read_text(encoding="utf-8") == _um["state"]["final_markdown"]
     assert mds[0]["summary"] == "交底书定稿（实用新型）"
 
     docxs = _artifacts(case_id, "disclosure_docx")
     assert len(docxs) == 1, f"docx 未产出：{_um['state']['deliver']['files'].get('docx_error')}"
-    blob = "\n".join(p.text.strip() for p in Document(docxs[0]["stored_path"]).paragraphs)
+    blob = "\n".join(p.text.strip() for p in Document(disk_path(docxs[0]["stored_path"])).paragraphs)
     assert "技术交底书" in blob
     for heading in ("一、相关技术背景", "三、技术方案的详细阐述", "3.1 总体构成",
                     "3.2 连接与配合", "五、本实用新型的技术关键点与欲保护点"):
@@ -1067,7 +1069,7 @@ def test_design_docx_artifact() -> None:
 
     docxs = _artifacts(case_id, "disclosure_docx")
     assert len(docxs) == 1, f"docx 未产出：{_ds['state']['deliver']['files'].get('docx_error')}"
-    blob = "\n".join(p.text.strip() for p in Document(docxs[0]["stored_path"]).paragraphs)
+    blob = "\n".join(p.text.strip() for p in Document(disk_path(docxs[0]["stored_path"])).paragraphs)
     assert "外观设计说明" in blob
     for heading in ("一、产品名称与用途", "二、设计要点", "三、视图说明", "四、与在先外观的主要差异"):
         assert heading in blob, f"DOCX 缺少章节：{heading}"

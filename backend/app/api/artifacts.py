@@ -27,6 +27,7 @@ from ..models.artifact import ArtifactContentOut, ArtifactExportIn, ArtifactOut
 from ..services import artifacts as artifacts_service
 from ..services import export_docx as export_docx_service
 from ..services import export_pdf as export_pdf_service
+from ..services import paths as paths_service
 from .deps import client_ip, current_user, resolve_artifact_sync, resolve_case_sync
 
 logger = logging.getLogger(__name__)
@@ -90,8 +91,8 @@ async def download_artifact(
     user: dict[str, Any] = Depends(current_user),
 ) -> FileResponse:
     row = await db.arun(resolve_artifact_sync, artifact_id, user, ip=client_ip(request))
-    path = Path(row["stored_path"])
-    if not path.is_file():
+    path = paths_service.resolve_existing(row["stored_path"])
+    if path is None:
         raise HTTPException(status_code=404, detail="磁盘上找不到该交付物文件")
     return FileResponse(path, filename=row["filename"])
 
@@ -104,7 +105,7 @@ async def artifact_content(
     user: dict[str, Any] = Depends(current_user),
 ) -> ArtifactContentOut:
     row = await db.arun(resolve_artifact_sync, artifact_id, user, ip=client_ip(request))
-    path = Path(row["stored_path"])
+    path = paths_service.resolve(row["stored_path"]) or Path(row["stored_path"])
     if path.suffix.lower() not in _TEXT_EXTS:
         raise HTTPException(status_code=415, detail=f"{path.suffix} 为二进制交付物，请走 download 接口")
     if not path.is_file():
@@ -128,8 +129,8 @@ async def export_artifact(
         resolve_artifact_sync, artifact_id, user, ip=client_ip(request), write=True
     )
     src_kind: str = row["kind"]
-    src_path = Path(row["stored_path"])
-    if not src_path.is_file():
+    src_path = paths_service.resolve_existing(row["stored_path"])
+    if src_path is None:
         raise HTTPException(status_code=404, detail="源交付物文件已不存在于磁盘")
 
     # 依源 kind + 目标格式决定导出链与目标 kind
