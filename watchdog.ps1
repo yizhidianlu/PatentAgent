@@ -112,42 +112,76 @@ function Write-Log {
     } catch { }
 }
 
+function Test-BelongsToThisDeployment {
+    <# 这个进程（或它的某个祖先）是不是本仓库 .venv 起的？返回整条归属链的 PID。
+
+       Windows 上 <venv>\Scripts\python.exe 是个 launcher：真解释器是它的**子进程**，
+       socket 归子进程持有。所以端口属主的命令行里根本没有 .venv 字样——
+       要沿父链往上找才能确认归属。
+
+       返回整条链而不只是命中的那一个：只杀子进程会留下 launcher 继续占着端口，
+       只杀 launcher 则子进程成了孤儿、照样监听。
+    #>
+    param([int] $OwnerPid)
+    $chain = @()
+    $found = $false
+    $cur = $OwnerPid
+    for ($depth = 0; $depth -lt 6; $depth++) {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+        if (-not $p) { break }
+        $isOurs = $p.CommandLine -and $p.CommandLine -like "*$Py*"
+        if ($isOurs) {
+            $chain += [int] $p.ProcessId
+            $found = $true
+        } elseif ($found) {
+            break        # 已经走出本部署的范围（再往上是 powershell / 服务宿主）
+        } else {
+            $chain += [int] $p.ProcessId   # 还没命中，先记下——它可能是 launcher 的子进程
+        }
+        $cur = [int] $p.ParentProcessId
+        if ($cur -le 0) { break }
+    }
+    # 命中过才算数：否则这条链是别人的（比如端口被无关进程占着）
+    if ($found) { return $chain }
+    return @()
+}
+
 function Get-AppProcess {
     <# 找出「本仓库、本端口」的应用进程，返回 PID 数组。
 
-       只按 `*uvicorn app.main*` 认人有两个真实后果：
-         * 同机另一个端口上跑着的本项目实例（比如按提示改用 -Port 8080 起的那个）
-           会被这个看门狗当成自己的，健康检查一失败就把人家 Force kill 掉；
-         * 操作员在前台跑 start.ps1 排障时，进程会被无声杀掉、端口被隐藏的替身占住，
-           再起就报端口占用，如此循环。
-       所以判据必须和 deploy\update.ps1 一致：先看谁在监听本端口，
-       再以本仓库 .venv 的解释器兜底（进程已崩到不监听、或刚起还没绑上端口）。
+       判据是「本端口的监听者是否属于本部署」——不是「两个集合是否命中同一个 PID」。
+       这个区别要命：早先版本对 byPort 与 byVenv 取交集，而 launcher 与真解释器
+       永远是两个不同的 PID，交集**恒为空**。于是端口还有人监听时（也就是
+       「僵死但仍在听」——看门狗存在的全部理由）一个进程都杀不掉，
+       Restart-App 对着空数组做完 Stop-Process，3 秒后在端口仍被占用的情况下
+       再起一个，撞 address-in-use 立即退出，日志却写「应用重启后仍不健康」
+       ——把责任推给了应用，而真相是它一次都没被重启过。
+
+       只按 `*uvicorn app.main*` 认人也不行：同机可能还跑着 `-Port 8080` 起的
+       另一个健康实例（端口占用时的官方建议就是换端口），那会被误杀。
     #>
-    # 端口监听者
-    $byPort = [System.Collections.Generic.HashSet[int]]::new()
+    $pids = [System.Collections.Generic.HashSet[int]]::new()
+
+    # 本端口的监听者：沿父链确认归属，命中则把整条链收进来
     try {
         Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-            ForEach-Object { [void] $byPort.Add([int] $_.OwningProcess) }
+            ForEach-Object {
+                foreach ($id in (Test-BelongsToThisDeployment -OwnerPid ([int] $_.OwningProcess))) {
+                    [void] $pids.Add($id)
+                }
+            }
     } catch { }
 
-    # 本仓库 .venv 解释器跑的 uvicorn
+    if ($pids.Count -gt 0) { return @($pids) }
+
+    # 端口无人监听 = 进程崩到不再听了。这时只有「本仓库 .venv 的 uvicorn 只剩一个」
+    # 才能确定它就是我们的；有多个说明同机还跑着别的端口的实例，不能瞎杀。
     $byVenv = @(
         Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -and $_.CommandLine -like "*$Py*" -and $_.CommandLine -like '*uvicorn*' } |
             ForEach-Object { [int] $_.ProcessId }
     )
-
-    # 两条判据取**交集**，不是并集。并集会误伤：本看门狗守 8000，而同机可能还跑着
-    # `.\start.ps1 -Port 8080` 起的另一个健康实例（端口占用时的官方建议就是换端口），
-    # 它同样是本仓库 .venv 的 uvicorn——并集会在 8000 不健康时把 8080 那个一起 Force kill。
-    $both = @($byVenv | Where-Object { $byPort.Contains($_) })
-    if ($both.Count -gt 0) { return $both }
-
-    # 交集为空的两种情形，都只该动本端口上的那个：
-    #   * 进程崩到不再监听（byPort 空）→ 用 byVenv 里的？不行，那可能是别的端口上的实例。
-    #     只有当 byVenv 只有一个、且本端口无人监听时，才能确定它就是我们的。
-    #   * 端口被非本仓库进程占着（byVenv 空）→ 交给上层报错，不在这里杀。
-    if ($byPort.Count -eq 0 -and $byVenv.Count -eq 1) { return $byVenv }
+    if ($byVenv.Count -eq 1) { return $byVenv }
     return @()
 }
 
@@ -203,10 +237,42 @@ function Test-TunnelHealthy {
     }
 }
 
+function Test-PortFree {
+    <# 本端口是否已无人监听 #>
+    try {
+        return @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue).Count -eq 0
+    } catch {
+        return $true   # 查不了就别拦着重启
+    }
+}
+
 function Restart-App {
     Write-Log 'FIX' '重启应用...'
-    Get-AppProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 3
+    $targets = @(Get-AppProcess)
+    if ($targets.Count -eq 0) {
+        # 这句必须打出来。早先版本因判据写错而恒返回空数组，Stop-Process 对空数组
+        # 静默通过，日志只留下后面那句「应用重启后仍不健康」——把责任推给了应用，
+        # 而真相是它一次都没被停过。数量记在日志里，下次就能一眼看穿。
+        Write-Log 'WARN' '未定位到本部署的应用进程（可能已退出，或端口被非本部署的进程占用）'
+    } else {
+        foreach ($id in $targets) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+        Write-Log 'INFO' "已停止 $($targets.Count) 个进程：$($targets -join ', ')"
+    }
+
+    # 等端口真正释放再起。不等的话会起出一个注定撞 address-in-use 的实例——
+    # 而 uvicorn 是**先跑完 lifespan 再绑端口**，那个短命进程会先把别人正在跑的
+    # 流水线判成中断（详见 backend/app/services/instance_lock.py）。
+    $freed = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        if (Test-PortFree) { $freed = $true; break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $freed) {
+        Write-Log 'ERR' "端口 $Port 仍被占用，放弃本次重启（避免起出一个会误判流水线的短命实例）"
+        $script:AppFails = 0
+        return
+    }
+
     $argList = @('-m','uvicorn','app.main:app','--host','127.0.0.1','--port',"$Port",'--proxy-headers','--forwarded-allow-ips','127.0.0.1')
     Start-Process -FilePath $Py -ArgumentList $argList -WorkingDirectory $Backend -WindowStyle Hidden
     Start-Sleep -Seconds 10

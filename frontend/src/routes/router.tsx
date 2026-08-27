@@ -11,6 +11,7 @@ import { OACasesPage } from '../pages/OACasesPage'
 import { SettingsPage } from '../pages/SettingsPage'
 import { NotFoundPage } from '../pages/NotFoundPage'
 import { LoginPage } from '../pages/LoginPage'
+import { SkillsPage } from '../pages/SkillsPage'
 import { RegisterPage } from '../pages/RegisterPage'
 import { ChangePasswordPage } from '../pages/ChangePasswordPage'
 import { AdminPage } from '../pages/AdminPage'
@@ -95,6 +96,7 @@ const protectedRoutes: RouteObject[] = [
     element: <SecondaryLayout />,
     children: [
       { path: '/oa/cases', element: <OACasesPage /> },
+      { path: '/skills', element: <SkillsPage /> },
       { path: '/settings', element: <SettingsPage /> },
     ],
   },

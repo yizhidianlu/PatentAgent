@@ -13,6 +13,7 @@ export const zh = {
   nav: {
     workbench: '工作台',
     cases: '案例库',
+    skills: '技能库',
     settings: '设置',
   },
 
@@ -1161,6 +1162,52 @@ export const zh = {
   // -------------------------------------------------------------------------
   // 案例库页（§3.6）
   // -------------------------------------------------------------------------
+
+  /** §技能库：平台支持的各项能力，写专利时可勾选启用。 */
+  skills: {
+    title: '技能库',
+    desc: '平台支持的各项能力。开启后会在对应的专利撰写流程中自动生效。',
+    empty: '暂无可用技能',
+    loadFailed: '技能列表加载失败',
+    retry: '重新加载',
+
+    statuses: {
+      available: '可用',
+      needs_config: '待配置',
+      unavailable: '环境不支持',
+    } as Record<string, string>,
+
+    modules: {
+      disclosure: '交底书',
+      paper2patent: '论文转专利',
+      reader: '专利解读',
+      oa: '审查答复',
+    } as Record<string, string>,
+
+    patentTypes: {
+      invention: '发明',
+      utility_model: '实用新型',
+      design: '外观设计',
+    } as Record<string, string>,
+
+    appliesTo: '适用于',
+    allTypes: '全部专利类型',
+    inputs: '需要提供',
+    outputs: '产出',
+    costHint: '开销',
+    requirements: '前置条件',
+    goConfigure: '去配置',
+    alwaysOn: '流程必需，不可关闭',
+    alwaysOnHint: '这项是产出合规文书的必要环节，关闭它等于允许输出不符合审查要求的内容。',
+    source: '来源',
+    license: '许可证',
+    toggleFailed: '开关失败，请重试',
+    enabledOk: (name: string) => `已开启「${name}」`,
+    disabledOk: (name: string) => `已关闭「${name}」`,
+    adminOnly: '仅管理员可修改技能开关',
+    /** 待配置技能的开关被点击时的引导。 */
+    configFirst: '请先完成前置配置，再开启该技能',
+  },
 
   oaCases: {
     title: '审查答复案例库',

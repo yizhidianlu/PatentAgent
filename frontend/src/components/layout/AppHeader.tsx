@@ -10,6 +10,7 @@ import { UserMenu } from './UserMenu'
 const navItems = [
   { to: '/', label: zh.nav.workbench, end: true },
   { to: '/oa/cases', label: zh.nav.cases, end: false },
+  { to: '/skills', label: zh.nav.skills, end: false },
   { to: '/settings', label: zh.nav.settings, end: false },
 ]
 

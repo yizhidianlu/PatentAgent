@@ -34,12 +34,14 @@ from .api import reader as reader_api
 from .api import render as render_api
 from .api import search as search_api
 from .api import settings as settings_api
+from .api import skills as skills_api
 from .api import system as system_api
 from .config import get_config, unknown_env_keys
 from .db import database as db
 from .middleware import AuthMiddleware, SecurityHeadersMiddleware
 from .pipelines import engine as pipeline_engine
 from .services import auth as auth_service
+from .services.instance_lock import InstanceLock
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +66,31 @@ async def lifespan(app: FastAPI):
     # 首次启动引导：库中无用户时创建管理员（随机密码在日志里醒目打印一次）
     await anyio.to_thread.run_sync(auth_service.ensure_bootstrap_admin)
     # 启动恢复钩子：上次进程死亡遗留的 running 状态 → failed('interrupted')
-    recovered = await anyio.to_thread.run_sync(pipeline_engine.recover_interrupted)
-    if recovered["runs_failed"] or recovered["cases_failed"]:
-        logger.info(
-            "流水线启动恢复：runs→failed %s 条，cases→failed %s 条（可经 /pipeline/resume 续跑）",
-            recovered["runs_failed"], recovered["cases_failed"],
+    #
+    # 只有拿到单实例锁才能做——这一步是破坏性的、且不区分「这条 run 属于谁」。
+    # uvicorn 先跑完 lifespan 再绑端口，所以一个注定撞 address-in-use 的多余实例
+    # 也会完整走到这里：它会把另一个进程正在跑的流水线判死，然后自己退出，
+    # 留下一条被判死却仍在被写入的记录。几十分钟的产出就此报废，
+    # 而 failed 不是 waiting_user，走不了 resume。
+    instance_lock = InstanceLock(cfg.data_dir)
+    app.state.instance_lock = instance_lock
+    if instance_lock.acquire():
+        recovered = await anyio.to_thread.run_sync(pipeline_engine.recover_interrupted)
+        if recovered["runs_failed"] or recovered["cases_failed"]:
+            logger.info(
+                "流水线启动恢复：runs→failed %s 条，cases→failed %s 条（可经 /pipeline/resume 续跑）",
+                recovered["runs_failed"], recovered["cases_failed"],
+            )
+    else:
+        logger.warning(
+            "检测到同一数据目录上已有实例在运行，跳过启动恢复钩子。"
+            "本进程多半是重复启动，稍后会因端口占用退出——"
+            "跳过是对的：否则会把另一个进程正在跑的流水线判成中断。"
         )
+
     logger.info("%s 启动完成（数据目录：%s）", APP_NAME, cfg.data_dir)
     yield
+    instance_lock.release()
     db.close_db()
 
 
@@ -138,6 +157,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_api.router, prefix=api_prefix)
     app.include_router(admin_api.router, prefix=api_prefix)
     app.include_router(settings_api.router, prefix=api_prefix)
+    app.include_router(skills_api.router, prefix=api_prefix)
     app.include_router(cases_api.router, prefix=api_prefix)
     app.include_router(events_api.router, prefix=api_prefix)
     app.include_router(files_api.router, prefix=api_prefix)
