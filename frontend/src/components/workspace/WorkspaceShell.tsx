@@ -17,6 +17,7 @@ import {
   useCaseDetail,
   useCaseMessages,
   usePipelineState,
+  useResumePipeline,
   useRetryPipeline,
   useStartPipeline,
   useSubmitInput,
@@ -153,6 +154,7 @@ export function WorkspaceShell({
   const submitInput = useSubmitInput(caseId)
   const cancelPipeline = useCancelPipeline(caseId)
   const retryPipeline = useRetryPipeline(caseId)
+  const resumePipeline = useResumePipeline(caseId)
 
   const [snapshotReady, setSnapshotReady] = useState(false)
   const [connectEpoch, setConnectEpoch] = useState(0)
@@ -166,6 +168,8 @@ export function WorkspaceShell({
   const docHydratedRef = useRef<string | null>(null)
   /** 已自动启动过流水线的案件（StrictMode 双挂载下不重复 start）。 */
   const autoStartedCaseRef = useRef<string | null>(null)
+  /** 已自动恢复过的案件（同上，且 resume 只需一次）。 */
+  const autoResumedCaseRef = useRef<string | null>(null)
   const cursorRef = useRef<string | null>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const atBottomRef = useRef(true)
@@ -175,6 +179,7 @@ export function WorkspaceShell({
     seededRef.current = false
     hydratedRef.current = false
     docHydratedRef.current = null
+    autoResumedCaseRef.current = null
     cursorRef.current = null
     atBottomRef.current = true
     setSnapshotReady(false)
@@ -305,6 +310,29 @@ export function WorkspaceShell({
 
   // --- 4) 首次进入自动启动流水线 --------------------------------------------
   const pipelineSettled = pipelineQuery.isSuccess || pipelineQuery.isError
+
+  // --- 重启后自动恢复停在门控的案件 ------------------------------------------
+  //
+  // 服务重启（部署更新、看门狗拉起）会清空引擎的内存态，但数据库里的
+  // waiting_user 保持原样——恢复责任被交给了 /pipeline/resume。而在此之前
+  // 前端从没调过它：门控卡片照常渲染成可点，用户一点得到 409，
+  // cancel 和 retry 同样 409，于是这个案件彻底卡死，几十分钟的产出只能删案重来。
+  //
+  // resume 对 waiting_user 的语义是「重发 interaction_required」，不重跑 LLM，
+  // 所以这里自动做掉而不是让用户点一颗「继续」按钮——没人该知道服务重启过。
+  useEffect(() => {
+    if (!caseId || !pipelineSettled || caseMissing) return
+    if (autoResumedCaseRef.current === caseId) return
+    const state = pipelineQuery.data
+    if (!state) return
+    const waiting = (state.steps ?? []).some((s) => s.status === 'waiting_user')
+    if (!waiting || state.pending_interaction) return
+    autoResumedCaseRef.current = caseId
+    void resumePipeline.mutateAsync().catch(() => {
+      // 恢复不了不该打断阅读：卡片仍在，用户可以走「取消/重试」或联系管理员
+    })
+  }, [caseId, pipelineSettled, caseMissing, pipelineQuery.data, resumePipeline])
+
   const itemCount = session?.items.length ?? 0
   useEffect(() => {
     if (!caseId || !autoStartPayload || autoStartedCaseRef.current === caseId) return

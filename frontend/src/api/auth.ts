@@ -7,6 +7,8 @@
  * | POST | `/auth/logout` | 销毁会话 |
  * | GET  | `/auth/me` | 当前用户（含 quota / usage） |
  * | POST | `/auth/change-password` | `{old_password,new_password}`；400 = 旧密码错/新旧相同 |
+ * | POST | `/auth/register` | 自助注册；**不签发会话**，账号落为 pending |
+ * | GET  | `/auth/registration-open` | 是否开放注册（登录页据此显示入口） |
  *
  * 会话走 httpOnly Cookie，前端不保存任何凭据；CSRF 由 lib/api 自动带头。
  */
@@ -21,7 +23,8 @@ import { useAuthStore } from '../stores/authStore'
 // ---------------------------------------------------------------------------
 
 export type Role = 'admin' | 'user'
-export type UserStatus = 'active' | 'disabled'
+// pending = 自助注册后等待管理员审核；与 disabled（管理员停用）语义不同
+export type UserStatus = 'active' | 'disabled' | 'pending'
 
 /** 按用户的用量上限；0 表示不限。 */
 export interface Quota {
@@ -149,6 +152,41 @@ export function useLogout() {
       useAuthStore.getState().clear()
       queryClient.clear()
     },
+  })
+}
+
+export interface RegisterPayload {
+  username: string
+  password: string
+  display_name?: string
+}
+
+export interface RegisterResult {
+  ok: boolean
+  status: UserStatus
+  message: string
+}
+
+/** 是否开放自助注册。公开接口，未登录也能查。 */
+export function useRegistrationOpen() {
+  return useQuery({
+    queryKey: ['auth', 'registration-open'],
+    queryFn: () => api.get<{ open: boolean }>('/auth/registration-open', { skipAuthHandling: true }),
+    staleTime: 60_000,
+    retry: false,
+  })
+}
+
+/**
+ * 自助注册。
+ *
+ * 刻意不写 onSuccess 缓存用户——注册成功不等于登录成功，账号还在等审核。
+ * 把它当登录处理会让人以为已经进去了。
+ */
+export function useRegister() {
+  return useMutation({
+    mutationFn: (payload: RegisterPayload) =>
+      api.post<RegisterResult>('/auth/register', payload, { skipAuthHandling: true }),
   })
 }
 

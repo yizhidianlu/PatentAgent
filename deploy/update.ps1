@@ -266,7 +266,9 @@ function Stop-Watchdog {
         # 更新期间应用会被停掉几分钟。若此刻其实有个看门狗在跑而我们没认出来，
         # 它会在构建过程中把旧代码拉起来占住端口——这正是本脚本要防的事，
         # 所以「没找到」值得一句 WARN，而不是淹没在 INFO 里。
-        Write-Log 'WARN' '未发现本仓库的看门狗；若确有守护进程在跑，请先手动停止再更新'
+        # 别再建议「先手动停止再更新」——照做会导致更新后无人重启它。
+        # 更新结束时无论如何都会拉起看门狗，这里只是如实记录当前没找到。
+        Write-Log 'INFO' '更新前未发现本仓库的看门狗（更新完成后会拉起一个）'
         return $false
     }
     foreach ($processId in $pids) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }
@@ -629,7 +631,7 @@ if ($CheckOnly) {
 }
 
 # 2. 更新（失败即回滚）
-$watchdogWasRunning = Stop-Watchdog
+[void] (Stop-Watchdog)   # 返回值不再参与控制流：无论更新前有没有，结束时都会起一个
 $backup = $null
 $rolledBack = $false
 
@@ -663,7 +665,8 @@ catch {
         Write-Log 'WARN' '已指定 -NoRollback：保持现场不回滚'
         Write-Log 'WARN' "  代码停在 $($newCommit.Substring(0,7))，数据库备份：$backup"
         Write-Log 'WARN' "  请自行确认服务状态；需要回退时用：git reset --hard $($oldCommit.Substring(0,7))"
-        if ($watchdogWasRunning) { Start-Watchdog }
+        # 无条件起，不看更新前有没有。见下方 finally 处的说明。
+        Start-Watchdog
         exit 1
     }
     Write-Log 'STEP' '开始回滚...'
@@ -721,7 +724,18 @@ finally {
         try { & git -C $Root stash pop | Out-Null; Write-Log 'INFO' '已恢复 stash 的本地改动' }
         catch { Write-Log 'WARN' "stash 未能自动恢复，用 git stash list 查看" }
     }
-    if ($watchdogWasRunning) { Start-Watchdog }
+    # 无条件把看门狗拉回来，而不是「更新前有才起」。
+    #
+    # 原先那句 WARN 建议操作员「先手动停止再更新」，照做的结果是：Stop-Watchdog
+    # 返回 $false → 这里跳过 → 更新成功 exit 0 → 此后系统再无守护，而
+    # WatchdogFailed 的唯一赋值点在 Start-Watchdog 里，为此准备的 exit 3 根本不可达。
+    # 应用僵死没人拉起还是小事，要命的是隧道没人重启——看门狗存在的全部理由
+    # 就是兜住代理干扰 QUIC 导致的隧道掉线。那时域名长期 502，
+    # 而 update.log 最后一行写着「更新成功」。
+    #
+    # watchdog.ps1 的参数有默认值，pid 文件丢了也能起出一个可用的守护；
+    # 真起不来会走 Start-Watchdog 里的 ERR 分支并把退出码抬到 3。
+    Start-Watchdog
 }
 
 if ($rolledBack) { exit 1 }

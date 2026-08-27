@@ -23,7 +23,8 @@ export interface DisplayStep {
  * pipeline.steps → 展示步骤映射：
  * - 任一聚合 key running/waiting_user → current；
  * - 聚合 keys 全部 done/skipped → done；
- * - 后端缺失的展示步骤，凡后续步骤已有进展即视为 done（隐含完成）。
+ * - 后端**缺失**的展示步骤，凡后续步骤已有进展即视为 done（隐含完成）；
+ *   注意「有进展」不含 pending——后端会把没开始的步骤也返回出来。
  */
 export function computeDisplaySteps(
   presets: DisplayStepPreset[],
@@ -39,7 +40,12 @@ export function computeDisplaySteps(
     const current = statuses.some((s) => s === 'running' || s === 'waiting_user')
     const failed = !current && statuses.some((s) => s === 'failed')
     const done = statuses.length > 0 && statuses.every((s) => s === 'done' || s === 'skipped')
-    const hasProgress = current || statuses.length > 0
+    // 「有进展」必须是真的动过。此前写的是 statuses.length > 0——
+    // 后端把尚未开始的步骤也以 pending 返回，于是末尾那个 pending 的「交付」
+    // 让下面的隐含完成从后往前一路点亮，把中间还没开始的步骤全打成了 ✓：
+    // 用户看到「生成五大部分」「附图」已完成，实际上流水线还停在第 2 步。
+    const hasProgress =
+      current || failed || done || statuses.some((s) => s !== 'pending')
     return { preset, current, failed, done, hasProgress }
   })
 
