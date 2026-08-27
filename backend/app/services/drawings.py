@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import logging
 import re
 import subprocess
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 # 附图脚本单次执行超时（秒）
 DRAWINGS_TIMEOUT = 300
+
+# 每案最多用图像模型补几张图。与本文件其余几处 REPAIR 上限同量级。
+# 不设上限的话，「附图脚本整体失败」这一分支会对每张图各调一次，串行叠加。
+MAX_AI_FIGURES = 3
 
 # 工作目录内的内容 JSON 文件名（与图片同目录，供 DOCX/PDF 解析相对路径）
 CONTENT_FILENAME = "patent_content.json"
@@ -233,6 +238,15 @@ async def try_ai_figure(
     spec = spec_of(content, figure_no)
     if not spec:
         return False
+
+    # 每案上限：整体失败分支会对每张图各调一次，而单次最坏要等满 IMAGE_TIMEOUT。
+    # 八张图串起来就是二十多分钟，全压在一条用户正盯着的实时流水线上。
+    # 本文件其余几处 REPAIR 都设了上限，这里没有理由例外。
+    used = int(content.get("_ai_figure_count") or 0)
+    if used >= MAX_AI_FIGURES:
+        logger.info("AI 补图已达每案上限 %s，图%s 直接降级", MAX_AI_FIGURES, figure_no)
+        return False
+
     prompt = fallback_image_prompt(figure_no, spec)
     try:
         data = await llm.generate_image(prompt, case_id=case_id, step_key=step_key)
@@ -240,36 +254,70 @@ async def try_ai_figure(
         return False        # 没配就是没配，静默走降级
     except Exception as exc:  # noqa: BLE001
         logger.warning("AI 补图失败 case=%s 图%s：%s", case_id, figure_no, exc)
+        content["_ai_figure_count"] = used + 1
         return False
 
+    # 从这里到写回 content 全部包进 try：磁盘满、权限、路径过长都会抛 OSError，
+    # 而 outputs/ 只增不改、会一直长大，磁盘满不是假设性风险。
+    # 出图是增强能力，不该有本事让整条流水线失败。
+    tmp_png = tmp_svg = None
     try:
         width, height = _png_size(data)
+        work = work_dir(case_id)
+        # 先写临时名，两个都成功再改名：中途失败会在磁盘上留下没人认领的 figure_N_ai.png
+        tmp_png = work / f".figure_{figure_no}_ai.png.tmp"
+        tmp_svg = work / f".figure_{figure_no}_ai.svg.tmp"
+        tmp_png.write_bytes(data)
+        tmp_svg.write_text(_svg_wrapper(data, width, height), encoding="utf-8")
+
+        png_path = work / f"figure_{figure_no}_ai.png"
+        svg_path = work / f"figure_{figure_no}_ai.svg"
+        tmp_png.replace(png_path)
+        tmp_svg.replace(svg_path)
+        tmp_png = tmp_svg = None
+
+        title = re.sub(r"^图\s*\d+\s*[：:]\s*", "", spec.strip())[:40] or f"图{figure_no}"
+        assets = [
+            a for a in (content.get("drawing_assets") or [])
+            if not (isinstance(a, dict) and _figure_no_of(a) == figure_no)
+        ]
+        assets.append({
+            "figure_no": figure_no,
+            "svg_path": svg_path.name,
+            "png_path": png_path.name,
+            "title": title,
+            "caption": f"图{figure_no} {title}",
+            "source": "image_model",   # 标明来路：人工复核时要能一眼分出哪些图是模型画的
+        })
+        content["drawing_assets"] = sorted(assets, key=_figure_no_of)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("AI 补图产物不是有效 PNG case=%s 图%s：%s", case_id, figure_no, exc)
+        logger.warning("AI 补图落盘失败 case=%s 图%s：%s", case_id, figure_no, exc)
+        for leftover in (tmp_png, tmp_svg):
+            if leftover is not None:
+                try:
+                    leftover.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        content["_ai_figure_count"] = used + 1
         return False
 
-    work = work_dir(case_id)
-    png_path = work / f"figure_{figure_no}_ai.png"
-    svg_path = work / f"figure_{figure_no}_ai.svg"
-    png_path.write_bytes(data)
-    svg_path.write_text(_svg_wrapper(png_path.name, width, height), encoding="utf-8")
-
-    title = re.sub(r"^图\s*\d+\s*[：:]\s*", "", spec.strip())[:40] or f"图{figure_no}"
-    assets = [
-        a for a in (content.get("drawing_assets") or [])
-        if not (isinstance(a, dict) and int(a.get("figure_no") or 0) == figure_no)
-    ]
-    assets.append({
-        "figure_no": figure_no,
-        "svg_path": svg_path.name,
-        "png_path": png_path.name,
-        "title": title,
-        "caption": f"图{figure_no} {title}",
-        "source": "image_model",   # 标明来路：人工复核时要能一眼分出哪些图是模型画的
-    })
-    content["drawing_assets"] = sorted(assets, key=lambda a: int(a.get("figure_no") or 0))
+    content["_ai_figure_count"] = used + 1
     logger.info("AI 补图成功 case=%s 图%s %sx%s", case_id, figure_no, width, height)
     return True
+
+
+def _figure_no_of(asset: Any) -> int:
+    """从 asset 里取图号；取不到就当 0。
+
+    直接 int(a.get("figure_no") or 0) 会在遇到非数字时抛 ValueError——
+    同一行已经防了 isinstance(a, dict)，却没防这个转换。
+    """
+    if not isinstance(asset, dict):
+        return 0
+    try:
+        return int(asset.get("figure_no") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _png_size(data: bytes) -> tuple[int, int]:
@@ -279,15 +327,22 @@ def _png_size(data: bytes) -> tuple[int, int]:
     return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
 
 
-def _svg_wrapper(png_name: str, width: int, height: int) -> str:
-    """把 PNG 包一层 SVG：满足 DOCX 生成器对 svg_path 的入口校验。"""
+def _svg_wrapper(png_data: bytes, width: int, height: int) -> str:
+    """把 PNG 内嵌进一层 SVG：满足 DOCX 生成器对 svg_path 的入口校验。
+
+    早先用相对路径 xlink:href 引同目录的 PNG，体积小，走 DOCX 那条路也没问题
+    （生成器优先用 png_path）。但只要有人把这个 SVG 单独拿出来看——前端预览、
+    或者只拷走 svg——就是一张裂图。内嵌 base64 换来的是「这个文件自己能站住」，
+    代价是体积约为 PNG 的 1.37 倍，值得。
+    """
+    b64 = base64.b64encode(png_data).decode("ascii")
     return (
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" '
         f'width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n'
-        f'  <image xlink:href="{png_name}" x="0" y="0" '
-        f'width="{width}" height="{height}"/>\n'
-        f'</svg>\n'
+        f'  <image xlink:href="data:image/png;base64,{b64}" '
+        f'x="0" y="0" width="{width}" height="{height}"/>\n'
+        '</svg>\n'
     )
 
 

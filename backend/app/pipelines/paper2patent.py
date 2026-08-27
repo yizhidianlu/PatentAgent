@@ -1370,10 +1370,25 @@ async def regenerate_drawings(
             work = await drawings_service.generate(case_id, work)
         except drawings_service.DrawingGenerationError as exc:
             figure_no = exc.figure_no
-            if figure_no is None:  # 整体失败：逐图先试图像模型，不成再降级
-                for n in _figure_numbers(work):
-                    if await drawings_service.try_ai_figure(case_id, work, n, step_key="drawings"):
+            if figure_no is None:
+                # 整体失败 = 附图脚本根本跑不起来，所有图都画不出。
+                # 这时逐张去问图像模型没有信息量：第一张不成，后面大概率也不成，
+                # 而每次最坏要等满 IMAGE_TIMEOUT，串起来能把流水线堵上二十多分钟。
+                # 所以只拿第一张探路——通了再继续补，不通就整体降级。
+                numbers = _figure_numbers(work)
+                channel_ok = True
+                for n in numbers:
+                    if channel_ok and await drawings_service.try_ai_figure(
+                        case_id, work, n, step_key="drawings"
+                    ):
                         continue
+                    if channel_ok and n == numbers[0]:
+                        channel_ok = False
+                        if ctx is not None:
+                            await ctx.emit(
+                                "log",
+                                {"message": "图像模型未能补出首图，其余附图直接降级为提示词。"},
+                            )
                     gaps.append(drawings_service.degrade_figure(work, n, "附图脚本执行失败"))
                     degraded.append(n)
                 break
