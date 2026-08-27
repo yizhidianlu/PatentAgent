@@ -206,3 +206,51 @@ def test_normalize_leaves_unrelatable_paths_alone(client: TestClient) -> None:
     assert stats["left_alone"] >= 1
     row = db.query_one("SELECT stored_path FROM files WHERE id=?", (file_id,))
     assert row["stored_path"] == weird
+
+
+def test_data_dir_wins_over_a_still_existing_foreign_absolute_path(tmp_path) -> None:
+    """同机恢复到另一个目录时，源目录还在——不能去读源目录。
+
+    这条是恢复演练真踩出来的：把备份恢复到**同一台机器的另一个目录**做验证，
+    库里那条旧的绝对路径仍然指向一个真实存在的文件。若按「绝对路径存在就用它」，
+    恢复出来的实例会安静地去读源目录——**验证全绿，实际上根本没在用恢复的数据**。
+    等源目录一删、或者源目录本身是份过期副本，问题才会以最难查的形式冒出来。
+
+    所以不变式是：当前数据目录里的东西优先。
+    """
+    cfg = get_config()
+    case_dir = cfg.uploads_dir / "SAMEHOST"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    mine = case_dir / "figure.png"
+    mine.write_bytes(PNG)
+
+    # 「源目录」：同机的另一个位置，同样的相对结构，内容不同
+    old_root = tmp_path / "old_data"
+    old = old_root / "uploads" / "SAMEHOST" / "figure.png"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"STALE-COPY")
+    assert old.exists(), "本用例的前提就是这条旧绝对路径仍然有效"
+
+    got = paths_service.resolve(str(old))
+    assert got == mine, f"应当用当前数据目录内的那份，实际取了 {got}"
+    assert got.read_bytes() == PNG, "读到的是源目录里的过期副本"
+
+
+def test_media_serves_the_restored_copy_not_the_source(
+    client: TestClient, tmp_path
+) -> None:
+    """同一条规则要贯穿到正文取图：网页端不能显示源目录里的旧图。"""
+    r = client.post(f"{API}/cases", json={"module": "disclosure", "title": "同机恢复"})
+    case_id = r.json()["id"]
+    cfg = get_config()
+    updir = cfg.uploads_dir / case_id
+    updir.mkdir(parents=True, exist_ok=True)
+    (updir / "图.png").write_bytes(PNG)
+
+    old = tmp_path / "old_data" / "uploads" / case_id / "图.png"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"STALE-COPY")
+
+    got = client.get(f"{API}/cases/{case_id}/media", params={"path": str(old)})
+    assert got.status_code == 200, got.text
+    assert got.content == PNG, "取到的是源目录里的过期副本"

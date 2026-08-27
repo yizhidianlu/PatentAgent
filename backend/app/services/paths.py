@@ -80,8 +80,19 @@ def _relocate(raw: str) -> Path | None:
 def resolve(value: str | Path | None) -> Path | None:
     """入库形态 → 可用的磁盘路径；无从落实时返回 None。
 
-    次序：相对路径拼当前数据目录 → 绝对路径本身仍存在 → 按锚点重定位。
-    三条都不成立才返回 None（调用方据此报「文件已不在磁盘」）。
+    **次序的核心是一条不变式：当前数据目录里的东西优先。**
+
+    次序：
+    1. 相对路径 → 拼当前数据目录；
+    2. 绝对路径且**就在当前数据目录内** → 直接用；
+    3. 否则先尝试按锚点重定位到当前数据目录，命中就用重定位的结果；
+    4. 都不成立，才退回那条绝对路径本身。
+
+    第 2、3 步的先后不能颠倒，这一条是演练里真踩出来的：
+    把备份**恢复到同一台机器的另一个目录**做验证时，库里那条旧的绝对路径
+    仍然指向一个**真实存在**的文件（源目录还在）。若按「绝对路径存在就用它」，
+    恢复出来的实例会安静地去读源目录——验证全绿，实际上根本没在用恢复的数据；
+    等源目录一删，或者源目录是份过期副本，问题才会以最难查的形式冒出来。
     """
     if value is None:
         return None
@@ -98,12 +109,23 @@ def resolve(value: str | Path | None) -> Path | None:
         relocated = _relocate(raw)
         return relocated if relocated is not None and relocated.exists() else candidate
 
-    if p.exists():
+    root = data_dir()
+    try:
+        inside = p.resolve().is_relative_to(root.resolve())
+    except OSError:
+        inside = False
+    if inside and p.exists():
         return p
 
     relocated = _relocate(raw)
     if relocated is not None and relocated.exists():
-        logger.info("按数据目录重定位了一条旧的绝对路径：%s → %s", raw, relocated)
+        if p.exists():
+            logger.info(
+                "绝对路径 %s 指向数据目录之外的一份真实文件，已改用数据目录内的 %s",
+                raw, relocated,
+            )
+        else:
+            logger.info("按数据目录重定位了一条旧的绝对路径：%s → %s", raw, relocated)
         return relocated
     return p
 

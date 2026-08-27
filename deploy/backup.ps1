@@ -6,7 +6,7 @@
     把 DATA_DIR 下的全部业务数据备份到指定位置：
 
       * app.db  —— 走 sqlite 的 backup API 做热备，服务不必停
-      * uploads/、outputs/ —— 增量复制
+      * uploads/、outputs/ —— 镜像复制；源里已删除的文件先移入 _deleted\<时间戳>        保留一段时间，而不是跟着镜像一起消失
 
     数据目录不写死：直接问应用要（与 deploy\update.ps1 同一套判据），
     所以 .env 里把 DATA_DIR 指到数据盘之后，这个脚本自动跟着走。
@@ -25,6 +25,12 @@
 .PARAMETER Keep
     目标目录下保留多少份数据库备份，默认 30。
 
+.PARAMETER KeepDeletedDays
+    回收阁（_deleted\）里已删除文件的保留天数，默认 90。
+
+    媒体侧用 /MIR 镜像，源里删掉的文件下一次备份会被一并删掉——那等于备份对删除
+    毫无保护。现在这类文件先移入 _deleted\<时间戳>\，过了这个窗口才真正丢弃。
+
 .EXAMPLE
     .\deploy\backup.ps1 -Destination D:\backup\PatentAgent
 
@@ -36,7 +42,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $Destination,
     [switch] $SkipMedia,
-    [int]    $Keep = 30
+    [int]    $Keep = 30,
+    [ValidateRange(1, 3650)]
+    [int]    $KeepDeletedDays = 90
 )
 
 $ErrorActionPreference = 'Stop'
@@ -134,7 +142,53 @@ dst.close(); src.close()
 }
 
 # --- 2. 上传件与交付物 ------------------------------------------------------
+#
+# /MIR 是镜像：源里删掉的文件，下一次备份就会把备份里的那一份也删掉。
+# 于是「备份」对删除毫无保护——误删一个案件、或删掉一个账号连带清盘之后，
+# 只要跑过一次备份，唯一的副本就没了。数据库那侧有多份历史快照，
+# 媒体这侧却是零历史，这个不对称是灾备链上最容易被忽略的一环。
+#
+# 所以镜像之前先把「即将被删掉的文件」挪进回收阁 _deleted\<时间戳>\。
+# 只处理删除，不处理覆盖：本平台的交付物是版本化只增不改的，
+# 上传件也按唯一文件名落盘，同名覆盖在正常流程里不会发生。
+
+function Move-ToAttic {
+    <#
+    .SYNOPSIS
+        把 $dst 里存在、而 $src 里已经没有的文件挪进回收阁；返回挪走的份数。
+    #>
+    param([string] $Src, [string] $Dst, [string] $AtticRoot, [string] $Name)
+
+    if (-not (Test-Path $Dst)) { return 0 }
+
+    $srcFiles = @{}
+    foreach ($f in Get-ChildItem $Src -Recurse -File -ErrorAction SilentlyContinue) {
+        $srcFiles[$f.FullName.Substring($Src.Length).TrimStart('')] = $true
+    }
+
+    $moved = 0
+    foreach ($f in Get-ChildItem $Dst -Recurse -File -ErrorAction SilentlyContinue) {
+        $rel = $f.FullName.Substring($Dst.Length).TrimStart('')
+        if ($srcFiles.ContainsKey($rel)) { continue }
+        $target = Join-Path (Join-Path $AtticRoot $Name) $rel
+        $dir = Split-Path -Parent $target
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force $dir | Out-Null }
+        try {
+            Move-Item -LiteralPath $f.FullName -Destination $target -Force -ErrorAction Stop
+            $moved++
+        } catch {
+            # 挪不动就别删：宁可让 /MIR 这次不清理它，也不能把它弄丢
+            Write-Line 'WARN' "无法移入回收阁，保留原样：$rel（$($_.Exception.Message)）"
+        }
+    }
+    return $moved
+}
+
 if (-not $SkipMedia) {
+    $stampAttic = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $atticRoot  = Join-Path (Join-Path $Destination '_deleted') $stampAttic
+    $atticTotal = 0
+
     foreach ($name in @('uploads', 'outputs')) {
         $src = Join-Path $DataDir $name
         if (-not (Test-Path $src)) {
@@ -142,8 +196,13 @@ if (-not $SkipMedia) {
             continue
         }
         $dst = Join-Path $Destination $name
-        # /MIR 会让目标镜像源目录（含删除）。只在源确实存在时才走到这里，
-        # 所以不会出现「源不存在导致目标被清空」的情况。
+
+        $moved = Move-ToAttic -Src $src -Dst $dst -AtticRoot $atticRoot -Name $name
+        if ($moved -gt 0) {
+            $atticTotal += $moved
+            Write-Line 'WARN' "$name\ 有 $moved 个文件在源目录已不存在，已移入回收阁而非直接丢弃"
+        }
+
         # /R /W 必须显式给：默认是「重试 100 万次、每次等 30 秒」，
         # uploads 里只要有一个文件被杀软实时扫描或 Word COM 占住，
         # 备份就会挂死约 347 天，日志停在上一行、看着像还在跑。
@@ -154,6 +213,26 @@ if (-not $SkipMedia) {
             exit 1
         }
         Write-Line 'OK' "$name\ 已同步到 $dst"
+    }
+
+    if ($atticTotal -gt 0) {
+        Write-Line 'WARN' "共 $atticTotal 个已删除文件存入 $atticRoot"
+        Write-Line 'WARN' "  保留 $KeepDeletedDays 天。若是误删，请在此期限内取回。"
+    } else {
+        # 空目录别留着，否则回收阁里全是空壳，真有东西时反而看不出来
+        Remove-Item $atticRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # 回收阁按天清理：过了窗口才真正丢弃
+    $atticBase = Join-Path $Destination '_deleted'
+    if (Test-Path $atticBase) {
+        $cutoff = (Get-Date).AddDays(-$KeepDeletedDays)
+        Get-ChildItem $atticBase -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            ForEach-Object {
+                Write-Line 'INFO' "回收阁过期，清理：$($_.Name)"
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
     }
 }
 

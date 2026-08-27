@@ -47,6 +47,15 @@
     回滚时连 deploy\ 也一并回退（默认会把它留在新版，好让下次更新用上修好的脚本）。
     只在需要精确复现某个旧版本行为时使用。
 
+.PARAMETER KeepBackupDays
+    更新前数据库备份（pre-*.db）的保留天数，默认 30。
+    按天而不是按份数：一天推五次的节奏下，按份数保留会在两天内把上周那个
+    唯一正确的回退点挤掉，而那种更新恰恰最需要回退点。
+
+.PARAMETER KeepBackupMin
+    无论多旧都至少保留几份 pre-*.db，默认 10。磁盘再紧也不能连一步都退不回去。
+    含数据库迁移的更新会另外固定一份 keep-*.db，永不自动清理。
+
 .EXAMPLE
     .\deploy\update.ps1
     检查并更新到最新，失败自动回滚。
@@ -76,7 +85,11 @@ param(
     [switch] $CheckOnly,
     [switch] $SkipBackup,
     [switch] $NoRollback,
-    [switch] $NoSelfHeal
+    [switch] $NoSelfHeal,
+    [ValidateRange(1, 3650)]
+    [int]    $KeepBackupDays = 30,
+    [ValidateRange(1, 1000)]
+    [int]    $KeepBackupMin  = 10
 )
 
 $ErrorActionPreference = 'Stop'
@@ -469,6 +482,8 @@ function Resolve-DataDir {
 
 function Backup-Database {
     <# WAL 模式下必须走 sqlite backup API，冷拷 app.db 会得到不一致快照 #>
+    param([string] $FromCommit = '', [string] $ToCommit = '')
+
     $db = Join-Path $DataDir 'app.db'
     if (-not (Test-Path $db)) {
         # 全新部署确实还没有库；但更常见的是 DATA_DIR 配错、指到了空目录。
@@ -478,7 +493,10 @@ function Backup-Database {
     }
     if (-not (Test-Path $BackupDir)) { New-Item -ItemType Directory -Force $BackupDir | Out-Null }
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $target = Join-Path $BackupDir "app-$stamp.db"
+    # 名字里带「退回哪个 commit」。旧命名是纯时间戳，真要回滚时只能靠日志去对
+    # 时间——而日志恰恰是出事时最不容易拿到的东西。
+    $rev    = if ($FromCommit) { $FromCommit.Substring(0, 7) } else { 'unknown' }
+    $target = Join-Path $BackupDir "pre-$rev-$stamp.db"
 
     $code = @"
 import sqlite3, sys
@@ -499,11 +517,33 @@ dst.close(); src.close()
     $sizeMb = [math]::Round((Get-Item $target).Length / 1MB, 1)
     Write-Log 'OK' "数据库已备份：$([IO.Path]::GetFileName($target))（$sizeMb MB）"
 
-    # 只留最近 10 份，避免长期占盘
-    Get-ChildItem $BackupDir -Filter 'app-*.db' |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -Skip 10 |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+    # 改数据库结构的更新，回退点必须长期留着。
+    # 迁移是**代码回滚救不回来**的那一类改动：退回旧代码，库已经是新结构了。
+    if ($FromCommit -and $ToCommit) {
+        $touched = @(& git -C $Root diff --name-only "$FromCommit..$ToCommit" 2>$null)
+        if ($touched | Where-Object { $_ -like '*app/db/migrations/*' }) {
+            $pinned = Join-Path $BackupDir "keep-$rev-$stamp.db"
+            Copy-Item $target $pinned -Force -ErrorAction SilentlyContinue
+            Write-Log 'WARN' "本次更新含数据库迁移，已固定回退点：$([IO.Path]::GetFileName($pinned))"
+            Write-Log 'WARN' '  keep-*.db 永不自动清理；回退到该 commit 之前时必须连库一起回。'
+        }
+    }
+
+    # 保留策略：按**天**而不是按份数。
+    # 按份数（原来是 10 份）在快节奏更新下会失效——一天推五次，两天就把上周
+    # 那个唯一正确的回退点挤掉了，而恰恰是那种更新最需要回退点。
+    $cutoff = (Get-Date).AddDays(-$KeepBackupDays)
+    # 同时清理旧命名 app-*.db：改名之后它们不再被任何规则扫到，会永远堆着。
+    # keep-*.db 与人工固定的其它命名（如 PINNED-*.db）都不在此列，不会被碰。
+    $all = @(Get-ChildItem $BackupDir -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -like 'pre-*.db' -or $_.Name -like 'app-*.db' } |
+             Sort-Object LastWriteTime -Descending)
+    if ($all.Count -gt $KeepBackupMin) {
+        # 无论多旧，最近 $KeepBackupMin 份一律保留：磁盘再紧也不能连一步都退不回去
+        $all | Select-Object -Skip $KeepBackupMin |
+            Where-Object { $_.LastWriteTime -lt $cutoff } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
     return $target
 }
 
@@ -636,7 +676,7 @@ $backup = $null
 $rolledBack = $false
 
 try {
-    if (-not $SkipBackup) { $backup = Backup-Database }
+    if (-not $SkipBackup) { $backup = Backup-Database -FromCommit $oldCommit -ToCommit $newCommit }
 
     Stop-App
     # --ff-only：部署端永远是远端的镜像，出现分叉说明有人在这台机器上提交过，
