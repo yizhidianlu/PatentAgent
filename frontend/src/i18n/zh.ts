@@ -726,7 +726,13 @@ export const zh = {
     steps: {
       upload: '上传论文',
       mode: '模式选择',
-      parts: '生成五大部分',
+      /** 后端是四个独立步骤，实测各自耗时 8/26/8/0 分钟。
+          早先把它们聚合成一个「生成五大部分」圆圈，结果 46 分钟的运行里
+          有 42 分钟界面纹丝不动——用户没法判断是在跑还是卡死了。 */
+      extraction: '深读论文',
+      draft: '起草五部分',
+      rulesCheck: '规则校验',
+      contentReview: '内容确认',
       figures: '附图',
       delivery: '交付',
     },

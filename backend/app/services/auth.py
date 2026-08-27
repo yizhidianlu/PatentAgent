@@ -208,10 +208,15 @@ def create_user(
 
 
 def registration_open() -> bool:
-    """是否允许自行注册（管理员可在后台关掉）。"""
+    """是否允许自行注册。**默认关闭，必须由管理员显式打开。**
+
+    这里的默认值方向是安全边界，不是产品口味：注册是本平台唯一不需要身份
+    就能写库的入口。默认开着意味着任何一次部署、任何一个裸库，
+    在管理员还没意识到之前就已经对整个互联网开放了注册——
+    而迁移只重建表、不写 settings，所以「裸库」不是罕见情况，是常态。
+    """
     policy = db.get_setting_json("auth") or {}
-    value = policy.get("allow_registration")
-    return True if value is None else bool(value)
+    return bool(policy.get("allow_registration", False))
 
 
 def set_registration_open(allowed: bool) -> None:
@@ -279,12 +284,37 @@ def locked_remaining_seconds(row: dict[str, Any]) -> int:
     return int(delta) if delta > 0 else 0
 
 
+def unlock_user(user_id: str) -> None:
+    """解除锁定并清零失败计数。
+
+    管理员必须有一条不依赖「受害者能登录」的解锁路径：failed_logins 原本只在
+    登录成功或改密时清零，而这两件事都要求先能登录进来——账号一旦被锁，
+    就只剩下去服务器上改 SQLite 这一条路。
+    """
+    db.execute(
+        "UPDATE users SET failed_logins=0, locked_until=NULL, updated_at=? WHERE id=?",
+        (_fmt(_now()), user_id),
+    )
+
+
 def record_login_failure(user_id: str) -> int:
     """记一次失败并按阈值锁定；返回锁定秒数（0=未锁）。"""
     row = get_user_row(user_id)
     if not row:
         return 0
-    failed = int(row.get("failed_logins") or 0) + 1
+
+    # 上一轮锁定已到期 → 重新计数。
+    #
+    # 原先 failed_logins 是**累计值**且到期后从不复位，于是：累到 10 次锁 60 分钟，
+    # 到期后再发一个错误密码就变成 11、仍然 ≥10、于是再锁 60 分钟——
+    # 每小时一个请求即可把任意账号**永久**锁死，而攻击者只需要知道用户名。
+    # 生产库里两个账号都是管理员，两个都锁上就等于把所有人永久关在门外。
+    prev_locked = _parse(row.get("locked_until"))
+    if prev_locked and prev_locked <= _now():
+        failed = 1
+    else:
+        failed = int(row.get("failed_logins") or 0) + 1
+
     minutes = _lock_minutes(failed)
     locked_until = _fmt(_now() + timedelta(minutes=minutes)) if minutes else None
     db.execute(

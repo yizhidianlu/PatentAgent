@@ -234,6 +234,16 @@ async def try_ai_figure(
     任何失败都只返回 False，由调用方降级为「只给提示词」——出图是增强，不是主路径。
     """
     from . import llm  # 延迟导入：drawings 被 CLI 工具单独引用时不该拖上 LLM 依赖
+    from . import skills as skills_service
+
+    # 技能开关要真的管用：这条会按图像模型计费，用户关掉它就是不想花这个钱。
+    # 只改数据库而照样调用，等于在用户明确关闭之后继续扣他的额度。
+    #
+    # 用 is_user_enabled 而非 is_enabled：这里只需要知道「用户想不想用」。
+    # 前置条件（有没有配图像模型）由下面的 generate_image 处理——
+    # 它抛 ImageGenUnavailableError，同样落到静默降级，无须在这里重复判断。
+    if not skills_service.is_user_enabled("ai_figure"):
+        return False
 
     spec = spec_of(content, figure_no)
     if not spec:

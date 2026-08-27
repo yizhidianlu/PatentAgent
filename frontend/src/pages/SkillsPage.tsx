@@ -4,15 +4,12 @@ import {
   ArrowPathIcon,
   ArrowTopRightOnSquareIcon,
   ChevronDownIcon,
-  CheckCircleIcon,
   Cog6ToothIcon,
-  ExclamationTriangleIcon,
   LockClosedIcon,
 } from '@heroicons/react/24/outline'
 import { useSkills, useToggleSkill, type Skill } from '../api/skills'
 import { useAuthStore } from '../stores/authStore'
 import { useUiStore } from '../stores/uiStore'
-import { Badge } from '../components/ui/Badge'
 import { Card } from '../components/ui/Card'
 import { ToggleSwitch } from '../components/ui/ToggleSwitch'
 import { Skeleton } from '../components/ui/Skeleton'
@@ -21,14 +18,30 @@ import { zh } from '../i18n/zh'
 
 const t = zh.skills
 
-function StatusBadge({ status }: { status: Skill['status'] }) {
-  const variant =
-    status === 'available' ? 'emerald' : status === 'needs_config' ? 'amber' : 'neutral'
-  return <Badge variant={variant}>{t.statuses[status] ?? status}</Badge>
+/** 状态点：用一个小圆点而不是徽章——它是辅助信息，不该和技能名争视线。 */
+function StatusDot({ status }: { status: Skill['status'] }) {
+  const cls =
+    status === 'available'
+      ? 'bg-emerald-500'
+      : status === 'needs_config'
+        ? 'bg-amber-400'
+        : 'bg-gray-300 dark:bg-gray-600'
+  return (
+    <span
+      className={cn('inline-block w-1.5 h-1.5 rounded-full shrink-0', cls)}
+      title={t.statuses[status] ?? status}
+      aria-label={t.statuses[status] ?? status}
+    />
+  )
 }
 
-/** 一项技能的卡片：摘要 + 适用范围 + 开关，点击展开详情。 */
-function SkillCard({
+/**
+ * 一项技能。
+ *
+ * 卡片正面只留「名称 + 一句话 + 开关」三样。适用范围、输入输出、开销、来源
+ * 全部收进折叠区——它们是决定要不要开时才看的，平铺出来会让整页密不透风。
+ */
+function SkillRow({
   skill,
   canToggle,
   onToggle,
@@ -41,136 +54,99 @@ function SkillCard({
 }) {
   const [open, setOpen] = useState(false)
   const unmet = skill.requirements.filter((r) => !r.satisfied)
-  // 前置条件没满足时开关是灰的：让用户点开一个必然不生效的技能，
-  // 只会让他以为开了就有用，然后困惑于为什么没反应
   const switchDisabled = !canToggle || !skill.toggleable || busy || unmet.length > 0
 
   return (
-    <Card className="p-0 overflow-hidden">
-      <div className="flex items-start gap-3 px-4 py-3.5">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">{skill.name}</h3>
-            <StatusBadge status={skill.status} />
-            {!skill.toggleable && (
-              <span
-                className="inline-flex items-center gap-1 text-[11px] text-gray-400 dark:text-gray-500"
-                title={t.alwaysOnHint}
-              >
-                <LockClosedIcon className="w-3 h-3" strokeWidth={1.5} />
-                {t.alwaysOn}
+    <div className="border-b border-gray-100 dark:border-gray-700/50 last:border-0">
+      <div className="flex items-center gap-3 py-3">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="min-w-0 flex-1 flex items-center gap-2 text-left group"
+        >
+          <StatusDot status={skill.status} />
+          <span className="min-w-0">
+            <span className="flex items-center gap-1.5">
+              <span className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
+                {skill.name}
               </span>
+              {!skill.toggleable && (
+                <LockClosedIcon
+                  className="w-3 h-3 shrink-0 text-gray-300 dark:text-gray-600"
+                  strokeWidth={1.5}
+                  title={t.alwaysOnHint}
+                />
+              )}
+            </span>
+            <span className="block mt-0.5 text-xs text-gray-500 dark:text-gray-400 truncate">
+              {skill.summary}
+            </span>
+          </span>
+          <ChevronDownIcon
+            className={cn(
+              'w-3.5 h-3.5 shrink-0 text-gray-300 dark:text-gray-600 transition-transform',
+              'group-hover:text-gray-400',
+              open && 'rotate-180',
             )}
-          </div>
-          <p className="mt-1 text-xs leading-relaxed text-gray-600 dark:text-gray-300">
-            {skill.summary}
-          </p>
-
-          <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-gray-400 dark:text-gray-500">
-            <span>{t.appliesTo}</span>
-            {skill.modules.map((m) => (
-              <span
-                key={m}
-                className="rounded bg-gray-100 dark:bg-gray-700/60 px-1.5 py-0.5 text-gray-500 dark:text-gray-300"
-              >
-                {t.modules[m] ?? m}
-              </span>
-            ))}
-            {skill.patent_types.length > 0 && skill.patent_types.length < 3 && (
-              <span className="text-gray-400">
-                · {skill.patent_types.map((p) => t.patentTypes[p] ?? p).join(' / ')}
-              </span>
-            )}
-          </div>
-
-          {skill.cost_hint && (
-            <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-400">
-              {t.costHint}：{skill.cost_hint}
-            </p>
-          )}
-        </div>
-
-        <div className="shrink-0 flex flex-col items-end gap-2">
-          <ToggleSwitch
-            checked={skill.enabled}
-            onChange={onToggle}
-            disabled={switchDisabled}
-            label={skill.name}
+            strokeWidth={2}
           />
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            className="inline-flex items-center gap-0.5 text-[11px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-          >
-            <ChevronDownIcon
-              className={cn('w-3.5 h-3.5 transition-transform', open && 'rotate-180')}
-              strokeWidth={2}
-            />
-          </button>
-        </div>
+        </button>
+
+        <ToggleSwitch
+          checked={skill.enabled}
+          onChange={onToggle}
+          disabled={switchDisabled}
+          label={skill.name}
+        />
       </div>
 
-      {/* 未满足的前置条件始终显示——它是「为什么用不了」的答案，不该藏在折叠里 */}
-      {unmet.length > 0 && (
-        <div className="border-t border-gray-100 dark:border-gray-700/60 bg-amber-50/50 dark:bg-amber-500/5 px-4 py-2.5 space-y-1.5">
-          {unmet.map((r) => (
-            <div key={r.key} className="flex items-start gap-2 text-[11px]">
-              <ExclamationTriangleIcon
-                className="w-3.5 h-3.5 shrink-0 mt-px text-amber-500"
-                strokeWidth={1.5}
-              />
-              <div className="min-w-0 flex-1">
-                <span className="text-gray-700 dark:text-gray-200">{r.label}</span>
-                {r.hint && (
-                  <span className="ml-1 text-gray-500 dark:text-gray-400">{r.hint}</span>
-                )}
-              </div>
-              {r.settings_path && (
-                <Link
-                  to={r.settings_path}
-                  className="shrink-0 inline-flex items-center gap-0.5 text-[#492497] dark:text-[#61d0e2] hover:underline"
-                >
-                  <Cog6ToothIcon className="w-3 h-3" strokeWidth={1.5} />
-                  {t.goConfigure}
-                </Link>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
       {open && (
-        <div className="border-t border-gray-100 dark:border-gray-700/60 px-4 py-3 space-y-2.5 text-xs">
+        <div className="pb-3.5 pl-[18px] space-y-2.5 text-xs">
           {skill.description && (
             <p className="whitespace-pre-line leading-relaxed text-gray-600 dark:text-gray-300">
               {skill.description}
             </p>
           )}
-          <dl className="grid gap-1.5 sm:grid-cols-2">
+
+          <dl className="grid gap-x-6 gap-y-1.5 sm:grid-cols-2 text-gray-600 dark:text-gray-300">
+            <div>
+              <dt className="text-gray-400 dark:text-gray-500">{t.appliesTo}</dt>
+              <dd>
+                {skill.modules.map((m) => t.modules[m] ?? m).join('、')}
+                {skill.patent_types.length > 0 && skill.patent_types.length < 3 && (
+                  <span className="text-gray-400">
+                    （{skill.patent_types.map((p) => t.patentTypes[p] ?? p).join(' / ')}）
+                  </span>
+                )}
+              </dd>
+            </div>
+            {skill.cost_hint && (
+              <div>
+                <dt className="text-gray-400 dark:text-gray-500">{t.costHint}</dt>
+                <dd>{skill.cost_hint}</dd>
+              </div>
+            )}
             {skill.inputs && (
               <div>
-                <dt className="text-[11px] text-gray-400">{t.inputs}</dt>
-                <dd className="text-gray-700 dark:text-gray-200">{skill.inputs}</dd>
+                <dt className="text-gray-400 dark:text-gray-500">{t.inputs}</dt>
+                <dd>{skill.inputs}</dd>
               </div>
             )}
             {skill.outputs && (
               <div>
-                <dt className="text-[11px] text-gray-400">{t.outputs}</dt>
-                <dd className="text-gray-700 dark:text-gray-200">{skill.outputs}</dd>
+                <dt className="text-gray-400 dark:text-gray-500">{t.outputs}</dt>
+                <dd>{skill.outputs}</dd>
               </div>
             )}
           </dl>
-          {/* 外部来源必须如实标注：既是许可证义务，也让用户知道这段能力来自哪里 */}
+
+          {/* 外部来源如实标注：既是许可证义务，也让用户知道这段能力从哪来 */}
           {skill.provider !== 'builtin' && (
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-[11px] text-gray-400 dark:text-gray-500">
+            <p className="flex flex-wrap items-center gap-x-3 text-[11px] text-gray-400 dark:text-gray-500">
               <span>
                 {t.source}：{skill.provider}
+                {skill.license && ` · ${skill.license}`}
               </span>
-              {skill.license && (
-                <span>
-                  {t.license}：{skill.license}
-                </span>
-              )}
               {skill.source_url && (
                 <a
                   href={skill.source_url}
@@ -182,15 +158,36 @@ function SkillCard({
                   <ArrowTopRightOnSquareIcon className="w-3 h-3" strokeWidth={1.5} />
                 </a>
               )}
-            </div>
+            </p>
           )}
         </div>
       )}
-    </Card>
+
+      {/* 缺前置条件时始终显示——这是「为什么开关是灰的」的答案，藏进折叠里等于没说 */}
+      {unmet.length > 0 && (
+        <div className="pb-3 pl-[18px] space-y-1">
+          {unmet.map((r) => (
+            <p key={r.key} className="text-[11px] text-gray-500 dark:text-gray-400">
+              <span className="text-amber-600 dark:text-amber-400">{r.label}</span>
+              {r.hint && <span className="ml-1">{r.hint}</span>}
+              {r.settings_path && (
+                <Link
+                  to={r.settings_path}
+                  className="ml-1 inline-flex items-center gap-0.5 text-[#492497] dark:text-[#61d0e2] hover:underline"
+                >
+                  <Cog6ToothIcon className="w-3 h-3" strokeWidth={1.5} />
+                  {t.goConfigure}
+                </Link>
+              )}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
-/** §技能库：平台支持的各项能力，按分类分组展示，可开关。 */
+/** §技能库：平台支持的各项能力，按分类分组，可开关。 */
 export function SkillsPage() {
   const query = useSkills()
   const toggle = useToggleSkill()
@@ -207,7 +204,8 @@ export function SkillsPage() {
     toggle.mutate(
       { key: skill.key, enabled: next },
       {
-        onSuccess: () => pushToast('success', next ? t.enabledOk(skill.name) : t.disabledOk(skill.name)),
+        onSuccess: () =>
+          pushToast('success', next ? t.enabledOk(skill.name) : t.disabledOk(skill.name)),
         onError: () => pushToast('error', t.toggleFailed),
         onSettled: () => setBusyKey(null),
       },
@@ -215,7 +213,9 @@ export function SkillsPage() {
   }
 
   return (
-    <div className="space-y-5">
+    // max-w-4xl mx-auto：与案例库一致。此前没有宽度约束，宽屏上卡片会拉满整行，
+    // 一句话摘要孤零零躺在两千像素里，看着又空又乱。
+    <div className="max-w-4xl mx-auto p-4 sm:p-8 space-y-6">
       <header className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">{t.title}</h2>
@@ -237,8 +237,8 @@ export function SkillsPage() {
 
       {query.isLoading && (
         <div className="space-y-3">
-          {[0, 1, 2].map((i) => (
-            <Skeleton key={i} className="h-24 rounded-2xl" />
+          {[0, 1].map((i) => (
+            <Skeleton key={i} className="h-40 rounded-2xl" />
           ))}
         </div>
       )}
@@ -256,31 +256,30 @@ export function SkillsPage() {
         </Card>
       )}
 
+      {/* 一个分类一张卡，技能在卡内以行排列——而不是每项技能各占一张卡。
+          后者在只有六七项能力时会把页面撑得很散。 */}
       {query.data?.categories.map((cat) => {
         const items = query.data.skills.filter((s) => s.category === cat.key)
         if (items.length === 0) return null
+        const onCount = items.filter((s) => s.enabled && s.status === 'available').length
         return (
-          <section key={cat.key} className="space-y-2.5">
-            <h3 className="flex items-center gap-2 text-xs font-medium text-gray-500 dark:text-gray-400">
-              {cat.label}
-              <span className="text-gray-300 dark:text-gray-600">·</span>
-              <span className="inline-flex items-center gap-1 text-gray-400">
-                <CheckCircleIcon className="w-3.5 h-3.5 text-emerald-500" strokeWidth={1.5} />
-                {items.filter((s) => s.enabled && s.status === 'available').length}/{items.length}
+          <Card key={cat.key} className="px-4 py-1">
+            <div className="flex items-center justify-between gap-2 pt-2.5 pb-1">
+              <h3 className="text-xs font-medium text-gray-500 dark:text-gray-400">{cat.label}</h3>
+              <span className="text-[11px] tabular-nums text-gray-400 dark:text-gray-500">
+                {onCount}/{items.length}
               </span>
-            </h3>
-            <div className="space-y-2.5">
-              {items.map((s) => (
-                <SkillCard
-                  key={s.key}
-                  skill={s}
-                  canToggle={isAdmin}
-                  busy={busyKey === s.key}
-                  onToggle={(next) => handleToggle(s, next)}
-                />
-              ))}
             </div>
-          </section>
+            {items.map((s) => (
+              <SkillRow
+                key={s.key}
+                skill={s}
+                canToggle={isAdmin}
+                busy={busyKey === s.key}
+                onToggle={(next) => handleToggle(s, next)}
+              />
+            ))}
+          </Card>
         )
       })}
 

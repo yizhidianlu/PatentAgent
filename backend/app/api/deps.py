@@ -24,10 +24,26 @@ logger = logging.getLogger(__name__)
 
 
 def client_ip(request: Request) -> str | None:
-    """取客户端 IP（信任反向代理的 X-Forwarded-For 首段）。"""
+    """取客户端 IP。
+
+    **不能取 X-Forwarded-For 的首段。** Cloudflare 在客户端已带 XFF 时是
+    **追加**真实 IP、不是覆盖，所以首段正是攻击者自己填进去的值——
+    审计日志里的 IP 会全部可伪造，按 IP 做的限流也会被一并绕过。
+
+    优先级：
+      1. `CF-Connecting-IP` —— 经 Cloudflare 时由边缘覆盖写入，客户端伪造不了；
+      2. XFF 的**最后**一段 —— 最靠近本机的那一跳追加的，即最可信的一段；
+      3. 直连的 socket 地址。
+    """
+    cf = request.headers.get("cf-connecting-ip")
+    if cf and cf.strip():
+        return cf.strip()
+
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return request.client.host if request.client else None
 
 

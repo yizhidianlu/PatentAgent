@@ -1193,7 +1193,8 @@ def test_openapi_exposes_every_operation_with_a_summary(client: TestClient) -> N
     # 77 = 73 + 自助注册引入的 4 个：
     #   GET/POST /auth/registration-open|register、GET/PUT /admin/registration
     # 79 = 77 + 技能库的 2 个：GET /skills、PUT /skills/{key}
-    assert len(operations) == 79, f"端点数变了：{len(operations)}"
+    # 80 = 79 + 解锁账号（POST /admin/users/{id}/unlock）
+    assert len(operations) == 80, f"端点数变了：{len(operations)}"
     assert not [f"{m.upper()} {p}" for p, m, op in operations if not op.get("summary")]
 
 

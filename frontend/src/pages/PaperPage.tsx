@@ -19,11 +19,13 @@ import type { DisplayStepPreset } from '../components/pipeline/StepProgress'
 const PAPER_STEPS: DisplayStepPreset[] = [
   { key: 'upload', label: zh.paper.steps.upload, matchKeys: ['upload_paper'] },
   { key: 'mode', label: zh.paper.steps.mode, matchKeys: ['input_check'] },
-  {
-    key: 'parts',
-    label: zh.paper.steps.parts,
-    matchKeys: ['extraction', 'draft', 'rules_check', 'content_review'],
-  },
+  // 这四步不能聚合成一个圆圈：实测一条真实运行里 extraction 8m11s、draft 25m54s、
+  // rules_check 7m51s，合计 42 分钟——全塌进同一个圆圈的话，46 分钟的任务里
+  // 有 42 分钟界面上什么都不动，用户无从判断是在跑还是卡死了。
+  { key: 'extraction', label: zh.paper.steps.extraction, matchKeys: ['extraction'] },
+  { key: 'draft', label: zh.paper.steps.draft, matchKeys: ['draft'] },
+  { key: 'rules_check', label: zh.paper.steps.rulesCheck, matchKeys: ['rules_check'] },
+  { key: 'content_review', label: zh.paper.steps.contentReview, matchKeys: ['content_review'] },
   { key: 'figures', label: zh.paper.steps.figures, matchKeys: ['drawings'] },
   { key: 'delivery', label: zh.paper.steps.delivery, matchKeys: ['build'] },
 ]

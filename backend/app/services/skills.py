@@ -143,6 +143,25 @@ REQ_CHROME = RequirementDef(
     probe=_has_chrome,
     hint="国知局检索需要真实浏览器才能通过站点校验，请在服务器上安装 Chrome。",
 )
+def _cad_libs_available() -> bool:
+    """ezdxf 与 matplotlib 是否可用。
+
+    两者都是纯 Python 轮子，Python 3.13 上实测可直接安装——
+    注意别装 ezdxf[draw]，那个 extra 会拉 PySide6(Qt)，在未开启长路径的
+    Windows 上装不上，而渲染成 PNG 只需要 matplotlib 后端。
+    """
+    from importlib.util import find_spec
+
+    return find_spec("ezdxf") is not None and find_spec("matplotlib") is not None
+
+
+REQ_CAD_LIBS = RequirementDef(
+    key="cad_libs",
+    label="已安装制图库（ezdxf + matplotlib）",
+    probe=_cad_libs_available,
+    hint="在服务器上执行：pip install ezdxf matplotlib（勿用 ezdxf[draw]，它会拉 Qt）。",
+)
+
 REQ_WORD_OR_SOFFICE = RequirementDef(
     key="pdf_engine",
     label="本机可转 PDF（Word 或 LibreOffice）",
@@ -197,6 +216,31 @@ REGISTRY: tuple[SkillDef, ...] = (
         outputs="嵌入文档的黑白线条附图",
         cost_hint="每张约 20-60 秒，按图像模型计费；每案最多补 3 张",
         order=20,
+    ),
+    SkillDef(
+        key="cad_lineart",
+        name="机械结构线稿",
+        category="drawing",
+        summary="由结构描述直接生成符合专利规范的黑白线条图，并附可编辑的 DXF 源文件",
+        description=(
+            "实用新型与外观设计需要机械结构附图，而这类图用框图脚本画不出来。\n\n"
+            "这项技能把技术方案里的结构关系转成二维工程图元（轮廓、内腔、剖面线、"
+            "零件标号与引出线），直接产出纯黑白线条图：白底、无颜色灰度渐变阴影、"
+            "图内只有数字标号不写说明文字——这些都是审查指南对附图的硬性要求。\n\n"
+            "同时产出 DXF 矢量源文件。代理人可以拿去任何 CAD 软件里继续修改，"
+            "这比只给一张位图有用得多。"
+        ),
+        modules=("disclosure", "paper2patent"),
+        patent_types=("utility_model", "design", "invention"),
+        requirements=(REQ_CAD_LIBS, REQ_LLM),
+        default_enabled=False,   # 依赖未必装，默认不开免得每次都提示缺环境
+        inputs="技术方案中的结构描述（自动提取，也可人工调整图元）",
+        outputs="黑白线条 PNG（嵌入文档）+ DXF 矢量源（可二次编辑）",
+        provider="ezdxf",
+        source_url="https://github.com/mozman/ezdxf",
+        license="MIT",
+        cost_hint="本地渲染，单张约 1-3 秒，不消耗模型额度",
+        order=21,
     ),
     SkillDef(
         key="formula_check",
@@ -295,6 +339,25 @@ def set_enabled(key: str, enabled: bool) -> None:
 
 def get_definition(key: str) -> SkillDef | None:
     return next((s for s in REGISTRY if s.key == key), None)
+
+
+def is_user_enabled(key: str) -> bool:
+    """用户有没有把这项技能关掉 —— **只看开关，不看前置条件**。
+
+    与 is_enabled 的区别是刻意的：
+    * 「用户明确关掉了」是一个决定，流程必须尊重它，直接不做；
+    * 「前置条件没配好」不是决定，那时该走该能力自己的降级路径
+      （联网查新失败会给出重试/手工录入/跳过三选项，比直接跳过有用得多）。
+
+    把两者混为一谈会让「没装 Chrome」表现得和「用户不想联网」一模一样，
+    而后者需要如实写进文书、前者应该提示用户去装浏览器。
+    """
+    defn = get_definition(key)
+    if defn is None:
+        return False
+    if not defn.toggleable:
+        return True
+    return _overrides().get(key, defn.default_enabled)
 
 
 def is_enabled(key: str) -> bool:

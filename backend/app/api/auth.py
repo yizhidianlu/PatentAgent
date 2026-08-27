@@ -25,6 +25,7 @@ from ..models.auth import (
 )
 from ..models.common import Ok, OkMessage
 from ..services import auth as auth_service
+from ..services.rate_limit import registration_limiter
 from .deps import client_ip, current_user
 
 logger = logging.getLogger(__name__)
@@ -114,15 +115,36 @@ async def register(body: RegisterIn, request: Request) -> Any:
     藏也藏不住（换个名字再试一次就知道了），所以这里不做登录那套模糊化处理。
     """
     ip = client_ip(request)
+
+    # 限流必须在 register_user 之前——它内部会做 argon2（64 MiB / 约 50ms），
+    # 而那正是被放大的那一步。放到之后等于没限。
+    allowed, retry_after = registration_limiter.check(ip or "unknown")
+    if not allowed:
+        return JSONResponse(
+            {
+                "detail": f"注册过于频繁，请 {retry_after} 秒后再试。",
+                "code": "rate_limited",
+                "retry_after": retry_after,
+            },
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+
     try:
         row = await db.arun(
             auth_service.register_user, body.username, body.password, body.display_name,
         )
     except auth_service.AuthError as exc:
-        await db.arun(
-            auth_service.audit, "register_rejected",
-            actor_name=body.username, detail={"code": exc.code, "reason": str(exc)}, ip=ip,
-        )
+        # 只有「注册开着、但这次被拒」才值得留档。注册关闭时的拒绝不写审计——
+        # 否则关掉注册也挡不住匿名灌库：攻击者继续 POST，audit_log 就一直长，
+        # 而它与客户的专利原件同盘；更糟的是真正的 login / cross_user_read 记录
+        # 会被冲到几万行之后，等于把审计日志本身废掉。
+        # 限流已经挡在前面，能走到这里的量是有界的。
+        if exc.code != "registration_closed":
+            await db.arun(
+                auth_service.audit, "register_rejected",
+                actor_name=body.username, detail={"code": exc.code, "reason": str(exc)}, ip=ip,
+            )
         return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=400)
     except ValueError as exc:   # create_user 的用户名冲突兜底
         return JSONResponse({"detail": str(exc), "code": "username_taken"}, status_code=400)

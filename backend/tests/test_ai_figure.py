@@ -27,6 +27,21 @@ CONTENT = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _enable_ai_figure(raw_client):
+    """这组用例验的是「开着的时候怎么工作」。
+
+    ai_figure 默认关闭（它按图像模型计费，不替用户做主），
+    而技能开关现在真的会拦住调用——不显式打开，下面每条都会在第一行就返回 False。
+    """
+    from app.db import database as db
+    from app.services import skills
+
+    skills.set_enabled("ai_figure", True)
+    yield
+    db.execute("DELETE FROM settings WHERE key='skills'")
+
+
 @pytest.fixture
 def content():
     import copy

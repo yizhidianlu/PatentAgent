@@ -101,11 +101,25 @@ async def _notify(cb: ProgressCallback | None, stage: str, msg: str) -> None:
 
 
 def hub_progress(case_id: str, step_key: str | None = None) -> ProgressCallback:
-    """构造把进度推成 SSE `search_progress{stage,msg}` 的回调（流水线/API 共用）。"""
+    """构造把进度推成 SSE `search_progress` 的回调（流水线/API 共用）。
+
+    字段名必须是 `message`：前端 SearchProgressEvent 就是这么定义的，
+    而 sessionStore 的分支第一句是 `if (!d?.message) return`——
+    早先这里发的是 `{stage, msg}`，于是国知局检索的每一条滚动进度都被静默丢弃，
+    检索那几分钟界面上什么都不会出现。同一个事件在 oa 那条链路上带的正是 `message`，
+    所以只有这一处是哑的。
+
+    persist=False：滚动进度是瞬时值，UI 语义是「同一行原地更新」。
+    落库的话界面只留一条、库里却存了几十条，重放时还会把它们一条条铺开。
+    """
 
     async def _cb(stage: str, msg: str) -> None:
         await hub.emit(
-            case_id, "search_progress", {"stage": stage, "msg": msg}, step_key=step_key
+            case_id,
+            "search_progress",
+            {"message": msg, "phase": stage},
+            step_key=step_key,
+            persist=False,
         )
 
     return _cb

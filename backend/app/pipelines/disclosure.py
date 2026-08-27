@@ -52,6 +52,7 @@ from ..models.disclosure import (
 )
 from ..models.search import AbstractDigests, SearchTermsPlan
 from ..services import artifacts as artifacts_service
+from ..services import skills as skills_service
 from ..services import assembler, assets_loader, cnipa, faithfulness, terminology
 from ..services import disclosure_build as build_service
 from ..services import figure_plan as figure_plan_service
@@ -1556,6 +1557,36 @@ SEARCH_FAIL_SCHEMA: dict[str, Any] = {
 
 async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
     """A4 联网查新：检索词 → 爬虫 → 失败三选项门控 → 消化改写 → 勾选纳入。"""
+    # 技能开关必须在这里生效，不能只做成界面上的一个按钮。
+    #
+    # 联网查新会带着本案的技术要点去访问国知局公布公告系统——用户把它关掉，
+    # 通常正是出于保密考虑。如果开关只改数据库、流程照跑，那就是在用户明确
+    # 收到「已停用」之后仍然把交底内容发了出去。这比功能不生效严重得多。
+    if not skills_service.is_user_enabled("cnipa_search"):
+        await ctx.emit(
+            "log",
+            {"message": "联网查新已在技能库中关闭，本案不联网检索，1.1 将如实写明。"},
+        )
+        # 形状必须与正常路径一致：下游按 prior_art.* 取值，缺字段会在成文时才炸
+        return {
+            "prior_art": {
+                "searched": False,
+                "status": "skipped",
+                "error": None,
+                "terms": [],
+                "type_param": "",
+                "terms_report": {},
+                "rounds": 0,
+                "cached": False,
+                "manual": False,
+                "skipped": True,
+                "skip_reason": "技能库中已关闭联网查新",
+                "hit_count": 0,
+                "selected_count": 0,
+            },
+            "prior_art_notes": [],
+        }
+
     blocks, type_param, terms_report = await _search_terms(ctx)
     progress = cnipa.hub_progress(ctx.case_id, ctx.step_key)
 

@@ -259,6 +259,37 @@ async def reset_password(
     return PasswordIssuedOut(user=_user_out(row, with_usage=False), password=password)
 
 
+@router.post("/users/{user_id}/unlock", response_model=UserOut, summary="解除账号锁定")
+async def unlock_user(
+    user_id: str,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> UserOut:
+    """解除锁定并清零失败计数。
+
+    没有这条路径时，被锁的账号只能等锁定自然到期——而失败计数不复位意味着
+    「到期」可以被攻击者无限推迟。管理员必须能在不登录受害者账号的前提下解锁。
+    """
+    def _run() -> dict[str, Any]:
+        row = auth_service.get_user_row(user_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        auth_service.unlock_user(user_id)
+        auth_service.audit(
+            "user_unlocked",
+            actor_id=admin["id"], actor_name=admin["username"],
+            target_type="user", target_id=user_id,
+            detail={"username": row["username"]},
+            ip=client_ip(request),
+        )
+        updated = auth_service.get_user_row(user_id)
+        assert updated is not None
+        return updated
+
+    row = await db.arun(_run)
+    return _user_out(row)
+
+
 @router.delete("/users/{user_id}", response_model=OkMessage, summary="删除用户")
 async def delete_user(
     user_id: str,
