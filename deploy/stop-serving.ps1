@@ -141,12 +141,23 @@ if ($localUp) {
 Write-Line 'OK' "本机 $Port 已停止响应"
 
 if ($Domain) {
-    Write-Line 'STEP' "探测 $Domain（此时应当打不开；等新机器接管后再变成 200）"
+    Write-Line 'STEP' "探测 $Domain"
+    # 走到这一步时本机必然已停（上面探测到端口仍在响应就 exit 1 了），
+    # 所以域名还有响应，只可能是另一台机器在服务——那正是迁移想要的结果。
+    #
+    # 别拿 revision 与本机 HEAD 比对来判断「是不是本机在服务」：两台机器同步到
+    # 同一个 commit 是常态、甚至是目标状态，相同不说明任何问题。revision 在这里
+    # 只用来告诉人「接管的那台跑的是哪个版本」。
     try {
-        $r = Invoke-WebRequest "https://$Domain/api/v1/system/health" -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
-        Write-Line 'WARN' "$Domain 仍返回 $($r.StatusCode)——可能是 Cloudflare 缓存，或别处还跑着同一条隧道"
+        $r = Invoke-RestMethod "https://$Domain/api/v1/system/health" -TimeoutSec 8 -ErrorAction Stop
+        $rev = [string] $r.revision
+        if ($rev) {
+            Write-Line 'OK' "$Domain 已由另一台机器提供服务（revision=$rev）"
+        } else {
+            Write-Line 'OK' "$Domain 已由另一台机器提供服务"
+        }
     } catch {
-        Write-Line 'OK' "$Domain 已无后端响应（预期）"
+        Write-Line 'OK' "$Domain 已无后端响应（还没有机器接管时的预期状态）"
     }
 }
 
