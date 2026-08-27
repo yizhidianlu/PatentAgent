@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from 'react'
 import { zh } from '../../i18n/zh'
 import { Button } from '../../components/ui/Button'
 import { NumberInput } from '../../components/ui/NumberInput'
+import { formatTokens } from '../../lib/formatTokens'
 import { Input } from '../../components/ui/Input'
 import { Spinner } from '../../components/ui/Spinner'
 import {
@@ -129,10 +130,15 @@ export function ModelSection() {
           kind: 'ok',
           text: zh.settings.model.testSuccess(result.latency_ms ?? 0),
           detail: applied
-            ? zh.settings.model.capabilityApplied(
-                patchFromCap.context_window ?? form.context_window,
-                patchFromCap.max_output_tokens ?? form.max_output_tokens,
-              ) + (cap?.estimated ? zh.settings.model.capabilityEstimated : '')
+            ? (() => {
+                const ctx = patchFromCap.context_window ?? form.context_window
+                const out = patchFromCap.max_output_tokens ?? form.max_output_tokens
+                return (
+                  zh.settings.model.capabilityApplied(
+                    ctx, out, formatTokens(ctx), formatTokens(out),
+                  ) + (cap?.estimated ? zh.settings.model.capabilityEstimated : '')
+                )
+              })()
             : undefined,
         })
       } else {
@@ -237,7 +243,10 @@ export function ModelSection() {
             />
           )}
         </Field>
-        <Field label={zh.settings.model.maxOutputTokens}>
+        <Field
+          label={zh.settings.model.maxOutputTokens}
+          badge={formatTokens(form.max_output_tokens)}
+        >
           {(id) => (
             <NumberInput
               id={id}
@@ -249,7 +258,10 @@ export function ModelSection() {
             />
           )}
         </Field>
-        <Field label={zh.settings.model.contextWindow}>
+        <Field
+          label={zh.settings.model.contextWindow}
+          badge={formatTokens(form.context_window)}
+        >
           {(id) => (
             <NumberInput
               id={id}

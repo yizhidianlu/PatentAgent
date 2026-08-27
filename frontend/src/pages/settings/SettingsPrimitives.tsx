@@ -47,18 +47,33 @@ export function SettingsCard({ title, description, children, footer }: SettingsC
 export interface FieldProps {
   label: string
   hint?: string
+  /** 标签行右端的附注（如 token 数的易读写法 `1M`）。留空则整块不渲染。 */
+  badge?: string
   children: (id: string) => ReactNode
   className?: string
 }
 
 /** 标签 + 控件 + 提示行。children 收到 id，供 label htmlFor 关联。 */
-export function Field({ label, hint, children, className }: FieldProps) {
+export function Field({ label, hint, badge, children, className }: FieldProps) {
   const id = useId()
   return (
     <div className={cn('space-y-1.5', className)}>
-      <label htmlFor={id} className="block text-sm font-medium text-gray-700 dark:text-gray-200">
-        {label}
-      </label>
+      <div className="flex items-baseline justify-between gap-2">
+        <label htmlFor={id} className="block text-sm font-medium text-gray-700 dark:text-gray-200">
+          {label}
+        </label>
+        {badge && (
+          // 做成浅底小徽章而不是一行灰字：它是对下方数字的换算，不是又一个可编辑项，
+          // 视觉上要能一眼与标签区分开。等宽 + tabular-nums 让不同字段的简写竖向对齐。
+          <span
+            className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px] leading-none
+                       tabular-nums bg-gray-100 text-gray-500
+                       dark:bg-gray-800 dark:text-gray-400"
+          >
+            {badge}
+          </span>
+        )}
+      </div>
       {children(id)}
       {hint && <p className="text-xs text-gray-500 dark:text-gray-400">{hint}</p>}
     </div>
