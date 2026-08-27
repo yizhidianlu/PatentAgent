@@ -27,6 +27,7 @@ import anyio.to_thread
 from ulid import ULID
 
 from ..config import get_config
+from .convert import run_tool
 from ..db import database as db
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,10 @@ _WD_FORMAT_PDF = 17
 
 # soffice 转换超时（秒）
 SOFFICE_TIMEOUT = 300
+
+# Word COM 转换超时（秒）。与 soffice 同量级——它们做的是同一件事，
+# 没有理由风险更高的那条反而不设上限。
+WORD_TIMEOUT = 300
 
 # 模块级锁：Word COM 全局串行（asyncio.Lock 自 Py3.10 起创建时不绑定事件循环）
 _word_lock = asyncio.Lock()
@@ -77,26 +82,26 @@ def probe() -> dict:
 
 
 def _docx_to_pdf_word_sync(docx_path: Path, pdf_path: Path) -> None:
-    """Word COM 转换（必须在专用线程内调用；调用方需已持 _word_lock）。"""
-    import pythoncom
-    import win32com.client
+    """Word COM 转换 —— 走独立子进程，超时能真的杀掉。
 
-    pythoncom.CoInitialize()  # 专用线程 STA 初始化
-    try:
-        # DispatchEx：独立 Word 实例，避免干扰用户已开的 Word
-        word = win32com.client.DispatchEx("Word.Application")
-        try:
-            word.Visible = False
-            word.DisplayAlerts = 0  # wdAlertsNone：关闭一切弹窗，防止卡死
-            doc = word.Documents.Open(str(docx_path), ReadOnly=True)
-            try:
-                doc.SaveAs(str(pdf_path), FileFormat=_WD_FORMAT_PDF)
-            finally:
-                doc.Close(False)  # 不保存改动
-        finally:
-            word.Quit()
-    finally:
-        pythoncom.CoUninitialize()
+    此前是 `anyio.to_thread.run_sync` 直接在线程里跑 COM，既没有超时、
+    也不可取消（cancellable 默认 False）。而 Word COM 挂起不是假设：弹窗、
+    激活提示、「文档恢复」对话框都会让调用永不返回。线程杀不掉，
+    它持有的 _word_lock 就永久不释放，此后每一次 PDF 导出都排在它后面。
+
+    最难受的是这种死法探不出来：应用没崩、端口在听、health 照常 200，
+    看门狗只看 200，于是永远不会重启它——核心功能死了，监控全绿。
+
+    同一个函数里的 soffice 分支本就有 timeout，没有理由风险更高的这条反而没有。
+    """
+    proc = run_tool(
+        "docx_to_pdf_word.py",
+        [str(docx_path), str(pdf_path)],
+        timeout=WORD_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "") + (proc.stdout or "")).strip()[-400:]
+        raise RuntimeError(tail or f"Word 子进程退出码 {proc.returncode}")
 
 
 def _docx_to_pdf_soffice_sync(docx_path: Path, pdf_path: Path, soffice: str) -> None:
@@ -175,6 +180,8 @@ async def docx_to_pdf(docx_path: Path, pdf_path: Path, engine: str | None = None
         if _word_available():
             try:
                 async with _word_lock:
+                    # 子进程调用本身是阻塞的，仍放线程里跑；但它内部有 timeout，
+                    # 到点会 kill 子进程并抛 TimeoutExpired，锁随之释放。
                     await anyio.to_thread.run_sync(_docx_to_pdf_word_sync, docx_path, pdf_path)
                 if pdf_path.is_file():
                     return "word"
