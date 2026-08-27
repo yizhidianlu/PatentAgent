@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, HTTPException
 
 from ..db import database as db
 from ..models.settings import (
@@ -94,15 +94,86 @@ def _keep_stored_key(submitted: str | None, stored: str) -> str:
     return submitted
 
 
+async def _audit_test_target(
+    admin: dict[str, Any],
+    request: Request,
+    section: str,
+    override: dict[str, Any] | None,
+    stored_base_url: str,
+) -> None:
+    """测试目标与已存地址不同 host 时留一条痕。
+
+    密钥不写（与设置审计同一原则）。这条的作用是让「把密钥往外送」的尝试
+    **可见**——否则只能靠代码审计才能发现，而那时东西已经出去了。
+    """
+    target = str((override or {}).get("base_url") or "").strip()
+    if not target or _same_host(target, stored_base_url):
+        return
+    await db.arun(
+        auth_service.audit,
+        "settings_test_external",
+        actor_id=admin["id"],
+        actor_name=admin["username"],
+        target_type="settings",
+        target_id=section,
+        detail={"base_url": target, "stored_base_url": stored_base_url},
+        ip=client_ip(request),
+    )
+
+
+def _same_host(a: str, b: str) -> bool:
+    """两个 base_url 是不是同一个服务地址（只比 host:port，忽略路径）。
+
+    按 host 而不是完整 URL 判断，是因为改路径是常见的合法操作
+    （/v1 → /v1beta、加版本号），而改 host 才意味着「换了收密钥的人」。
+    """
+    from urllib.parse import urlsplit
+
+    try:
+        pa, pb = urlsplit((a or "").strip()), urlsplit((b or "").strip())
+    except ValueError:
+        return False
+    if not pa.netloc or not pb.netloc:
+        return False
+    return pa.netloc.lower() == pb.netloc.lower()
+
+
 def _clean_override(
     body: LlmTestRequest | EmbeddingTestRequest | ImageGenTestRequest | None,
+    stored_base_url: str = "",
 ) -> dict[str, Any] | None:
-    """连接测试请求体 → 临时覆盖 dict：丢掉未填字段与掩码 api_key（回落已存配置）。"""
+    """连接测试请求体 → 临时覆盖 dict。
+
+    **不变式：库里的密钥只能发往库里的目的地。**
+
+    掩码 / 空 api_key 表示「沿用已存的那把」——这个约定对 PUT 是对的，
+    因为 PUT 时目的地也一并落库，密钥与目的地始终配对。但 test 不同：
+    目的地是临时的、且完全由请求方决定，配对关系在这里断了。
+
+    于是只要提交 `{base_url: "https://attacker/v1", api_key: "<界面上拿到的掩码>"}`，
+    平台就会把真实明文密钥当 Bearer 发给对方——**攻击者不需要构造任何异常输入，
+    用界面本身的数据流就能触发**。
+
+    所以：换了 host 就必须自带真实密钥，不允许回落。
+    同 host 改路径/端口仍可回落，那是真实存在的用法（同一供应商换版本）。
+    """
     if body is None:
         return None
     override = body.model_dump(exclude_none=True)
-    if is_masked_key(override.get("api_key")) or override.get("api_key") == "":
+
+    supplied = override.get("api_key")
+    falls_back = is_masked_key(supplied) or supplied == "" or supplied is None
+    if falls_back:
         override.pop("api_key", None)
+        target = str(override.get("base_url") or "").strip()
+        if target and stored_base_url and not _same_host(target, stored_base_url):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "测试新的服务地址时必须同时填写该地址的 API Key。"
+                    "已保存的密钥只会发往已保存的服务地址。"
+                ),
+            )
     return override or None
 
 
@@ -147,8 +218,15 @@ async def put_llm(
 
 @router.post("/llm/test", dependencies=ADMIN_ONLY, response_model=LlmTestResult,
              summary="用当前（或请求体临时）配置发一次最小 chat 测试连通性")
-async def test_llm(body: LlmTestRequest | None = None) -> LlmTestResult:
-    return await llm_service.test_llm(_clean_override(body))
+async def test_llm(
+    request: Request,
+    body: LlmTestRequest | None = None,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> LlmTestResult:
+    stored = await db.arun(_load_llm)
+    override = _clean_override(body, stored.base_url)
+    await _audit_test_target(admin, request, "llm", override, stored.base_url)
+    return await llm_service.test_llm(override)
 
 
 # ---------------------------------------------------------------------------
@@ -187,8 +265,15 @@ async def put_embedding(
 
 @router.post("/embedding/test", dependencies=ADMIN_ONLY, response_model=EmbeddingTestResult,
              summary="用当前（或临时）配置 embed(\"测试\") 测试连通性并返回维度")
-async def test_embedding(body: EmbeddingTestRequest | None = None) -> EmbeddingTestResult:
-    return await llm_service.test_embedding(_clean_override(body))
+async def test_embedding(
+    request: Request,
+    body: EmbeddingTestRequest | None = None,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> EmbeddingTestResult:
+    stored = await db.arun(_load_embedding)
+    override = _clean_override(body, stored.base_url)
+    await _audit_test_target(admin, request, "embedding", override, stored.base_url)
+    return await llm_service.test_embedding(override)
 
 
 @router.post("/embedding/reindex", dependencies=ADMIN_ONLY, response_model=EmbeddingReindexResult,
@@ -251,8 +336,15 @@ async def put_image_gen(
 
 @router.post("/image-gen/test", dependencies=ADMIN_ONLY, response_model=ImageGenTestResult,
              summary="用当前（或请求体临时）配置发一次最小 images 请求并回传缩略图")
-async def test_image_gen(body: ImageGenTestRequest | None = None) -> ImageGenTestResult:
-    return await llm_service.test_image_gen(_clean_override(body))
+async def test_image_gen(
+    request: Request,
+    body: ImageGenTestRequest | None = None,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> ImageGenTestResult:
+    stored = await db.arun(_load_image_gen)
+    override = _clean_override(body, stored.base_url)
+    await _audit_test_target(admin, request, "image_gen", override, stored.base_url)
+    return await llm_service.test_image_gen(override)
 
 
 # ---------------------------------------------------------------------------
