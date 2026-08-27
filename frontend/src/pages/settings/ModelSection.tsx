@@ -1,6 +1,7 @@
 import { useEffect, useId, useState } from 'react'
 import { zh } from '../../i18n/zh'
 import { Button } from '../../components/ui/Button'
+import { NumberInput } from '../../components/ui/NumberInput'
 import { Input } from '../../components/ui/Input'
 import { Spinner } from '../../components/ui/Spinner'
 import {
@@ -46,11 +47,6 @@ const FALLBACK: LlmSettings = {
   supports_json_mode: true,
 }
 
-/** 数字输入：空串保留上一有效值，避免受控 NaN。 */
-function numberOr(value: string, fallback: number): number {
-  const n = Number(value)
-  return Number.isFinite(n) ? n : fallback
-}
 
 /** 各数值字段的取值区间（与下方 Input 的 min/max 同源）。 */
 const LIMITS = {
@@ -208,42 +204,38 @@ export function ModelSection() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <Field label={zh.settings.model.temperature}>
           {(id) => (
-            <Input
+            <NumberInput
               id={id}
-              type="number"
               min={0}
               max={2}
               step={0.1}
               value={form.temperature}
-              onChange={(e) => patch({ temperature: numberOr(e.target.value, form.temperature) })}
+              fallback={0.2}
+              onChange={(temperature) => patch({ temperature })}
             />
           )}
         </Field>
         <Field label={zh.settings.model.maxOutputTokens}>
           {(id) => (
-            <Input
+            <NumberInput
               id={id}
-              type="number"
               min={256}
               step={256}
               value={form.max_output_tokens}
-              onChange={(e) =>
-                patch({ max_output_tokens: numberOr(e.target.value, form.max_output_tokens) })
-              }
+              fallback={4096}
+              onChange={(max_output_tokens) => patch({ max_output_tokens })}
             />
           )}
         </Field>
         <Field label={zh.settings.model.contextWindow}>
           {(id) => (
-            <Input
+            <NumberInput
               id={id}
-              type="number"
               min={4096}
               step={1024}
               value={form.context_window}
-              onChange={(e) =>
-                patch({ context_window: numberOr(e.target.value, form.context_window) })
-              }
+              fallback={131072}
+              onChange={(context_window) => patch({ context_window })}
             />
           )}
         </Field>

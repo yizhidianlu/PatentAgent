@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { zh } from '../../i18n/zh'
 import { Button } from '../../components/ui/Button'
+import { NumberInput } from '../../components/ui/NumberInput'
 import { Input } from '../../components/ui/Input'
 import { Modal } from '../../components/ui/Modal'
 import { Select } from '../../components/ui/Select'
@@ -220,17 +221,14 @@ export function EmbeddingSection() {
           </Field>
           <Field label={zh.settings.embedding.dim} hint={zh.settings.embedding.dimHint}>
             {(id) => (
-              <Input
+              <NumberInput
                 id={id}
-                type="number"
                 min={MIN_DIM}
                 max={MAX_DIM}
                 step={64}
                 value={form.dim}
-                onChange={(e) => {
-                  const n = Number(e.target.value)
-                  patch({ dim: Number.isFinite(n) ? n : form.dim })
-                }}
+                fallback={1024}
+                onChange={(dim) => patch({ dim })}
               />
             )}
           </Field>

@@ -190,10 +190,17 @@ export function CreateUserModal({ open, onClose, onCreated }: CreateUserModalPro
                   id={`admin-quota-${key}`}
                   type="number"
                   min={0}
-                  value={quota[key]}
-                  onChange={(e) =>
-                    setQuota((q) => ({ ...q, [key]: Math.max(0, Number(e.target.value) || 0) }))
-                  }
+                  /* 0 渲染为空串并用 placeholder 提示：否则受控值恒为 0，
+                     用户既删不掉它，输入 100 只会变成 0100（0 表示不限，空亦然）。 */
+                  value={quota[key] === 0 ? '' : String(quota[key])}
+                  placeholder="0"
+                  onChange={(e) => {
+                    const raw = e.target.value
+                    setQuota((q) => ({
+                      ...q,
+                      [key]: raw === '' ? 0 : Math.max(0, Number(raw) || 0),
+                    }))
+                  }}
                   className="h-9"
                 />
               </div>

@@ -21,18 +21,31 @@ export function Modal({ open, onClose, title, panelClassName, children }: ModalP
   const panelRef = useRef<HTMLDivElement>(null)
   const lastActiveRef = useRef<Element | null>(null)
 
+  // onClose 常被父组件写成内联箭头函数，每次重渲染都是新引用。若把它放进下面
+  // 主 effect 的依赖里，用户每敲一个字（父组件 setState → 重渲染）就会触发
+  // effect 重跑、把焦点抢回面板第一个可聚焦元素（通常是关闭按钮），表单根本
+  // 没法连续输入。故用 ref 承接，主 effect 只依赖 open。
+  const onCloseRef = useRef(onClose)
+  useEffect(() => {
+    onCloseRef.current = onClose
+  }, [onClose])
+
   useEffect(() => {
     if (!open) return
     lastActiveRef.current = document.activeElement
 
     const panel = panelRef.current
-    const first = panel?.querySelector<HTMLElement>(FOCUSABLE)
+    // 初始焦点优先给第一个输入控件——弹窗多为表单，落在关闭按钮上既不便也易误触
+    const firstField = panel?.querySelector<HTMLElement>(
+      'input:not([disabled]):not([type="hidden"]), textarea:not([disabled]), select:not([disabled])',
+    )
+    const first = firstField ?? panel?.querySelector<HTMLElement>(FOCUSABLE)
     ;(first ?? panel)?.focus()
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation()
-        onClose()
+        onCloseRef.current()
         return
       }
       if (e.key !== 'Tab' || !panelRef.current) return
@@ -58,7 +71,7 @@ export function Modal({ open, onClose, title, panelClassName, children }: ModalP
       document.removeEventListener('keydown', onKeyDown, true)
       if (lastActiveRef.current instanceof HTMLElement) lastActiveRef.current.focus()
     }
-  }, [open, onClose])
+  }, [open])
 
   if (!open) return null
 
