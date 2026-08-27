@@ -98,6 +98,8 @@ def _case_endpoints(case_id: str) -> list[tuple[str, str, dict[str, Any]]]:
          {"files": [("files", ("x.md", b"intruder", "text/markdown"))]}),
         # 交付物
         ("GET", f"{base}/artifacts", {}),
+        # 正文插图（网页端 <img> 的取图口）
+        ("GET", f"{base}/media", {"params": {"path": "figure_1.png"}}),
         # 流水线
         ("GET", f"{base}/pipeline/state", {}),
         ("POST", f"{base}/pipeline/start", {"json": {}}),

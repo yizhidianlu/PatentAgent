@@ -23,6 +23,7 @@ import {
   useSubmitInput,
 } from '../../api/pipeline'
 import { artifactToMarkdown, pickDocArtifact } from '../../lib/docHydration'
+import { MediaCaseContext } from '../../lib/mediaContext'
 import {
   DEFAULT_DOC_ID,
   useSessionStore,
@@ -582,6 +583,8 @@ export function WorkspaceShell({
   }
 
   return (
+    /* 正文里的插图是磁盘路径，MarkdownBlock 要靠这个案件 id 换成媒体端点才取得到图 */
+    <MediaCaseContext.Provider value={caseId ?? null}>
     <div className="flex-1 min-h-0 flex overflow-hidden">
       {/* 左：流式列 */}
       <div className="flex-1 min-w-0 flex flex-col relative">
@@ -678,5 +681,6 @@ export function WorkspaceShell({
         />
       )}
     </div>
+    </MediaCaseContext.Provider>
   )
 }

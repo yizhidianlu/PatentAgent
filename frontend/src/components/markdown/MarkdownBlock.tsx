@@ -1,5 +1,5 @@
 import { isValidElement, memo, type ReactElement, type ReactNode } from 'react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
@@ -9,6 +9,8 @@ import { cn } from '../../lib/cn'
 import { CodeBlock } from './CodeBlock'
 import { MermaidBlock } from './MermaidBlock'
 import { normalizeMathDelimiters } from './normalizeMath'
+import { useMediaCaseId } from '../../lib/mediaContext'
+import { toMediaUrl } from '../../lib/mediaUrl'
 
 const remarkPlugins = [remarkGfm, remarkMath]
 const rehypePlugins = [rehypeKatex]
@@ -26,7 +28,43 @@ function extractText(node: ReactNode): string {
 
 const LANGUAGE_RE = /language-([\w-]+)/
 
+/**
+ * 正文插图。
+ *
+ * md 里写的是磁盘路径（导出 Word/PDF 时按盘读），浏览器取不到，
+ * 这里改写成案件媒体端点。拿不到案件上下文时不出 `<img>` ——
+ * 一个必然 404 的破图比只留图题更难看，也更让人以为是数据丢了。
+ */
+function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?: string }) {
+  const caseId = useMediaCaseId()
+  const url = toMediaUrl(caseId, typeof src === 'string' ? src : '')
+  if (!url) return null
+  return (
+    <img
+      className="md-figure"
+      src={url}
+      alt={alt ?? ''}
+      title={title}
+      loading="lazy"
+      /* 图缺失时收起自己，不留浏览器默认的破图图标 */
+      onError={(e) => {
+        e.currentTarget.style.display = 'none'
+      }}
+    />
+  )
+}
+
+/**
+ * 图片的 src 放行给 MarkdownImage 自己收口（默认清洗器会把 `C:/…` 当未知协议丢掉）；
+ * 其余（尤其是链接 href）仍走 react-markdown 的默认清洗，`javascript:` 照样拦。
+ */
+const urlTransform: UrlTransform = (value, key, node) => {
+  if (key === 'src' && node.tagName === 'img') return value
+  return defaultUrlTransform(value)
+}
+
 const components: Components = {
+  img: MarkdownImage,
   // 围栏码块：<pre><code class="language-x"> → CodeBlock / MermaidBlock
   pre({ children }) {
     let className = ''
@@ -77,6 +115,7 @@ export const MarkdownBlock = memo(function MarkdownBlock({
         remarkPlugins={remarkPlugins}
         rehypePlugins={rehypePlugins}
         components={components}
+        urlTransform={urlTransform}
       >
         {normalizeMathDelimiters(markdown)}
       </ReactMarkdown>

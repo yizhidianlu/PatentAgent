@@ -27,6 +27,7 @@ from .api import cases as cases_api
 from .api import disclosure as disclosure_api
 from .api import events as events_api
 from .api import files as files_api
+from .api import media as media_api
 from .api import oa as oa_api
 from .api import p2p as p2p_api
 from .api import pipeline as pipeline_api
@@ -161,6 +162,7 @@ def create_app() -> FastAPI:
     app.include_router(cases_api.router, prefix=api_prefix)
     app.include_router(events_api.router, prefix=api_prefix)
     app.include_router(files_api.router, prefix=api_prefix)
+    app.include_router(media_api.router, prefix=api_prefix)
     app.include_router(pipeline_api.router, prefix=api_prefix)
     app.include_router(p2p_api.router, prefix=api_prefix)
     app.include_router(disclosure_api.router, prefix=api_prefix)

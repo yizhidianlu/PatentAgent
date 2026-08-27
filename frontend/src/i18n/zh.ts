@@ -337,6 +337,8 @@ export const zh = {
       inventionContent: '发明内容',
       drawingDescription: '附图说明',
       embodiments: '具体实施方式',
+      figures: '说明书附图',
+      figurePending: '（该图未能成图，已降级为图像模型提示词，见交付物）',
     },
   },
 

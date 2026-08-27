@@ -108,6 +108,54 @@ function asStrings(value: unknown): string[] {
   return value.map((v) => (typeof v === 'string' ? v.trim() : '')).filter(Boolean)
 }
 
+/** drawing_assets 一项：附图脚本回写的成图元数据。 */
+interface DrawingAsset {
+  figure_no?: unknown
+  caption?: unknown
+  title?: unknown
+  png_path?: unknown
+  svg_path?: unknown
+}
+
+/**
+ * 说明书附图。
+ *
+ * 图片路径是磁盘路径（相对附图工作目录或绝对），浏览器取不到——
+ * MarkdownBlock 的 img 会把它换成案件媒体端点。此前这里根本不出图，
+ * 于是网页端只有文字，只有导出的 Word / PDF 才有图。
+ *
+ * PNG 优先：SVG 也能显示，但附图脚本的 SVG 依赖外部字体度量，浏览器里字距会飘；
+ * PNG 就是 Word 里嵌的那一张，所见即所得。
+ */
+function figuresMarkdown(content: Record<string, unknown>): string[] {
+  const raw = content.drawing_assets
+  if (!Array.isArray(raw)) return []
+  const t = zh.document.patentSections
+  const lines: string[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const asset = item as DrawingAsset
+    const no = Number(asset.figure_no) || 0
+    const caption =
+      (typeof asset.caption === 'string' && asset.caption.trim()) ||
+      [no ? `图${no}` : '', typeof asset.title === 'string' ? asset.title.trim() : '']
+        .filter(Boolean)
+        .join(' ')
+    const path =
+      (typeof asset.png_path === 'string' && asset.png_path.trim()) ||
+      (typeof asset.svg_path === 'string' && asset.svg_path.trim()) ||
+      ''
+    if (!path) {
+      // 降级为提示词的图：说明它为什么不在，而不是静静少一张
+      lines.push(`**${caption || '附图'}**`, '', `> ${t.figurePending}`, '')
+      continue
+    }
+    lines.push(`![${caption}](${path})`, '', `**${caption}**`, '')
+  }
+  if (lines.length === 0) return []
+  return [`## ${t.figures}`, '', ...lines]
+}
+
 /**
  * PatentContent（论文转专利的 patent_content_json）→ 可读 Markdown。
  * 直接把 JSON 原文丢进 md-prose 会渲染成一大坨无格式文本，比空白还难看。
@@ -135,6 +183,7 @@ function patentContentToMarkdown(content: Record<string, unknown>): string {
     ...section(t.embodiments, desc.embodiments as string | undefined, '###'),
   ]
   if (body.length > 0) lines.push(`## ${t.description}`, '', ...body)
+  lines.push(...figuresMarkdown(content))
   return lines.join('\n').trim()
 }
 

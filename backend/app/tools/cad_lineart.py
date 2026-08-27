@@ -30,9 +30,8 @@ LW_OUTLINE = 35
 LW_INNER = 20
 LW_THIN = 9
 
-# 剖面线间距（图元坐标单位）
+# 剖面线间距（图元坐标单位，沿 X 方向量取）
 HATCH_STEP = 5.0
-HATCH_ANGLE_DX = 4.0   # 45° 的水平偏移
 
 
 def _add_polyline(msp, points: list[list[float]], *, closed: bool, weight: int) -> None:
@@ -47,13 +46,29 @@ def _add_hatch(msp, x0: float, y0: float, x1: float, y1: float) -> None:
     """45° 剖面线。用细实线画，不用 DXF HATCH 实体——
 
     HATCH 在部分渲染后端会被填充成灰色块，那在专利附图里是不允许的。
+
+    **裁剪必须按参数 t 同时裁 x 和 y。**
+    早先的写法只把端点的 x 夹进 [x0, x1]、y 恒取 y0/y1：这既改变了被裁那几根线的
+    角度（多根线收敛到同一个角点，渲染出来是一把戳出方块的扇形），也让「45°」
+    根本不成立——水平偏移曾是个常量，于是实际角度随剖切区高度变化，
+    只有高度恰好等于那个常量时才是 45°。审查指南要求剖面线 45°，这条得是真的。
     """
-    span = int((x1 - x0) // HATCH_STEP) + 1
-    for i in range(span + 4):
-        sx = x0 + i * HATCH_STEP - HATCH_ANGLE_DX
+    height = y1 - y0
+    if height <= 0 or x1 <= x0:
+        return
+    # 45° ⇒ 水平偏移等于高度。起点从 x0 - height 开始，才能覆盖左下角那一片
+    start = x0 - height
+    count = int((x1 - start) // HATCH_STEP) + 2
+    for i in range(count):
+        sx = start + i * HATCH_STEP
+        # 线段 (sx, y0) → (sx + height, y1) 按 t 裁到 x ∈ [x0, x1]
+        t0 = max(0.0, (x0 - sx) / height)
+        t1 = min(1.0, (x1 - sx) / height)
+        if t1 <= t0:
+            continue           # 整根落在剖切区外
         msp.add_line(
-            (max(x0, sx), y0),
-            (min(x1, sx + HATCH_ANGLE_DX), y1),
+            (sx + t0 * height, y0 + t0 * height),
+            (sx + t1 * height, y0 + t1 * height),
             dxfattribs={"lineweight": LW_THIN},
         )
 

@@ -206,3 +206,21 @@
   0%, 100% { opacity: 1; }
   50% { opacity: 0.25; }
 }
+
+/* --- 正文插图（专利附图 / 交底书插图） ---------------------------------- */
+/* 专利附图是黑白线条图，白底。暗色模式下直接贴上去会是一块刺眼的白，
+   所以给一层浅色衬底把它收进卡片里，而不是反相——反相会把线条图毁掉。 */
+.md-prose .md-figure {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0.75em auto;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  padding: 0.5rem;
+}
+.dark .md-prose .md-figure {
+  border-color: #374151;
+  background: #f8fafc;
+}

@@ -1,0 +1,120 @@
+# -*- coding: utf-8 -*-
+"""案件媒体 API：把落在案件目录里的图片按 URL 交给浏览器。
+
+**为什么需要这个端点。**
+交底书正文里的插图写的是磁盘路径（``![图1](C:/.../uploads/xx.png)``），论文转专利
+的附图落在 ``outputs/{case_id}/p2p_work/``。这两处 Word / PDF 导出器都直接读盘，
+所以导出件里图是全的；但浏览器读不了本机路径（``C:`` 会被当成未知协议整个丢掉），
+网页端于是只剩图题没有图——「只有导出的 Word 和 PDF 能看到图」正是这个成因。
+
+**边界。**
+路径由前端提供，而前端的路径又来自文档正文，也就是说它可以被模型生成的内容影响。
+所以这里按「白名单目录 + 真实路径包含判定」收口：解析后的绝对路径必须落在本案件
+自己的 uploads / outputs 目录内，扩展名必须在图片白名单里。越界一律 404 而不是
+403——403 等于确认「这个路径存在」，那本身就是一点不该给的信息。
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse
+
+from ..config import get_config
+from ..db import database as db
+from .deps import client_ip, current_user, resolve_case_sync
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["媒体"])
+
+# 只放行图片。这个端点是给 <img> 用的，不是通用文件下载口——
+# 放宽到任意扩展名就等于把案件目录整个开成了可枚举的静态站点。
+_MEDIA_TYPES: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+}
+
+
+def _case_roots(case_id: str) -> list[Path]:
+    """本案件允许被读取的两个根目录。"""
+    cfg = get_config()
+    return [cfg.outputs_dir / case_id, cfg.uploads_dir / case_id]
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        root_real = root.resolve()
+    except OSError:
+        return False
+    return path == root_real or root_real in path.parents
+
+
+def resolve_media_path(case_id: str, raw: str) -> Path | None:
+    """把正文里的图片引用解析成本案件目录内的真实文件；越界或不存在返回 None。
+
+    正文里的写法有三种，都要认：
+    - 绝对路径（交底书插图、AI 补图）
+    - 相对工作目录的文件名（附图脚本回写的 ``png_path`` 有时只有文件名）
+    - 相对案件输出目录的路径（mermaid / 公式 PNG 的 ``assets_dir``）
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.lower().startswith("file:///"):
+        text = text[8:]
+    elif text.lower().startswith("file://"):
+        text = text[7:]
+
+    roots = _case_roots(case_id)
+    candidate = Path(text)
+    tries: list[Path] = []
+    if candidate.is_absolute():
+        tries.append(candidate)
+    else:
+        for root in roots:
+            tries.append(root / candidate)
+            tries.append(root / "p2p_work" / candidate)
+
+    for item in tries:
+        try:
+            # strict=True：符号链接一并解开后再做包含判定，
+            # 否则一个指向案件目录外的链接就能绕过整套边界。
+            real = item.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not real.is_file():
+            continue
+        if real.suffix.lower() not in _MEDIA_TYPES:
+            continue
+        if any(_within(real, root) for root in roots):
+            return real
+    return None
+
+
+@router.get("/cases/{case_id}/media", summary="按案件内路径读取图片（供网页端 <img> 内联显示）")
+async def case_media(
+    case_id: str,
+    request: Request,
+    path: str = Query(description="正文中的图片路径（绝对或相对案件目录）"),
+    user: dict[str, Any] = Depends(current_user),
+) -> FileResponse:
+    await db.arun(resolve_case_sync, case_id, user, ip=client_ip(request))
+    real = await db.arun(resolve_media_path, case_id, path)
+    if real is None:
+        # 不区分「不存在」与「越界」：区分本身就是一条信息
+        raise HTTPException(status_code=404, detail="找不到该图片，或该路径不属于本案件")
+    return FileResponse(
+        real,
+        media_type=_MEDIA_TYPES[real.suffix.lower()],
+        # 图片按内容寻址（路径含时间戳/图号），可以放心让浏览器缓存
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
