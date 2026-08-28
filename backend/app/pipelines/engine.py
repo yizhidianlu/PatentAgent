@@ -518,14 +518,20 @@ async def _run_step(ctx: Ctx, step: StepDef, attempt: int) -> bool:
 
     async def _await_user(interaction: InteractionRequest) -> Any:
         pend = _Pending(step_key=step.key, run_id=run_id, interaction=interaction)
-        _pending[case_id] = pend
         # 等用户不是卡住，是设计好的停顿——心跳照发，但不报「无响应」
         if (p := progress.current(case_id)) is not None:
             p.suspended = True
             p.waiting_for = "你的确认"
             p.touch("等待人工确认")
+
+        # **先写库，再挂出 pending。**
+        # 反过来的话，`get_pending()` 会在 case 还写着 running 时就返回非空——
+        # 中间隔着两次 await，轮询的客户端能实实在在地读到
+        # 「有待确认的门控，但案件状态是运行中」这种自相矛盾的快照。
+        # 不变式：任何人能看见 pending 的那一刻，案件必须已经是 waiting_user。
         await db.arun(_update_run, run_id, {"status": "waiting_user"})
         await db.arun(_save_case, case_id, {"status": "waiting_user"})
+        _pending[case_id] = pend
         await hub.emit(
             case_id,
             "step_status",

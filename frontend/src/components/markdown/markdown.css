@@ -224,3 +224,39 @@
   border-color: #374151;
   background: #f8fafc;
 }
+
+/* 附图取不到时的占位：明说取不到，并给出路径，便于排查。
+   留白比破图图标好，但「什么都不显示」比破图更糟——那会让人以为本来就没有这张图。 */
+.md-prose .md-figure-missing {
+  display: block;
+  margin: 0.75em auto;
+  padding: 1rem;
+  border: 1px dashed #d1d5db;
+  border-radius: 0.75rem;
+  background: #f9fafb;
+  text-align: center;
+}
+.dark .md-prose .md-figure-missing {
+  border-color: #4b5563;
+  background: #1f2937;
+}
+.md-prose .md-figure-missing-title {
+  display: block;
+  font-size: 0.875em;
+  color: #6b7280;
+}
+.md-prose .md-figure-missing-hint {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.8125em;
+  color: #9ca3af;
+}
+.md-prose .md-figure-missing-path {
+  display: inline-block;
+  margin-top: 0.5rem;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 0.75em;
+  color: #9ca3af;
+  background: transparent;
+}

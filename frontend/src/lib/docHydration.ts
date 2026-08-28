@@ -113,6 +113,8 @@ interface DrawingAsset {
   figure_no?: unknown
   caption?: unknown
   title?: unknown
+  /** 相对 DATA_DIR 的路径，由后端在确知文件位置时回写；网页端取图首选。 */
+  media_path?: unknown
   png_path?: unknown
   svg_path?: unknown
 }
@@ -141,7 +143,15 @@ function figuresMarkdown(content: Record<string, unknown>): string[] {
       [no ? `图${no}` : '', typeof asset.title === 'string' ? asset.title.trim() : '']
         .filter(Boolean)
         .join(' ')
+    /*
+     * 取路径的次序：media_path → png_path → svg_path。
+     *
+     * media_path 是后端在**确知文件真实位置**时回写的（相对 DATA_DIR），自解释；
+     * png_path 则是「相对附图工作目录的文件名」，要靠两侧各自复刻同一套约定才解释得了，
+     * 复刻出偏差的那一刻图就不见了。老案件没有 media_path，仍走后两者兜底。
+     */
     const path =
+      (typeof asset.media_path === 'string' && asset.media_path.trim()) ||
       (typeof asset.png_path === 'string' && asset.png_path.trim()) ||
       (typeof asset.svg_path === 'string' && asset.svg_path.trim()) ||
       ''

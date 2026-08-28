@@ -27,6 +27,7 @@ from typing import Any
 import anyio.to_thread
 
 from ..config import get_config
+from . import paths as paths_service
 from .convert import run_tool
 
 logger = logging.getLogger(__name__)
@@ -414,7 +415,15 @@ def _is_figure_line(text: str, figure_no: int) -> bool:
 
 
 def asset_files(case_id: str, content: dict[str, Any]) -> list[dict[str, Any]]:
-    """列出已生成的图片文件（绝对路径），供落 figure_svg / figure_png 交付物。"""
+    """列出已生成的图片文件（绝对路径），供落 figure_svg / figure_png 交付物。
+
+    顺便把 `media_path`（相对 DATA_DIR）回写进 `drawing_assets`。
+
+    `png_path` 存的是**相对附图工作目录**的文件名，只有知道那个约定的人才解释得了。
+    网页端要显示这张图，就得在另一侧再复刻一遍同样的约定——复刻出偏差的那一刻，
+    图就不见了，而且一声不响。这里是唯一确知文件真实位置的地方（下面刚 `is_file()`
+    验过），把一条自解释的路径落下来，两边就不必各猜各的。
+    """
     base = work_dir(case_id)
     items: list[dict[str, Any]] = []
     for asset in content.get("drawing_assets") or []:
@@ -430,5 +439,8 @@ def asset_files(case_id: str, content: dict[str, Any]) -> list[dict[str, Any]]:
                 path = (base / path).resolve()
             if path.is_file():
                 entry[key] = path
+                # 网页端取图用这一条；PNG 优先（Word 里嵌的就是它，所见即所得）
+                if key == "png_path" or "media_path" not in asset:
+                    asset["media_path"] = paths_service.to_stored(path)
         items.append(entry)
     return items

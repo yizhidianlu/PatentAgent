@@ -1,4 +1,4 @@
-import { isValidElement, memo, type ReactElement, type ReactNode } from 'react'
+import { isValidElement, memo, useState, type ReactElement, type ReactNode } from 'react'
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -6,6 +6,7 @@ import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
 import './markdown.css'
 import { cn } from '../../lib/cn'
+import { zh } from '../../i18n/zh'
 import { CodeBlock } from './CodeBlock'
 import { MermaidBlock } from './MermaidBlock'
 import { normalizeMathDelimiters } from './normalizeMath'
@@ -37,8 +38,30 @@ const LANGUAGE_RE = /language-([\w-]+)/
  */
 function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?: string }) {
   const caseId = useMediaCaseId()
-  const url = toMediaUrl(caseId, typeof src === 'string' ? src : '')
-  if (!url) return null
+  const [failed, setFailed] = useState(false)
+  const raw = typeof src === 'string' ? src : ''
+  const url = toMediaUrl(caseId, raw)
+
+  /*
+   * 取不到图时**明说**，不要静静地什么都不显示。
+   *
+   * 早先这里是「拿不到 caseId 就 return null、加载失败就 display:none」——
+   * 于是页面上只剩一行图题，看起来像「这张图本来就没有」。
+   * 用户报的正是这个：右侧没有显示出图片，而界面一个字都没解释为什么。
+   * 静默失败在这个项目里已经咬过好几次，这里不再重复。
+   */
+  if (!url || failed) {
+    return (
+      <span className="md-figure-missing" role="img" aria-label={alt || zh.document.figureFailed}>
+        <span className="md-figure-missing-title">{alt || zh.document.figureFailed}</span>
+        <span className="md-figure-missing-hint">
+          {!caseId ? zh.document.figureNoCase : zh.document.figureFailedHint}
+        </span>
+        {raw && <code className="md-figure-missing-path">{raw}</code>}
+      </span>
+    )
+  }
+
   return (
     <img
       className="md-figure"
@@ -46,10 +69,7 @@ function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?
       alt={alt ?? ''}
       title={title}
       loading="lazy"
-      /* 图缺失时收起自己，不留浏览器默认的破图图标 */
-      onError={(e) => {
-        e.currentTarget.style.display = 'none'
-      }}
+      onError={() => setFailed(true)}
     />
   )
 }

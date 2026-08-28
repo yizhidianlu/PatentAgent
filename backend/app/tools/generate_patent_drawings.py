@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import re
+import sys
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
@@ -82,26 +83,104 @@ def has_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
-def wrap_label(text: str, max_chars: int = 12) -> list[str]:
+#: 一个方框最多排几行。超过就不是图了，是段落——那时该让模型把步骤写短，
+#: 而不是让脚本把句子剁断。
+MAX_LABEL_LINES = 5
+
+#: 非汉字（拉丁字母 / 数字）相对字号的宽度系数。等宽衬线里 ASCII 约为半角，
+#: 取 0.56 略留富余：宁可一行少放一个字，也不要让字压到框线上。
+ASCII_WIDTH_RATIO = 0.56
+
+#: 不允许在中间断开的连续片段：模型名、缩写、编号。
+#: 「MobileNetV4」被断成「MobileNetV / 4」在专利附图里就是个错字。
+_ATOM_RE = re.compile(r"[A-Za-z0-9]+(?:[.+-][A-Za-z0-9]+)*")
+
+
+def char_width(ch: str, font_size: int) -> float:
+    """单字符的估算宽度。汉字与全角标点按一个字宽，拉丁与数字按半角。"""
+    if has_cjk(ch) or ch in "，。、；：！？（）「」【】—…":
+        return float(font_size)
+    return font_size * ASCII_WIDTH_RATIO
+
+
+def text_width(text: str, font_size: int) -> float:
+    return sum(char_width(ch, font_size) for ch in text)
+
+
+def _atoms(text: str) -> list[str]:
+    """把文本切成「不可再断的最小单位」：一个汉字，或一整段拉丁/数字。"""
+    out: list[str] = []
+    pos = 0
+    for m in _ATOM_RE.finditer(text):
+        out.extend(text[pos:m.start()])
+        out.append(m.group(0))
+        pos = m.end()
+    out.extend(text[pos:])
+    return out
+
+
+def wrap_label(
+    text: str,
+    max_width: float,
+    font_size: int = 24,
+    max_lines: int = MAX_LABEL_LINES,
+) -> list[str]:
+    """把标签折成能装进 `max_width` 的若干行。
+
+    **按估算宽度折行，不按字符个数。**早先是数字符个数（写死 12 个），
+    带来两个问题：一是 ASCII 只有半角，按个数算会让含模型名的行白白空掉半行；
+    二是布局算高度和渲染画字用的是两个不同的 max_chars，
+    于是**算出来的盒子装不下真正排出来的行数**，字压到框线外面去。
+    现在布局与两个渲染器共用这一个函数、同一组参数。
+
+    另外早先是 `return lines[:3]`：多出来的行**直接丢掉，一声不吭**。
+    配合上游 20 字的硬截断，一条完整步骤到了图上就变成
+    「S101 获取视频喉镜在气管插管场景中采集的喉镜…」——句子断在半途。
+    专利附图是要交到审查员手里的，这种图不能用。
+    """
     text = text.strip()
-    if len(text) <= max_chars:
-        return [text]
-    lines = []
+    if not text:
+        return [""]
+    lines: list[str] = []
     current = ""
-    for char in text:
-        current += char
-        if len(current) >= max_chars:
+    for atom in _atoms(text):
+        if current and text_width(current + atom, font_size) > max_width:
             lines.append(current)
-            current = ""
+            current = atom
+        else:
+            current += atom
     if current:
         lines.append(current)
-    return lines[:3]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        tail = lines[-1]
+        while tail and text_width(tail + "…", font_size) > max_width:
+            tail = tail[:-1]
+        lines[-1] = tail + "…"
+    return lines
+
+
+#: 图题最多留多少字。图题会出现在附图下方与说明书里，太长不好看，
+#: 但 28 字（原值）连一句完整的图题都放不下——用户看到的就是一串「…」。
+CAPTION_LIMIT = 60
 
 
 def title_from_spec(spec: str, figure_no: int) -> str:
+    """从规格里取图题。
+
+    优先切到第一个句读处，让图题在**语义边界**结束，而不是在第 28 个字上切一刀。
+    实在没有句读才按长度兜底。
+    """
     first = as_paragraphs(spec)[0] if as_paragraphs(spec) else spec
     first = re.sub(r"^图\s*\d+\s*[：:]\s*", "", first).strip()
-    return compact_label(first or f"图{figure_no}")
+    first = re.sub(r"^图\s*\d+\s*为\s*", "", first).strip()
+    if len(first) > CAPTION_LIMIT:
+        # 在限长之内找最后一个句读，切在那里
+        head = first[:CAPTION_LIMIT]
+        cut = max(head.rfind(ch) for ch in "，,；;。")
+        if cut >= CAPTION_LIMIT // 3:
+            first = head[:cut]
+    return compact_label(first or f"图{figure_no}", CAPTION_LIMIT)
 
 
 def figure_no_from_spec(spec: str, fallback: int) -> int:
@@ -273,9 +352,9 @@ def text_block(
     label: str,
     anchor: str = "middle",
     size: int = 24,
-    max_chars: int = 12,
+    max_width: float = 260.0,
 ) -> str:
-    lines = wrap_label(label, max_chars=max_chars)
+    lines = wrap_label(label, max_width, font_size=size)
     line_height = int(size * 1.25)
     start_y = y - (len(lines) - 1) * line_height // 2
     tspans = []
@@ -289,11 +368,16 @@ def text_block(
     )
 
 
-def rect_node(x: int, y: int, width: int, height: int, label: str, max_chars: int = 12) -> str:
+def rect_node(
+    x: int, y: int, width: int, height: int, label: str, max_width: float | None = None
+) -> str:
+    """一个方框。`max_width` 缺省按盒宽减去左右内边距算，保证字不压框线。"""
+    if max_width is None:
+        max_width = inner_width(width)
     return (
         f'<rect x="{x}" y="{y}" width="{width}" height="{height}" rx="0" ry="0" '
         'fill="#ffffff" stroke="#000000" stroke-width="2"/>'
-        f"{text_block(x + width // 2, y + height // 2 + 8, label, max_chars=max_chars)}"
+        f"{text_block(x + width // 2, y + height // 2 + 8, label, max_width=max_width)}"
     )
 
 
@@ -353,20 +437,56 @@ def orthogonal_points(
     return [start, (x1, mid_y), (x2, mid_y), end]
 
 
+#: 流程图方框里一条步骤最多留多少字。
+#: 取值依据是排版而不是美观：盒宽 12 字 × 5 行 = 60 字，减去「S101 」这类前缀。
+STEP_LABEL_LIMIT = 54
+
+
 def extract_steps(spec: str) -> list[str]:
+    """从规格里抽出「S101 ……」这样的步骤标签。
+
+    这里**不做短截断**。早先是 `compact_label(label, 20)`，20 字放不下一句完整的
+    技术步骤，于是图上每个方框都以「…」收尾、句子断在半途。附图是要交到审查员
+    手里的东西，标签断句等于这幅图不能用。
+
+    真正该短的是模型写进规格的那句话，不是脚本的剪刀。所以这里只留一个
+    远高于正常长度的上限当跑飞保护，真触发了会在 stderr 上说一声。
+    """
     steps = []
     for step_no, label in STEP_RE.findall(spec):
-        label = compact_label(label, 20)
-        steps.append(f"{step_no} {label}")
+        cleaned = compact_label(label, STEP_LABEL_LIMIT)
+        if cleaned.endswith("…"):
+            print(
+                f"步骤 {step_no} 的描述超过 {STEP_LABEL_LIMIT} 字，已在图上截断；"
+                "建议把该步骤在附图规格里写得更概括。",
+                file=sys.stderr,
+            )
+        steps.append(f"{step_no} {cleaned}")
     return steps
+
+
+#: 结构框图里一个模块名最多留多少字。盒宽 430px 能排 3 行 × 约 15 字。
+MODULE_LABEL_LIMIT = 40
+
+#: 「这不是模块，是在描述图本身」的判据。
+#:
+#: 早先这里写的是 `"图" not in part` —— 只要模块名里带一个「图」字就整条丢掉。
+#: 医学影像类专利的模块几乎清一色叫「图像采集模块」「图像预处理模块」，
+#: 于是结构框图里**整块能力凭空消失**，而且不报错、图还画得好好的。
+#: 现在只排除真正在讲图的短语（图中/如图/图示/箭头表示…）。
+_NOT_A_MODULE = re.compile(r"^(图\s*\d*\s*[中示里内]|如图|见图|箭头|虚线|实线|参见)")
 
 
 def extract_modules(spec: str) -> list[str]:
     match = re.search(r"包含(.+?)(?:。|\.|$)", spec)
     source = match.group(1) if match else spec
     source = source.replace("和", "、")
-    parts = [compact_label(part, 12) for part in re.split(r"[、,，；;]", source)]
-    modules = [part for part in parts if part and "箭头" not in part and "图" not in part]
+    modules: list[str] = []
+    for raw in re.split(r"[、,，；;]", source):
+        part = compact_label(raw, MODULE_LABEL_LIMIT)
+        if not part or _NOT_A_MODULE.search(part) or "箭头" in part:
+            continue
+        modules.append(part)
     return modules[:8]
 
 
@@ -378,9 +498,33 @@ def require_items(items: list[str], asset: dict[str, Any], kind: str, minimum: i
         )
 
 
+#: 方框内文字的排版常量（与 text_block 的 size/line_height 对齐）。
+FLOW_FONT_SIZE = 24
+FLOW_LINE_HEIGHT = int(FLOW_FONT_SIZE * 1.25)
+#: 方框内上下留白（两侧各一半）。
+FLOW_PADDING_Y = 34
+
+
+#: 方框左右内边距（两侧各一半），免得字贴着框线。
+NODE_PADDING_X = 48
+
+
+def inner_width(node_w: int) -> float:
+    """方框内可用于排字的宽度。"""
+    return float(max(FLOW_FONT_SIZE, node_w - NODE_PADDING_X))
+
+
 def method_flow_layout(steps: list[str]) -> dict[str, Any]:
     node_w = 560
-    node_h = 82
+    max_width = inner_width(node_w)
+    # 方框高度按**实际排几行**算，而不是写死。
+    # 写死 82px 的后果是：文字多了就往框外溢或者被上游截掉，
+    # 两种表现都指向同一个观感——「图是残的」。
+    line_count = max(
+        (len(wrap_label(step, max_width, font_size=FLOW_FONT_SIZE)) for step in steps),
+        default=1,
+    )
+    node_h = max(82, line_count * FLOW_LINE_HEIGHT + FLOW_PADDING_Y)
     gap = 48
     content_w = node_w
     content_h = len(steps) * node_h + max(0, len(steps) - 1) * gap
@@ -395,14 +539,20 @@ def method_flow_layout(steps: list[str]) -> dict[str, Any]:
         "node_w": node_w,
         "node_h": node_h,
         "gap": gap,
+        "max_width": max_width,
         "positions": positions,
         "bbox": (x, top, x + content_w, top + content_h),
     }
 
 
-def vertical_block_layout(items: list[str]) -> dict[str, Any]:
+def vertical_block_layout(items: list[str], font_size: int = 23) -> dict[str, Any]:
     node_w = 430
-    node_h = 72
+    max_width = inner_width(node_w)
+    # 与流程图同一条规矩：盒子按真正排出来的行数长高，不写死
+    line_count = max(
+        (len(wrap_label(item, max_width, font_size=font_size)) for item in items), default=1
+    )
+    node_h = max(72, line_count * int(font_size * 1.25) + FLOW_PADDING_Y)
     gap = 52
     content_w = node_w
     content_h = len(items) * node_h + max(0, len(items) - 1) * gap
@@ -416,14 +566,19 @@ def vertical_block_layout(items: list[str]) -> dict[str, Any]:
         "height": height,
         "node_w": node_w,
         "node_h": node_h,
+        "max_width": max_width,
         "positions": positions,
         "bbox": (x, top, x + content_w, top + content_h),
     }
 
 
-def data_flow_layout(nodes: list[str]) -> dict[str, Any]:
+def data_flow_layout(nodes: list[str], font_size: int = 22) -> dict[str, Any]:
     node_w = 190
-    node_h = 78
+    max_width = inner_width(node_w)
+    line_count = max(
+        (len(wrap_label(node, max_width, font_size=font_size)) for node in nodes), default=1
+    )
+    node_h = max(78, line_count * int(font_size * 1.25) + FLOW_PADDING_Y)
     gap_x = 54
     gap_y = 64
     rows = 1 if len(nodes) <= 3 else 2
@@ -448,6 +603,7 @@ def data_flow_layout(nodes: list[str]) -> dict[str, Any]:
         "height": height,
         "node_w": node_w,
         "node_h": node_h,
+        "max_width": max_width,
         "positions": positions,
         "bbox": (left, top, left + content_w, top + content_h),
     }
@@ -494,8 +650,10 @@ def method_flow_svg(asset: dict[str, Any]) -> str:
     gap = layout["gap"]
     asset["validation"] = validate_canvas(width, height, layout["bbox"])
     parts = svg_header(width, height)
+    # 换行口径必须与算高时用的是同一个，否则算出来的盒子高度对不上真正排出来的行数
+    max_width = layout["max_width"]
     for index, (label, (x, y)) in enumerate(zip(steps, layout["positions"])):
-        parts.append(rect_node(x, y, node_w, node_h, label))
+        parts.append(rect_node(x, y, node_w, node_h, label, max_width=max_width))
         if index < len(steps) - 1:
             parts.append(arrow(width // 2, y + node_h + 6, width // 2, y + node_h + gap - 8))
     parts.append(svg_footer())
@@ -514,7 +672,7 @@ def system_block_svg(asset: dict[str, Any]) -> str:
     parts = svg_header(width, height)
     centers = []
     for (x, y), label in zip(layout["positions"], modules):
-        parts.append(rect_node(x, y, node_w, node_h, label, max_chars=10))
+        parts.append(rect_node(x, y, node_w, node_h, label, max_width=layout["max_width"]))
         centers.append((x + node_w // 2, y + node_h // 2))
     for index in range(len(centers) - 1):
         x1, y1 = centers[index]
@@ -537,7 +695,7 @@ def data_flow_svg(asset: dict[str, Any]) -> str:
     parts = svg_header(width, height)
     centers: list[tuple[int, int]] = []
     for label, (x, y) in zip(nodes, layout["positions"]):
-        parts.append(rect_node(x, y, node_w, node_h, label, max_chars=8))
+        parts.append(rect_node(x, y, node_w, node_h, label))
         centers.append((x + node_w // 2, y + node_h // 2))
     for source, target in data_flow_edges(nodes):
         parts.append(arrow(*box_arrow_points(centers[source], centers[target], node_w, node_h)))
@@ -578,8 +736,13 @@ def load_font(size: int):
     return ImageFont.load_default()
 
 
-def draw_center_text(draw: Any, x: int, y: int, label: str, font: Any, max_chars: int = 12) -> None:
-    lines = wrap_label(label, max_chars=max_chars)
+def draw_center_text(
+    draw: Any, x: int, y: int, label: str, font: Any, max_width: float = 260.0,
+    font_size: int = FLOW_FONT_SIZE,
+) -> None:
+    # 折行用与 SVG / 布局完全相同的估算，保证三者行数一致；
+    # 具体像素宽仍由 PIL 量，只用于水平居中
+    lines = wrap_label(label, max_width, font_size=font_size)
     metrics = []
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
@@ -598,10 +761,16 @@ def draw_rect_node(
     height: int,
     label: str,
     font: Any,
-    max_chars: int = 12,
+    max_width: float | None = None,
+    font_size: int = FLOW_FONT_SIZE,
 ) -> None:
+    if max_width is None:
+        max_width = inner_width(width)
     draw.rectangle((x, y, x + width, y + height), outline="black", width=2, fill="white")
-    draw_center_text(draw, x + width // 2, y + height // 2, label, font, max_chars=max_chars)
+    draw_center_text(
+        draw, x + width // 2, y + height // 2, label, font,
+        max_width=max_width, font_size=font_size,
+    )
 
 
 def draw_arrow(draw: Any, x1: int, y1: int, x2: int, y2: int) -> None:
@@ -660,9 +829,10 @@ def method_flow_png(asset: dict[str, Any], output: Path) -> None:
     node_h = layout["node_h"]
     gap = layout["gap"]
     image, draw = png_canvas(width, height)
-    body_font = load_font(24)
+    body_font = load_font(FLOW_FONT_SIZE)
+    max_width = layout["max_width"]
     for index, (label, (x, y)) in enumerate(zip(steps, layout["positions"])):
-        draw_rect_node(draw, x, y, node_w, node_h, label, body_font)
+        draw_rect_node(draw, x, y, node_w, node_h, label, body_font, max_width=max_width)
         if index < len(steps) - 1:
             draw_arrow(draw, width // 2, y + node_h + 6, width // 2, y + node_h + gap - 8)
     image.save(output)
@@ -680,7 +850,10 @@ def system_block_png(asset: dict[str, Any], output: Path) -> None:
     body_font = load_font(23)
     centers = []
     for (x, y), label in zip(layout["positions"], modules):
-        draw_rect_node(draw, x, y, node_w, node_h, label, body_font, max_chars=10)
+        draw_rect_node(
+            draw, x, y, node_w, node_h, label, body_font,
+            max_width=layout["max_width"], font_size=23,
+        )
         centers.append((x + node_w // 2, y + node_h // 2))
     for index in range(len(centers) - 1):
         x1, y1 = centers[index]
@@ -702,7 +875,10 @@ def data_flow_png(asset: dict[str, Any], output: Path) -> None:
     body_font = load_font(22)
     centers: list[tuple[int, int]] = []
     for label, (x, y) in zip(nodes, layout["positions"]):
-        draw_rect_node(draw, x, y, node_w, node_h, label, body_font, max_chars=8)
+        draw_rect_node(
+            draw, x, y, node_w, node_h, label, body_font,
+            max_width=layout["max_width"], font_size=22,
+        )
         centers.append((x + node_w // 2, y + node_h // 2))
     for source, target in data_flow_edges(nodes):
         draw_arrow(draw, *box_arrow_points(centers[source], centers[target], node_w, node_h))

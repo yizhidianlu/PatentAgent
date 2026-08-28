@@ -114,3 +114,31 @@ def test_work_json_is_not_reachable_through_the_image_endpoint(
     case_id, _, _ = case_with_real_figures
     r = client.get(f"{API}/cases/{case_id}/media", params={"path": "patent_content.json"})
     assert r.status_code == 404
+
+
+def test_media_path_is_written_back_and_is_directly_fetchable(
+    client: TestClient, case_with_real_figures
+) -> None:
+    """后端在确知文件位置时回写一条自解释的路径，网页端照着取就行。
+
+    `png_path` 是「相对附图工作目录的文件名」——只有知道那个约定的人才解释得了。
+    要显示这张图，网页端就得在另一侧再复刻一遍同样的约定；复刻出偏差的那一刻
+    图就不见了，而且**不报错**。所以在唯一确知真实位置的那一步把路径落下来。
+    """
+    from app.services import drawings as drawings_service
+
+    case_id, _, content = case_with_real_figures
+    # asset_files 会就地回写 media_path（落交付物时已 is_file() 验过）
+    drawings_service.asset_files(case_id, content)
+
+    assets = content["drawing_assets"]
+    assert assets, "样例应当出图"
+    for asset in assets:
+        media = asset.get("media_path")
+        assert media, f"图{asset.get('figure_no')} 没有回写 media_path"
+        assert not Path(media).is_absolute(), "回写的应是相对 DATA_DIR 的路径"
+        assert media.startswith("outputs/"), media
+
+        r = client.get(f"{API}/cases/{case_id}/media", params={"path": media})
+        assert r.status_code == 200, f"回写的路径必须能直接取到图：{media} → {r.text[:200]}"
+        assert r.headers["content-type"].startswith("image/")

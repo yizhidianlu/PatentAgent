@@ -328,6 +328,9 @@ export const zh = {
       export: '导出',
     },
     /** patent_content_json 交付物回填面板时的小节标题（JSON → Markdown）。 */
+    figureFailed: '附图未能显示',
+    figureFailedHint: '文件可能已被移动或删除；下载的 Word / PDF 里仍包含该图。',
+    figureNoCase: '当前页面缺少案件上下文，无法定位图片。',
     patentSections: {
       abstract: '摘要',
       claims: '权利要求书',
