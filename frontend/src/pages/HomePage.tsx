@@ -9,6 +9,9 @@ import { Composer, type ComposerHandle } from '../components/composer/Composer'
 import { ActivityPill } from '../components/home/ActivityPill'
 import { HeroGreeting } from '../components/home/HeroGreeting'
 import { ModuleToggle } from '../components/home/ModuleToggle'
+import { TierToggle } from '../components/composer/TierToggle'
+import { useModelTiers } from '../api/settings'
+import type { ModelTier } from '../api/sessions'
 import { FeatureChips, type ChipActionEvent } from '../components/home/FeatureChips'
 import {
   MODULE_META,
@@ -39,6 +42,11 @@ export function HomePage() {
   const createCase = useCreateCase()
 
   const [module, setModule] = useState<HomeModule>(readStoredModule)
+  // 档位默认跟随设置里的默认档；用户在首页改过之后，本次会话内保持他的选择
+  const tiersQuery = useModelTiers()
+  const [tierOverride, setTierOverride] = useState<ModelTier | null>(null)
+  const tier: ModelTier = tierOverride ?? tiersQuery.data?.default_tier ?? 'deep'
+  const setTier = useCallback((next: ModelTier) => setTierOverride(next), [])
   const [submitting, setSubmitting] = useState(false)
   const composerRef = useRef<ComposerHandle>(null)
   // 上传失败重试时复用已建案件，避免重复建案
@@ -72,6 +80,8 @@ export function HomePage() {
           const created = await createCase.mutateAsync({
             module: meta.backendModule,
             title: text ? text.slice(0, TITLE_MAX_CHARS) : undefined,
+            // 建案时就带上档位：省掉一次 PATCH，也少一个「PATCH 失败但案件已建」的中间态
+            model_tier: tier,
           })
           caseId = created.id
           pendingCaseIdRef.current = caseId
@@ -131,7 +141,7 @@ export function HomePage() {
         setSubmitting(false)
       }
     },
-    [createCase, meta, navigate, pushToast, submitting],
+    [createCase, meta, navigate, pushToast, submitting, tier],
   )
 
   // 参考站实测：胶囊 + logo/标题组同在拖放外壳内部（Composer header 插槽）
@@ -154,6 +164,7 @@ export function HomePage() {
         accent={meta.accent}
         header={heroHeader}
         toolbarLeft={<ModuleToggle value={module} onChange={changeModule} className="shrink-0" />}
+        toolbarRight={<TierToggle value={tier} onChange={setTier} />}
         placeholder={zh.home.placeholders[module]}
         onSend={(text, attachments) => void handleSend(text, attachments)}
         busy={submitting}

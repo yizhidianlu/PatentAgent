@@ -32,6 +32,8 @@ from ..models.settings import (
     LlmTestRequest,
     LlmTestResult,
     load_tolerant,
+    ModelTiersSettings,
+    ModelTiersOut,
 )
 from ..services import llm as llm_service
 from ..services import auth as auth_service
@@ -350,6 +352,55 @@ async def test_image_gen(
 # ---------------------------------------------------------------------------
 # General
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 模型档位（快速 / 深度思考）
+# ---------------------------------------------------------------------------
+
+def _load_model_tiers() -> ModelTiersSettings:
+    return load_tolerant(ModelTiersSettings, db.get_setting_json("model_tiers") or {})
+
+
+@router.get("/model-tiers", dependencies=[Depends(current_user)],
+            response_model=ModelTiersOut, summary="读取两档模型配置（含各档实际生效的模型名）")
+async def get_model_tiers() -> ModelTiersOut:
+    def op() -> ModelTiersOut:
+        tiers = _load_model_tiers()
+        base = load_tolerant(LlmSettings, db.get_setting_json("llm") or {})
+        # 把「实际会用哪个模型」一并回出去：档位留空时回落主配置，
+        # 界面若只显示用户填的空值，用户会以为这一档没生效
+        return ModelTiersOut(
+            fast=tiers.fast,
+            deep=tiers.deep,
+            default_tier=tiers.default_tier,
+            base_model=base.model,
+            effective={
+                "fast": tiers.fast.model.strip() or base.model,
+                "deep": tiers.deep.model.strip() or base.model,
+            },
+        )
+
+    return await db.arun(op)
+
+
+@router.put("/model-tiers", response_model=ModelTiersOut,
+            summary="保存两档模型配置（留空的字段沿用主配置）")
+async def put_model_tiers(
+    body: ModelTiersSettings,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> ModelTiersOut:
+    await db.arun(db.set_setting_json, "model_tiers", body.model_dump())
+    await db.arun(
+        _audit_settings, admin, request, "model_tiers",
+        {
+            "fast_model": body.fast.model,
+            "deep_model": body.deep.model,
+            "default_tier": body.default_tier,
+        },
+    )
+    return await get_model_tiers()
 
 @router.get("/general", dependencies=[Depends(current_user)], response_model=GeneralSettings, summary="读取通用设置")
 async def get_general() -> GeneralSettings:

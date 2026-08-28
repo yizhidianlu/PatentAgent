@@ -67,7 +67,8 @@ def test_case_create_and_list(client: TestClient) -> None:
 
     detail = client.get(f"/api/v1/cases/{case_id}")
     assert detail.status_code == 200
-    assert detail.json()["state"] == {}
+    # 新建案件的工作内存里只有模型档位（建案时定下，见 api/cases.create_case）
+    assert detail.json()["state"] == {"_model_tier": "deep"}
 
     assert client.get("/api/v1/cases/no-such-id").status_code == 404
 

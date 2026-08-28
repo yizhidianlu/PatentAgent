@@ -43,6 +43,8 @@ export interface ComposerProps {
    * sm 以下折行到输入框上方，避免窄屏挤压 +/发送按钮。
    */
   toolbarLeft?: ReactNode
+  /** 工具栏右侧、加号菜单之前的插槽（模型档位开关）。 */
+  toolbarRight?: ReactNode
   placeholder: string
   onSend: (text: string, attachments: ComposerAttachment[]) => void
   busy?: boolean
@@ -86,6 +88,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     accent = 'indigo',
     header,
     toolbarLeft,
+    toolbarRight,
     placeholder,
     onSend,
     busy = false,
@@ -298,14 +301,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           <>
             <div className="hidden sm:flex items-center min-w-0">{toolbarLeft}</div>
             <div className="flex items-center gap-2 ml-auto shrink-0">
+              {toolbarRight}
               {plusMenu}
               {sendButton}
             </div>
           </>
         ) : (
           <>
-            {plusMenu}
-            {sendButton}
+            {toolbarRight}
+            <div className="flex items-center gap-2 ml-auto shrink-0">
+              {plusMenu}
+              {sendButton}
+            </div>
           </>
         )}
       </div>

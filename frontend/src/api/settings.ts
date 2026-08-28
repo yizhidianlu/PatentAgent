@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../lib/api'
 import { zh } from '../i18n/zh'
 import { useUiStore } from '../stores/uiStore'
+import type { ModelTier } from './sessions'
 
 /**
  * 设置页 react-query hooks（backend-architecture.md §3.1 settings）：
@@ -29,6 +30,39 @@ export interface LlmSettings {
   max_output_tokens: number
   context_window: number
   supports_json_mode: boolean
+}
+
+/** 一档模型：留空的字段沿用主配置（`settings.llm`）。 */
+export interface LlmTierSettings {
+  model: string
+  label: string
+  temperature: number | null
+  max_output_tokens: number | null
+  context_window: number | null
+  supports_json_mode: boolean | null
+}
+
+export interface ModelTiersSettings {
+  fast: LlmTierSettings
+  deep: LlmTierSettings
+  default_tier: ModelTier
+}
+
+/** GET/PUT /settings/model-tiers 的响应：比请求体多「实际生效的模型名」。 */
+export interface ModelTiersOut extends ModelTiersSettings {
+  base_model: string
+  effective: Record<string, string>
+}
+
+export function emptyTier(): LlmTierSettings {
+  return {
+    model: '',
+    label: '',
+    temperature: null,
+    max_output_tokens: null,
+    context_window: null,
+    supports_json_mode: null,
+  }
 }
 
 /** 从服务商 /v1/models 探测到的模型规格（探测不到的字段为 null）。 */
@@ -162,6 +196,7 @@ export const settingsKeys = {
   llm: ['settings', 'llm'] as const,
   embedding: ['settings', 'embedding'] as const,
   imageGen: ['settings', 'image-gen'] as const,
+  modelTiers: ['settings', 'model-tiers'] as const,
   systemEnv: ['system', 'env'] as const,
 }
 
@@ -201,6 +236,36 @@ export function useTestLlm() {
   return useMutation({
     mutationFn: (payload: LlmTestPayload) => api.post<LlmTestResult>('/settings/llm/test', payload),
     onError: (error) => toastError(error, zh.settings.model.testFailed),
+  })
+}
+
+
+// ---------------------------------------------------------------------------
+// 模型档位（快速 / 深度思考）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读两档配置。**普通用户也能读**——聊天框上的档位开关要知道有哪些档、各是什么模型。
+ * 只有写需要管理员。
+ */
+export function useModelTiers() {
+  return useQuery({
+    queryKey: settingsKeys.modelTiers,
+    queryFn: () => api.get<ModelTiersOut>('/settings/model-tiers'),
+    ...SETTINGS_QUERY_OPTIONS,
+  })
+}
+
+export function useUpdateModelTiers() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: ModelTiersSettings) =>
+      api.put<ModelTiersOut>('/settings/model-tiers', payload),
+    onSuccess: (data) => {
+      queryClient.setQueryData(settingsKeys.modelTiers, data)
+      toastSuccess(zh.settings.common.saved)
+    },
+    onError: (error) => toastError(error, zh.settings.common.saveFailed),
   })
 }
 

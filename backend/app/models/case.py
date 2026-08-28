@@ -29,15 +29,20 @@ class CaseCreate(BaseModel):
     module: Module
     title: str | None = Field(default=None, description="案件标题，缺省为「未命名案件」")
     patent_type: PatentType | None = None
+    #: 模型档位（fast / deep）。不给则用设置里的默认档位。
+    model_tier: Literal["fast", "deep"] | None = None
 
 
 class CaseUpdate(BaseModel):
-    """PATCH /cases/{id} 请求体：改名 / 归档 / 联系人 / 专利类型。"""
+    """PATCH /cases/{id} 请求体：改名 / 归档 / 联系人 / 专利类型 / 模型档位。"""
 
     title: str | None = None
     status: Literal["draft", "archived"] | None = None
     patent_type: PatentType | None = None
     contact: Contact | None = None
+    #: 模型档位（fast / deep）。写进 state_json 的 `_model_tier`，
+    #: 下一次启动 / 续跑流水线时生效；不改已经跑完的步骤。
+    model_tier: Literal["fast", "deep"] | None = None
 
 
 class CaseOut(BaseModel):

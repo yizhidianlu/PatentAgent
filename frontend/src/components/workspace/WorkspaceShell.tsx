@@ -48,6 +48,8 @@ import {
 } from '../pipeline/StepProgress'
 import { LiveProgress } from '../pipeline/LiveProgress'
 import { CrossUserBanner } from './CrossUserBanner'
+import { TierToggle } from '../composer/TierToggle'
+import { useSetCaseModelTier, type ModelTier } from '../../api/sessions'
 import type { InteractionRequiredEvent } from '../../types/stream'
 import type { PipelineStepState } from '../../stores/sessionStore'
 
@@ -163,6 +165,48 @@ export function WorkspaceShell({
   const [panelCollapsed, setPanelCollapsed] = useState(false)
   const [showFab, setShowFab] = useState(false)
   const [busyStageId, setBusyStageId] = useState<string | null>(null)
+
+  // --- 模型档位 -------------------------------------------------------------
+  const setTier = useSetCaseModelTier()
+  /*
+   * 乐观值：点下去先动，服务端确认后再交回服务端状态。
+   * 纯受控（只认 detailQuery）的话，从点击到 refetch 回来这段时间开关一动不动，
+   * 用起来像没点上——而这个开关恰恰是「点一下看它动一下」才成立的控件。
+   * 失败时清掉乐观值，开关自己弹回真实档位，同时弹错误提示。
+   */
+  const [tierOptimistic, setTierOptimistic] = useState<ModelTier | null>(null)
+  const serverTier: ModelTier =
+    (detailQuery.data?.state?.['_model_tier'] as ModelTier | undefined) ?? 'deep'
+  const caseTier: ModelTier = tierOptimistic ?? serverTier
+
+  // 服务端追上来之后放开乐观值，之后一切以服务端为准
+  useEffect(() => {
+    if (tierOptimistic !== null && serverTier === tierOptimistic) setTierOptimistic(null)
+  }, [serverTier, tierOptimistic])
+
+  const handleTierChange = useCallback(
+    (next: ModelTier) => {
+      if (!caseId || next === caseTier) return
+      setTierOptimistic(next)
+      setTier.mutate(
+        { id: caseId, tier: next },
+        {
+          onSuccess: () => {
+            // 说清「只影响之后的步骤」——不说的话，用户会以为切一下就能让上一步重来
+            pushToast(
+              'success',
+              `${zh.tier.switched(next === 'fast' ? zh.tier.fast : zh.tier.deep)}　${zh.tier.appliesNext}`,
+            )
+          },
+          onError: () => {
+            setTierOptimistic(null)
+            pushToast('error', zh.tier.switchFailed)
+          },
+        },
+      )
+    },
+    [caseId, caseTier, setTier, pushToast],
+  )
 
   const seededRef = useRef(false)
   const hydratedRef = useRef(false)
@@ -669,6 +713,13 @@ export function WorkspaceShell({
           busy={running}
           onStop={handleStop}
           onSend={handleSend}
+          toolbarRight={
+            <TierToggle
+              value={caseTier}
+              onChange={handleTierChange}
+              busy={setTier.isPending}
+            />
+          }
         />
       </div>
 

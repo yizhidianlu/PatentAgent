@@ -1,5 +1,6 @@
 import { useMemo, useState, type ComponentType, type SVGProps } from 'react'
 import {
+  BoltIcon,
   CircleStackIcon,
   CpuChipIcon,
   KeyIcon,
@@ -11,12 +12,13 @@ import { cn } from '../lib/cn'
 import { zh } from '../i18n/zh'
 import { useIsAdmin } from '../stores/authStore'
 import { ModelSection } from './settings/ModelSection'
+import { TiersSection } from './settings/TiersSection'
 import { EmbeddingSection } from './settings/EmbeddingSection'
 import { ImageGenSection } from './settings/ImageGenSection'
 import { AppearanceSection } from './settings/AppearanceSection'
 import { PasswordSection } from './settings/PasswordSection'
 
-type SectionKey = 'model' | 'embedding' | 'imageGen' | 'appearance' | 'password'
+type SectionKey = 'model' | 'tiers' | 'embedding' | 'imageGen' | 'appearance' | 'password'
 
 interface SectionDef {
   key: SectionKey
@@ -29,6 +31,7 @@ interface SectionDef {
 /** 平台级三节（模型 / 向量 / 图像）——后端已把它们收紧为 require_admin。 */
 const PLATFORM_SECTIONS: SectionDef[] = [
   { key: 'model', label: zh.settings.nav.model, Icon: CpuChipIcon, platform: true },
+  { key: 'tiers', label: zh.settings.nav.tiers, Icon: BoltIcon, platform: true },
   { key: 'embedding', label: zh.settings.nav.embedding, Icon: CircleStackIcon, platform: true },
   { key: 'imageGen', label: zh.settings.nav.imageGen, Icon: PhotoIcon, platform: true },
 ]
@@ -141,6 +144,7 @@ export function SettingsPage() {
         <div className="max-w-2xl space-y-6 px-4 sm:px-8 py-6">
           {activeDef?.platform && <PlatformNotice />}
           {active === 'model' && <ModelSection />}
+          {active === 'tiers' && <TiersSection />}
           {active === 'embedding' && <EmbeddingSection />}
           {active === 'imageGen' && <ImageGenSection />}
           {active === 'appearance' && <AppearanceSection />}

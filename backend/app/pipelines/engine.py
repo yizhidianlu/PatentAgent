@@ -408,6 +408,10 @@ async def run_pipeline(
         if start_payload is not None:
             state["_start_payload"] = start_payload
         state["_run_group"] = run_group
+        # 档位在任务开头设一次，整棵调用树自动继承（见 services/llm 的说明）。
+        # 放在这里而不是各步骤里：漏一处就会出现「个别步骤悄悄用了别的模型」，
+        # 那是最难发现的一类不一致。
+        llm.set_active_tier(state.get("_model_tier"))
         # 步骤元信息存 case（state 端点无需内存任务即可拼装步骤表）
         state["_steps"] = [
             {"key": s.key, "name_zh": s.name_zh, "gate": s.gate, "retryable": s.retryable}

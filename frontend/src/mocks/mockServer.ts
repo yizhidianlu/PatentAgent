@@ -368,6 +368,9 @@ function makeMockUser(
   }
 }
 
+/** 案件 → 模型档位（mock 内存态：换档后详情接口要能回出新值，否则开关会弹回去）。 */
+const mockCaseTiers: Record<string, 'fast' | 'deep'> = {}
+
 let mockUsers: UserOut[] = [
   makeMockUser('u-admin', 'admin', '平台管理员', 'admin', {
     last_login_at: new Date(Date.now() - 3_600_000).toISOString(),
@@ -900,6 +903,31 @@ export function installMockApi(): () => void {
       }
       if (method === 'GET' || method === 'PUT') return jsonResponse(llm, 200)
     }
+    if (path.endsWith(`${API_BASE}/settings/model-tiers`)) {
+      // 两档指向不同模型，聊天框上的档位开关才会渲染（同模型时它会自己隐藏）
+      const tiers = {
+        fast: {
+          model: 'deepseek-chat',
+          label: '',
+          temperature: null,
+          max_output_tokens: null,
+          context_window: null,
+          supports_json_mode: null,
+        },
+        deep: {
+          model: 'deepseek-reasoner',
+          label: '',
+          temperature: null,
+          max_output_tokens: 32768,
+          context_window: null,
+          supports_json_mode: null,
+        },
+        default_tier: 'deep',
+        base_model: 'deepseek-chat',
+        effective: { fast: 'deepseek-chat', deep: 'deepseek-reasoner' },
+      }
+      if (method === 'GET' || method === 'PUT') return jsonResponse(tiers, 200)
+    }
     if (path.endsWith(`${API_BASE}/settings/embedding`)) {
       const embedding = {
         enabled: true,
@@ -970,8 +998,12 @@ export function installMockApi(): () => void {
         mockCases = mockCases.filter((c) => c.id !== caseId)
         return new Response(null, { status: 204 })
       }
-      const body = (await readJsonBody(input, init)) as { title?: string } | null
+      const body = (await readJsonBody(input, init)) as {
+        title?: string
+        model_tier?: 'fast' | 'deep'
+      } | null
       const current = mockCases[index] ?? mockCase(guessModule(caseId), null, caseId)
+      if (body?.model_tier) mockCaseTiers[caseId] = body.model_tier
       const next: Case = {
         ...current,
         title: (body?.title ?? current.title).trim() || current.title,
@@ -989,7 +1021,7 @@ export function installMockApi(): () => void {
       }
       const detail: CaseDetail = {
         ...(known ?? mockCase(guessModule(caseId), null, caseId)),
-        state: {},
+        state: { _model_tier: mockCaseTiers[caseId] ?? 'deep' },
         artifacts_latest: [],
         user_id: owner,
         owner_username: mockUsers.find((u) => u.id === owner)?.username ?? null,

@@ -21,6 +21,7 @@ from ..models.artifact import ArtifactOut
 from ..models.case import CaseCreate, CaseDetail, CaseOut, CaseUpdate, MessageOut
 from ..models.common import Ok, Page
 from ..services import auth as auth_service
+from ..services import llm as llm_service
 from .deps import client_ip, current_user, is_admin, resolve_case_sync
 
 router = APIRouter(tags=["案件"])
@@ -124,13 +125,18 @@ async def create_case(
     title = (body.title or "").strip() or "未命名案件"
 
     def op() -> sqlite3.Row:
+        # 档位：请求给了就用，没给就取设置里的默认档位。
+        # 建案时就定下来，是为了让「首页选好档位再开跑」这条路不需要额外一次 PATCH——
+        # 少一次往返，也少一个「PATCH 失败但案件已建」的中间态。
+        tier = body.model_tier or llm_service.load_model_tiers().default_tier
+        state = json.dumps({"_model_tier": tier}, ensure_ascii=False)
         db.execute(
             """
             INSERT INTO cases(id, module, title, patent_type, status, state_json,
                               user_id, created_at, updated_at)
-            VALUES (?,?,?,?,'draft','{}',?,?,?)
+            VALUES (?,?,?,?,'draft',?,?,?,?)
             """,
-            (case_id, body.module, title, body.patent_type, user["id"], now, now),
+            (case_id, body.module, title, body.patent_type, state, user["id"], now, now),
         )
         # 属主刚由本请求写入，直接回读即可
         return db.query_one("SELECT * FROM cases WHERE id=?", (case_id,))
@@ -196,6 +202,15 @@ async def update_case(
         if body.contact is not None:
             sets.append("contact_json=?")
             params.append(json.dumps(body.contact.model_dump(), ensure_ascii=False))
+        if body.model_tier is not None:
+            # 档位存进 state_json：它是流水线的运行参数，与 _run_group / _steps 同类，
+            # 不值得为它加一列（也就不必为它做一次迁移）。
+            state = _parse_json(db.query_one(
+                "SELECT state_json FROM cases WHERE id=?", (case_id,)
+            )["state_json"]) or {}
+            state["_model_tier"] = body.model_tier
+            sets.append("state_json=?")
+            params.append(json.dumps(state, ensure_ascii=False))
         if sets:
             sets.append("updated_at=?")
             params.append(db.now_str())

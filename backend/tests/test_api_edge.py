@@ -1202,7 +1202,8 @@ def test_openapi_exposes_every_operation_with_a_summary(client: TestClient) -> N
     # 79 = 77 + 技能库的 2 个：GET /skills、PUT /skills/{key}
     # 80 = 79 + 解锁账号（POST /admin/users/{id}/unlock）
     # 81 = 80 + 案件媒体（GET /cases/{id}/media：网页端内联显示正文里的图）
-    assert len(operations) == 81, f"端点数变了：{len(operations)}"
+    # 83 = 81 + 模型档位（GET/PUT /settings/model-tiers：快速 / 深度思考两档）
+    assert len(operations) == 83, f"端点数变了：{len(operations)}"
     assert not [f"{m.upper()} {p}" for p, m, op in operations if not op.get("summary")]
 
 

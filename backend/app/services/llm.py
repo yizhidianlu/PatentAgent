@@ -17,6 +17,7 @@ import random
 import re
 import base64
 import time
+from contextvars import ContextVar
 from typing import Any, AsyncIterator, Awaitable, Callable, TypeVar
 
 import httpx
@@ -30,8 +31,10 @@ from ..models.settings import (
     EmbeddingTestResult,
     ImageGenSettings,
     ImageGenTestResult,
+    MODEL_TIERS,
     LlmSettings,
     LlmTestResult,
+    ModelTiersSettings,
     ModelCapability,
     load_tolerant,
 )
@@ -89,10 +92,59 @@ async def _notify(
         logger.debug("进度事件发送失败 case=%s", case_id, exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# 模型档位（快速 / 深度思考）
+# ---------------------------------------------------------------------------
+#
+# 档位是**每次运行**的选择，而流水线是一棵很深的调用树：引擎 → 步骤 handler →
+# 各个 build/assemble 服务 → llm.chat/structured。把档位当参数一路传下去，
+# 要改几十个函数签名，而且只要漏掉一处，那一次调用就会静悄悄地用回默认模型——
+# 「大部分步骤用了快速档、个别步骤没有」是最难发现的一类不一致。
+#
+# 所以用 contextvar：引擎在任务开头设一次，整棵调用树自动继承（asyncio 任务
+# 天然携带上下文），漏不掉，也不影响并发——每个案件的任务各有各的上下文。
+
+_active_tier: ContextVar[str | None] = ContextVar("llm_active_tier", default=None)
+
+
+def set_active_tier(tier: str | None) -> None:
+    """设定当前上下文的模型档位（None = 用主配置）。"""
+    _active_tier.set(tier if tier in MODEL_TIERS else None)
+
+
+def active_tier() -> str | None:
+    return _active_tier.get()
+
+
+def load_model_tiers() -> ModelTiersSettings:
+    """读两档模型配置。"""
+    return load_tolerant(ModelTiersSettings, db.get_setting_json("model_tiers") or {})
+
+
+def resolve_tier_model(tier: str | None) -> str:
+    """该档位实际会用的模型名（未配置则回落主配置）；供界面显示与日志。"""
+    cfg = load_tolerant(LlmSettings, db.get_setting_json("llm") or {})
+    profile = load_model_tiers().get(tier)
+    if profile is not None and profile.configured:
+        return profile.model.strip()
+    return cfg.model
+
+
 def load_llm_settings(override: dict[str, Any] | None = None) -> LlmSettings:
-    """从 DB 读 LLM 配置并合并临时覆盖（override 中的 None/空 api_key 不生效）。"""
+    """从 DB 读 LLM 配置，叠加当前档位，再合并临时覆盖。
+
+    次序是有意的：**显式 override 永远压过档位**。
+    连接测试、诊断这类调用带着明确的目标模型，不该被某个还留在上下文里的档位改掉。
+    """
     stored = db.get_setting_json("llm") or {}
     cfg = load_tolerant(LlmSettings, stored)
+
+    profile = load_model_tiers().get(_active_tier.get())
+    if profile is not None:
+        patch = profile.overlay()
+        if patch:
+            cfg = cfg.model_copy(update=patch)
+
     if override:
         patch = {k: v for k, v in override.items() if v is not None}
         if not patch.get("api_key"):

@@ -10,6 +10,9 @@ export type Module = 'disclosure' | 'paper2patent' | 'reader' | 'oa'
 
 export type PatentType = 'invention' | 'utility_model' | 'design'
 
+/** 模型档位：快速 / 深度思考。 */
+export type ModelTier = 'fast' | 'deep'
+
 export type CaseStatus =
   | 'draft'
   | 'running'
@@ -49,6 +52,8 @@ export interface CaseCreatePayload {
   module: Module
   title?: string
   patent_type?: PatentType
+  /** 模型档位；不给则用设置里的默认档位。建案时带上可省掉一次 PATCH。 */
+  model_tier?: ModelTier
 }
 
 /** react-query key 约定：['cases', module | 'all']。 */
@@ -85,6 +90,24 @@ export function useRenameCase() {
       api.patch<CaseOut>(`/cases/${encodeURIComponent(id)}`, { title }),
     onSuccess: (data) => {
       void queryClient.invalidateQueries({ queryKey: caseKeys.all })
+      if (data?.id) void queryClient.invalidateQueries({ queryKey: ['case', data.id] })
+    },
+  })
+}
+
+/**
+ * PATCH /cases/{id} 换模型档位。
+ *
+ * 只影响**之后**的步骤：已经跑完的不会重跑，正在跑的那一步也不受影响
+ * （档位在流水线任务开头取一次）。这点必须在界面上说清楚，
+ * 否则用户会以为切一下就能让上一步用新模型重来。
+ */
+export function useSetCaseModelTier() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, tier }: { id: string; tier: ModelTier }) =>
+      api.patch<CaseOut>(`/cases/${encodeURIComponent(id)}`, { model_tier: tier }),
+    onSuccess: (data) => {
       if (data?.id) void queryClient.invalidateQueries({ queryKey: ['case', data.id] })
     },
   })

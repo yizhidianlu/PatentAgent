@@ -426,6 +426,22 @@ export const zh = {
     },
   },
 
+  /** 模型档位（快速 / 深度思考）。 */
+  tier: {
+    label: '模型档位',
+    fast: '快速',
+    deep: '深度思考',
+    fastHint: '响应更快，适合材料整理、初稿与迭代修改',
+    deepHint: '思考更充分，适合权利要求撰写、审查意见答复等要紧的一步',
+    usingModel: (name: string) => `模型：${name}`,
+    notConfigured: '未单独配置，使用默认模型',
+    switched: (name: string) => `已切换到「${name}」`,
+    switchFailed: '切换档位失败，请稍后再试',
+    appliesNext:
+      '换档只影响之后的步骤：已经跑完的不会重跑，正在跑的那一步也不受影响。',
+    adminOnly: '两档模型由管理员在设置中配置',
+  },
+
   upload: {
     dropzoneTitle: '点击或拖放文件到此处',
     dropzoneHintDefault: '支持 PDF / Word / PPT / 图片等格式',
@@ -859,6 +875,7 @@ export const zh = {
     subtitle: '模型服务、向量检索、图像生成与外观偏好',
     nav: {
       model: '模型服务',
+      tiers: '模型档位',
       embedding: '向量与检索',
       imageGen: '图像生成',
       appearance: '外观',
@@ -883,6 +900,25 @@ export const zh = {
       latency: (ms: number) => `${ms}ms`,
       notConfigured: '尚未配置',
     },
+    tiers: {
+      title: '模型档位',
+      desc: '给「快速」和「深度思考」各指定一个模型。用户可在聊天框上随时切换。',
+      fastTitle: '快速档',
+      deepTitle: '深度思考档',
+      modelLabel: '模型名称',
+      modelPlaceholder: '留空则沿用上方「模型服务」的模型',
+      labelLabel: '显示名称（可选）',
+      labelPlaceholder: '留空用默认文案',
+      maxOutputLabel: '最大输出 tokens（可选）',
+      inheritPlaceholder: '留空沿用主配置',
+      defaultTier: '新建案件的默认档位',
+      effective: (name: string) => `实际使用：${name}`,
+      sameModelWarning:
+        '两档当前指向同一个模型，聊天框上的档位开关不会显示——一个按下去没有任何区别的开关，比不给更糟。',
+      onlyModelHint:
+        '档位只换模型与生成参数，服务地址与密钥沿用上方「模型服务」。需要跨供应商分档请联系维护者。',
+    },
+
     model: {
       title: '模型服务',
       desc: '用于全部文本生成步骤的 OpenAI 兼容 Chat 接口。',
