@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from urllib.parse import unquote
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -76,24 +77,42 @@ def resolve_media_path(case_id: str, raw: str) -> Path | None:
     elif text.lower().startswith("file://"):
         text = text[7:]
 
+    # 兜底认一次「多编码了一层」的路径。
+    #
+    # markdown 的链接目标按 CommonMark 要做 URL 规范化，`patent_图1.png` 到了渲染器
+    # 手里已经是 `patent_%E5%9B%BE1.png`；调用方若再编码一次，我们收到的就是
+    # 一个字面上带 `%E5%9B%BE` 的文件名，于是**文件名带汉字的图全部 404**。
+    # 前端已经修好，这里再兜一层：任何调用方多编码一次都不至于让图消失。
+    #
+    # 不放松边界：解出来的路径照样要过下面的包含判定，`%2e%2e%2f` 这类照样被挡。
+    candidates_text = [text]
+    if "%" in text:
+        try:
+            decoded = unquote(text)
+        except (UnicodeDecodeError, ValueError):
+            decoded = ""
+        if decoded and decoded != text:
+            candidates_text.append(decoded)
+
     roots = _case_roots(case_id)
-    candidate = Path(text)
     tries: list[Path] = []
-    if candidate.is_absolute():
-        tries.append(candidate)
-        # 从别的机器/别的目录恢复过来的库，正文里留的是源机器的绝对路径。
-        # 交给 paths 按数据目录锚点重定位——包含判定在后面照做，边界不受影响。
-        relocated = paths_service.resolve(text)
-        if relocated is not None:
-            tries.append(relocated)
-    else:
-        for root in roots:
-            tries.append(root / candidate)
-            tries.append(root / "p2p_work" / candidate)
-        # 也认「相对 DATA_DIR」的形态：`outputs/<case>/图1.png` 正是
-        # artifacts.stored_path 现在的存储形态，把它直接递过来是很自然的写法。
-        # 放行它不放松边界——下面的包含判定照做，别的案件的路径照样进不来。
-        tries.append(paths_service.data_dir() / candidate)
+    for item_text in candidates_text:
+        candidate = Path(item_text)
+        if candidate.is_absolute():
+            tries.append(candidate)
+            # 从别的机器/别的目录恢复过来的库，正文里留的是源机器的绝对路径。
+            # 交给 paths 按数据目录锚点重定位——包含判定在后面照做，边界不受影响。
+            relocated = paths_service.resolve(item_text)
+            if relocated is not None:
+                tries.append(relocated)
+        else:
+            for root in roots:
+                tries.append(root / candidate)
+                tries.append(root / "p2p_work" / candidate)
+            # 也认「相对 DATA_DIR」的形态：`outputs/<case>/图1.png` 正是
+            # artifacts.stored_path 现在的存储形态，把它直接递过来是很自然的写法。
+            # 放行它不放松边界——下面的包含判定照做，别的案件的路径照样进不来。
+            tries.append(paths_service.data_dir() / candidate)
 
     for item in tries:
         try:

@@ -177,3 +177,38 @@ def test_another_cases_data_dir_relative_path_is_refused(
         f"{API}/cases/{case_id}/media", params={"path": f"outputs/{other_id}/secret.png"}
     )
     assert r.status_code == 404, "跨案件取图必须被包含判定挡住"
+
+
+def test_double_encoded_path_still_resolves(client: TestClient, case_with_figure) -> None:
+    """多编码一层的路径也要认。
+
+    这是生产上「右侧一张图都不显示」的真正成因：markdown 按 CommonMark 把链接目标
+    做了 URL 规范化，`patent_图1.png` 到渲染器手里已经是 `patent_%E5%9B%BE1.png`；
+    前端再编码一次，服务端解一次只得到那个字面名字 —— **文件名带汉字的图全 404**。
+    附图文件名清一色是「patent_图N.png」，所以现象是一张都不显示。
+
+    前端已经改成先解一次再编码；这里是服务端的兜底，任何调用方多编一层都不该让图消失。
+    """
+    case_id, png = case_with_figure
+    from urllib.parse import quote
+
+    once = quote(png.name)                    # markdown 规范化后的形态
+    assert once != png.name, "用例前提：文件名含非 ASCII"
+
+    r = client.get(f"{API}/cases/{case_id}/media", params={"path": once})
+    assert r.status_code == 200, f"多编码一层的路径应当仍能取到：{once} → {r.text[:200]}"
+    assert r.content == PNG_BYTES
+
+
+def test_double_encoding_does_not_open_a_traversal_hole(
+    client: TestClient, case_with_figure
+) -> None:
+    """认得更多不等于放得更松：编码过的 `../` 照样被包含判定挡住。"""
+    case_id, _ = case_with_figure
+    cfg = get_config()
+    (cfg.data_dir / "encoded_outsider.png").write_bytes(PNG_BYTES)
+
+    for probe in ("%2e%2e%2f%2e%2e%2fencoded_outsider.png",
+                  "..%2f..%2f..%2fencoded_outsider.png"):
+        r = client.get(f"{API}/cases/{case_id}/media", params={"path": probe})
+        assert r.status_code == 404, f"{probe} 不该被放行"
