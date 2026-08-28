@@ -293,6 +293,31 @@ def _note_reasoning(model: str) -> bool:
     return True
 
 
+def _chat_needs_stream(model: str) -> bool:
+    """该模型的非流式 chat 是否已被判定不可用（长静默期连接会被掐）。"""
+    _load_quirks_once()
+    quirks = _MODEL_QUIRKS.get(model) or {}
+    return bool(quirks.get("reasoning") or quirks.get("stream_chat"))
+
+
+def _note_stream_chat(model: str) -> bool:
+    """标记该模型的 chat 必须走缓冲流式；返回 True 表示这是**新**结论。
+
+    触发条件是非流式调用撞上连接类故障——它不证明模型是推理型（也可能只是
+    一次网络抖动），所以单独一个 quirk，不顺手打 reasoning 标（那会连带改
+    token 预算，属于没有证据的推断）。误标的代价 ≈ 0：缓冲流式对任何模型都
+    等价可用，而且更抗掐。真正的推理型标记仍由流式响应里的思维链分片给出。
+    """
+    _load_quirks_once()
+    quirks = _MODEL_QUIRKS.setdefault(model, {})
+    if quirks.get("stream_chat"):
+        return False
+    quirks["stream_chat"] = True
+    logger.info("模型 %s 的非流式调用被连接故障打断，此后 chat 一律走缓冲流式", model)
+    _persist_quirks()
+    return True
+
+
 def _escalate_reasoning_budget(model: str) -> bool:
     """思维链仍把预算吃光时把预算下限拉到上限档；返回 True 表示确实抬高了。"""
     quirks = _MODEL_QUIRKS.setdefault(model, {})
@@ -459,13 +484,21 @@ async def _with_rate_limit_retry(
     what: str,
     case_id: str | None = None,
     step_key: str | None = None,
+    transient_budget: int = RATE_LIMIT_MAX_RETRY,
 ) -> Any:
     """执行请求；遇限流则退避重试，其余异常原样抛出。
 
     退避期间向案件事件流发一条 log —— 否则前端只有一个转圈的步骤卡，用户看到的是
     「点了没反应」，而实际上系统正在按服务端要求等待配额窗口。
+
+    `transient_budget`：连接类瞬时故障的独立重试预算。限流重试永远值得等
+    （等的是配额窗口），但**同样的连接故障重试第 N 次不会有不同结果**——
+    当失败源于「非流式请求在长静默期被掐」时，每次重试都注定重蹈覆辙，
+    8 次 × 递增退避 ≈ 十几分钟的必败等待。调用方若有备用通道（如改走流式），
+    应设小预算尽快拿回控制权。
     """
     last: Exception | None = None
+    transient_used = 0
     for attempt in range(RATE_LIMIT_MAX_RETRY):
         try:
             return await factory()
@@ -476,6 +509,10 @@ async def _with_rate_limit_retry(
             if attempt == RATE_LIMIT_MAX_RETRY - 1:
                 break
             limited = _is_rate_limited(exc)
+            if not limited:
+                transient_used += 1
+                if transient_used >= transient_budget:
+                    raise
             delay = _retry_delay(exc, attempt)
             reason = "触发限流" if limited else "连接中断"
             logger.warning(
@@ -594,13 +631,15 @@ async def chat(
 ) -> str:
     """非流式 chat：返回完整回复文本；调用记账进 llm_calls 并计入用户配额。
 
-    推理型模型例外：改走流式再缓冲成整段。原因是这类模型一次调用要思考几分钟，
-    非流式请求期间连接上一个字节都不流动，中间网络设备会把这种空闲连接掐掉
-    （实测报 APIConnectionError）；流式下思维链分片持续到达，连接始终活跃。
+    推理型 / 已标记 stream_chat 的模型例外：改走流式再缓冲成整段。原因是这类模型
+    一次调用要思考几分钟，非流式请求期间连接上一个字节都不流动，中间网络设备会把
+    这种空闲连接掐掉（实测报 APIConnectionError）；流式下思维链分片持续到达，
+    连接始终活跃。未标记的模型首次撞上连接类故障时就地改走流式并记住该结论
+    （见 except 分支）——不能等「学会它是推理型」，那需要一次永远等不到的成功响应。
     """
     cfg = load_llm_settings(override)
     _require_configured(cfg)
-    if _is_reasoning_model(cfg.model):
+    if _chat_needs_stream(cfg.model):
         parts: list[str] = []
         async for piece in chat_stream(
             messages,
@@ -628,15 +667,20 @@ async def chat(
             return await client.chat.completions.create(**_build())
 
         async def _send_learning() -> Any:
+            # transient_budget=1：连接类故障在非流式路径上重试没有意义
+            # （失败源于长静默连接被掐时，重试注定重蹈覆辙），
+            # 第一次撞上就交还控制权，由下方 except 改走流式通道
             try:
                 return await _with_rate_limit_retry(
-                    _send, what=f"chat({cfg.model})", case_id=case_id, step_key=step_key
+                    _send, what=f"chat({cfg.model})", case_id=case_id, step_key=step_key,
+                    transient_budget=1,
                 )
             except Exception as exc:  # noqa: BLE001 —— 仅在学到参数 quirk 时重试一次
                 if not _learn_quirk(cfg.model, exc):
                     raise
                 return await _with_rate_limit_retry(
-                    _send, what=f"chat({cfg.model})", case_id=case_id, step_key=step_key
+                    _send, what=f"chat({cfg.model})", case_id=case_id, step_key=step_key,
+                    transient_budget=1,
                 )
 
         # 推理型模型的思维链与正文共享预算：正文空 + finish_reason=length 时
@@ -679,6 +723,29 @@ async def chat(
             duration_ms=duration, status="error", error=str(exc)[:2000],
             user_id=user_id,
         )
+        # 从失败本身学习，解开一个死锁：
+        # 思维链模型的非流式请求在长静默期零字节流动，会被中间设备当空闲连接掐掉
+        # ——解药（缓冲流式）早已存在，但通往解药的判断 `_is_reasoning_model()`
+        # 需要一次成功响应，而连接总在响应之前死掉，于是「学会走流式」永远等不到
+        # 它的前置条件。所以连接类故障本身就是证据：首次撞上就标记 stream_chat
+        # 并立刻改走流式重试；流式下思维链分片持续到达，连接不再空闲。
+        # 若这确实是推理型模型，流式响应里的思维链会让 reasoning 标记随后自然补上。
+        if _is_transient(exc) and _note_stream_chat(cfg.model):
+            await _notify(
+                case_id,
+                f"检测到 {cfg.model} 的请求在长时间无响应后被掐断，"
+                "已改用流式通道重试（此结论会被记住，下次直接走流式）……",
+                step_key=step_key,
+            )
+            parts: list[str] = []
+            async for piece in chat_stream(
+                messages,
+                case_id=case_id, step_key=step_key,
+                temperature=temperature, max_output_tokens=max_output_tokens,
+                override=override, response_format=response_format, user_id=user_id,
+            ):
+                parts.append(piece)
+            return "".join(parts)   # 流式内部自行记账；上面那条 error 记录如实保留
         raise
 
 
