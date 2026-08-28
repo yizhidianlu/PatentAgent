@@ -89,6 +89,8 @@ export interface LlmTestResult {
   latency_ms: number | null
   error: string | null
   capability?: ModelCapability | null
+  /** 这次实际打到的服务地址：model 只是服务端回声，认不出「打的是不是那家」。 */
+  target_base_url?: string | null
 }
 
 /** 连接测试请求体：全部可选，缺省字段回落已存配置。 */

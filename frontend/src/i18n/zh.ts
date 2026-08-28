@@ -930,6 +930,7 @@ export const zh = {
       test: '测试该档',
       testing: '测试中…',
       testOk: (ms: number) => `连接正常（${ms} ms）`,
+      testHitAt: (url: string) => `实际打到：${url}`,
       testFailed: '连接失败',
       testHint: '按已保存的配置试连；请先保存再测试。',
     },

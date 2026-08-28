@@ -182,6 +182,8 @@ def test_llm_test_uses_body_override(
         "ok": True, "model": "tmp-model", "latency_ms": 1, "error": None,
         # 探测走真实 /v1/models，FakeLLM 场景下拿不到规格 → None
         "capability": None,
+        # 桩没填这一项；真实 test_llm 会回出实际打到的地址（见 test_model_tiers）
+        "target_base_url": None,
     }
     assert captured[-1] == {
         "base_url": "https://tmp.example.com/v1",

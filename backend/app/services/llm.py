@@ -1055,13 +1055,21 @@ async def test_llm(override: dict[str, Any] | None = None) -> LlmTestResult:
                      prompt_tokens=None, completion_tokens=None,
                      duration_ms=latency, status="ok")
         cap = await probe_model_capability(override)
-        return LlmTestResult(ok=True, model=model_name, latency_ms=latency, capability=cap)
+        # 把「实际打到哪儿」一并回出去：model 是服务端回声，一个桩或一个配错的中转
+        # 都能回出你想看的名字，只看它分不出「配置真指向那家」与「你打的不是那家」
+        return LlmTestResult(
+            ok=True, model=model_name, latency_ms=latency, capability=cap,
+            target_base_url=cfg.base_url,
+        )
     except Exception as exc:  # noqa: BLE001
         latency = int((time.perf_counter() - started) * 1000)
         _record_call(case_id=None, step_key="settings.llm_test", model=cfg.model,
                      prompt_tokens=None, completion_tokens=None,
                      duration_ms=latency, status="error", error=str(exc)[:2000])
-        return LlmTestResult(ok=False, model=cfg.model, latency_ms=latency, error=str(exc))
+        return LlmTestResult(
+            ok=False, model=cfg.model, latency_ms=latency, error=str(exc),
+            target_base_url=cfg.base_url,
+        )
 
 
 DEFAULT_IMAGE_TEST_PROMPT = "专利附图风格：黑白线条示意图，白底，无阴影无文字，简单的方框与箭头"

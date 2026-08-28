@@ -530,3 +530,42 @@ def test_tier_key_never_appears_in_the_audit_log(admin_client: TestClient, confi
     detail = json.loads(dict(rows[0])["detail_json"] or "{}")
     assert detail["deep_api_key_changed"] is True
     assert detail["deep_base_url"] == FOREIGN
+
+
+def test_tier_test_reports_the_endpoint_it_actually_hit(
+    admin_client: TestClient, configured
+) -> None:
+    """试连必须回出「实际打到哪儿」，不能只回 ok 和模型名。
+
+    部署端在沙箱里踩到过这一点：他的假供应商对任何请求都回写死的模型名，
+    只看返回值会以为配置指向了那一家——**返回值同时兼容「配置真被改了」
+    和「你的桩就长这样」**。分档之后这条尤其要紧：两档指向不同供应商时，
+    用户唯一能自查的就是这个地址。
+    """
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": "sk-b-endpoint-1"},
+            "default_tier": "deep",
+        },
+    )
+
+    from app.models.settings import LlmTestResult
+    from app.services import llm as llm_mod
+
+    async def fake_test(override=None):
+        # 桩故意回一个与配置无关的模型名——正是那个会误导人的形态
+        cfg = llm_mod.load_llm_settings(override)
+        return LlmTestResult(
+            ok=True, model="whatever-the-stub-says", latency_ms=1,
+            target_base_url=cfg.base_url,
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(llm_mod, "test_llm", fake_test)
+        deep = admin_client.post(f"{API}/settings/model-tiers/deep/test").json()
+        fast = admin_client.post(f"{API}/settings/model-tiers/fast/test").json()
+
+    assert deep["target_base_url"] == FOREIGN, "深度档应当打到它自己的地址"
+    assert fast["target_base_url"] == "https://api.example.com/v1", "快速档应当回落主地址"

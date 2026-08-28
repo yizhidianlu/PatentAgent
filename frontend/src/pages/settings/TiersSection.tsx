@@ -167,11 +167,20 @@ export function TiersSection() {
     setStatus((s) => ({ ...s, [tier]: { kind: 'idle' } }))
     try {
       const result = await test.mutateAsync(tier)
+      // 把「实际打到哪儿」一并显示出来：模型名是服务端回声，一个配错的中转
+      // 也能回出你想看的名字；两档指向不同供应商时，地址是唯一能自查的东西
+      const hit = result.target_base_url
+        ? zh.settings.tiers.testHitAt(result.target_base_url)
+        : undefined
       setStatus((s) => ({
         ...s,
         [tier]: result.ok
-          ? { kind: 'ok', text: zh.settings.tiers.testOk(result.latency_ms ?? 0) }
-          : { kind: 'error', text: zh.settings.tiers.testFailed, detail: result.error },
+          ? { kind: 'ok', text: zh.settings.tiers.testOk(result.latency_ms ?? 0), detail: hit }
+          : {
+              kind: 'error',
+              text: zh.settings.tiers.testFailed,
+              detail: [hit, result.error].filter(Boolean).join('　'),
+            },
       }))
     } catch (e) {
       setStatus((s) => ({

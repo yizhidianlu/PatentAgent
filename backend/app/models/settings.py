@@ -259,6 +259,12 @@ class LlmTestResult(BaseModel):
     error: str | None = None
     #: 顺带探测到的模型规格，供前端一键填入「上下文窗口 / 最大输出」
     capability: ModelCapability | None = None
+    #: **这次实际打到的服务地址。**
+    #:
+    #: `model` 是服务端回声，一个桩或一个配错的中转都能回出你想看的名字——
+    #: 只看它，「测通了」同时兼容「配置真的指向了那家」和「你打的根本不是那家」。
+    #: 分档之后这一条尤其要紧：两档指向不同供应商时，用户唯一能自查的就是它。
+    target_base_url: str | None = None
 
 
 class EmbeddingTestRequest(BaseModel):
