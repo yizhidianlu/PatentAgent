@@ -148,8 +148,11 @@ export function TestResult({ status }: { status: TestStatus }) {
   if (status.kind === 'idle') return null
   const ok = status.kind === 'ok'
   const Icon = ok ? CheckCircleIcon : XCircleIcon
+  // 分行写的诊断（成因①②、判据、出路各一行）独占整行：footer 是 flex-wrap，
+  // 与按钮挤在同一行只剩三百来像素，六行文案会窄成一条难读的竖带。
+  const multiline = typeof status.detail === 'string' && status.detail.includes('\n')
   return (
-    <div className="min-w-0 flex-1 space-y-1">
+    <div className={cn('min-w-0 space-y-1', multiline ? 'w-full' : 'flex-1')}>
       <span
         className={cn(
           'inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs font-medium',
@@ -165,7 +168,10 @@ export function TestResult({ status }: { status: TestStatus }) {
         <p className="text-xs text-gray-500 dark:text-gray-400 break-words">{status.detail}</p>
       )}
       {status.kind === 'error' && status.detail && (
-        <p className="text-xs text-red-500 dark:text-red-400 break-all line-clamp-3">
+        // whitespace-pre-line：诊断提示是分行写的（成因①②、判据、出路各占一行），
+        // 折成一段就读不出结构。此前 line-clamp-3 会把最有用的「判据」那行裁掉，
+        // break-all 还会把中文从词中间断开——改为限高可滚，一行都不丢。
+        <p className="max-h-60 overflow-y-auto whitespace-pre-line break-words text-xs leading-relaxed text-red-500 dark:text-red-400">
           {status.detail}
         </p>
       )}

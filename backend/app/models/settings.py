@@ -11,7 +11,7 @@ import logging
 from collections.abc import Mapping
 from typing import Any, Literal, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,20 @@ class EmbeddingSettings(BaseModel):
     # 向量维度；变更需重建 oa_vec 虚拟表（0/负数会让 vec0 建表直接失败）
     dim: int = Field(default=1024, ge=MIN_POSITIVE)
 
+    @field_validator("base_url")
+    @classmethod
+    def _strip_endpoint_suffix(cls, value: str) -> str:
+        """剥掉末尾的 `/embeddings`。
+
+        SDK 总会自己拼上 `/embeddings`，所以照抄文档 curl 里的完整 URL 会得到
+        `/embeddings/embeddings` → 404，而报错里没有任何线索指向这里。
+        这个后缀永远不可能是用户的本意，直接剥掉，而不是让人对着 404 猜。
+        """
+        text = str(value or "").strip().rstrip("/")
+        if text.lower().endswith("/embeddings"):
+            text = text[: -len("/embeddings")].rstrip("/")
+        return text
+
     def masked(self) -> "EmbeddingSettings":
         """返回 api_key 掩码后的副本（GET 响应用）。"""
         return self.model_copy(update={"api_key": mask_api_key(self.api_key)})
@@ -294,6 +308,8 @@ class EmbeddingTestRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
+    #: 表单里的维度：测试要校验的是屏幕上这份配置，不是库里存着的旧值
+    dim: int | None = Field(default=None, ge=MIN_POSITIVE)
 
 
 class EmbeddingTestResult(BaseModel):

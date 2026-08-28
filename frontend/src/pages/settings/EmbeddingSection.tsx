@@ -83,16 +83,20 @@ export function EmbeddingSection() {
         base_url: form.base_url,
         api_key: form.api_key,
         model: form.model,
+        // 带上表单里的维度：要测的是屏幕上这份配置，不是库里存着的旧值
+        dim: form.dim,
       })
       if (result.ok) {
         setStatus({
           kind: 'ok',
           text: zh.settings.embedding.testSuccess(result.dim ?? 0, result.latency_ms ?? 0),
         })
-        if (result.dim && result.dim !== form.dim) setDimMismatch(result.dim)
       } else {
         setStatus({ kind: 'error', text: zh.settings.embedding.testFailed, detail: result.error })
       }
+      // 维度不符现在会让测试判红（它确实会让每次入库都失败）——但回填提示不能
+      // 因此丢掉：它挂在 ok 分支里时，恰恰是最该出现的那次不出现。
+      if (result.dim && result.dim !== form.dim) setDimMismatch(result.dim)
     } catch (e) {
       setStatus({
         kind: 'error',

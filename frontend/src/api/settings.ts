@@ -137,6 +137,8 @@ export interface EmbeddingTestPayload {
   base_url?: string
   api_key?: string
   model?: string
+  /** 表单里的维度：测试要校验的是屏幕上这份配置，不是库里存着的旧值 */
+  dim?: number
 }
 
 export interface EmbeddingReindexResult {

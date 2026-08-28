@@ -43,7 +43,10 @@ VEC_TABLE = "oa_vec"
 BLOB_TABLE = "oa_vec_blob"
 
 #: embeddings 接口单批条数（多数兼容端点对 input 数组长度有限制）
-EMBED_BATCH = 16
+EMBED_BATCH = 16       # 智谱 embedding-3 单次数组上限 64，留足余量
+#: 单条文本上限。embedding-3 标称 3072 tokens；中文约 1 字 ≈ 1 token，故按字符保守取值。
+#: 入库分块 ≤600 字符本就安全，这道保护是给检索时的长 query 用的。
+EMBED_MAX_CHARS = 3000
 #: embeddings 请求超时（秒）
 EMBED_TIMEOUT = 60
 #: `chunk_id IN (…)` 单批参数上限（避开 SQLITE_MAX_VARIABLE_NUMBER）
@@ -95,6 +98,69 @@ def not_configured_message(cfg: EmbeddingSettings | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: 已确认不接受 `dimensions` 的模型（进程内记忆，避免每批都白试一次）。
+_NO_DIMENSIONS: set[str] = set()
+
+
+def _dimension_kwargs(cfg: Any) -> dict[str, Any]:
+    """按设置里的维度向服务商索要向量长度。
+
+    此前从不发这个参数，于是「向量维度」只是个**事后校验值**：配 1024 而模型
+    默认返回 2048 时，要等到真正嵌入的那一刻才报「维度不一致」。
+    支持该参数的服务商应当直接按配置值出向量——让设置成为指令，而不是断言。
+    """
+    dim = int(getattr(cfg, "dim", 0) or 0)
+    if dim <= 0 or str(getattr(cfg, "model", "")) in _NO_DIMENSIONS:
+        return {}
+    return {"dimensions": dim}
+
+
+def _drop_dimensions_on_error(cfg: Any, exc: Exception) -> bool:
+    """报错是否因为不认 `dimensions`；是则记下并让调用方摘掉重发一次。"""
+    model = str(getattr(cfg, "model", ""))
+    if not model or model in _NO_DIMENSIONS:
+        return False
+    if int(getattr(cfg, "dim", 0) or 0) <= 0:
+        return False
+    message = str(exc).lower()
+    if "dimensions" not in message:
+        return False
+    _NO_DIMENSIONS.add(model)
+    logger.info("模型 %s 不接受 dimensions 参数，后续按其默认维度返回", model)
+    return True
+
+
+def embedding_error_hint(cfg: Any, exc: Exception) -> str:
+    """把服务商原话翻译成「这是什么问题、该去做什么」。
+
+    机主看到的是一句原始的 `Error code: 429 - {...'1113'...余额不足或无可用资源包}`。
+    今天已经证明这句话的真实含义可能是「订阅套餐不含这个模型」而不是「没钱」——
+    实测：同一把 key 三个端点两个 embedding 模型全 1113，而它的 chat 在订阅端点正常。
+    两种含义的处置完全不同，所以必须把可能性和判据一起说出来。
+    """
+    model = str(getattr(cfg, "model", "") or "该模型")
+    detail = llm._server_message(exc)
+    if llm._is_quota_exhausted(exc):
+        return (
+            f"Embedding 服务返回配额/余额受限（模型 {model}）：{detail}\n"
+            "常见成因有两种，处置不同：\n"
+            "① 该模型不在当前套餐内 —— 订阅制套餐（如 GLM Coding Plan）通常只含对话模型，"
+            "embedding 需要按量计费余额；\n"
+            "② 账户确实欠费。\n"
+            "判据：若同一把 Key 的对话模型可用而 embedding 报此错，多半是 ①。"
+            "此时可为账户充值按量余额、换一家 embedding 服务商，"
+            "或关闭向量检索（案例库会退化为关键词检索，功能仍可用）。"
+        )
+    if llm._is_rate_limited(exc):
+        return f"Embedding 服务触发限流（模型 {model}）：{detail}。请稍后重试或降低并发。"
+    if llm._is_context_overflow(exc):
+        return (
+            f"送入 {model} 的文本超出其单条上限：{detail}。"
+            "请缩短案例笔记的分块长度后重建索引。"
+        )
+    return f"Embedding 调用失败（模型 {model}）：{detail}"
+
+
 async def embed(
     texts: Sequence[str], *, override: dict[str, Any] | None = None
 ) -> list[list[float]]:
@@ -108,7 +174,7 @@ async def embed(
         raise EmbeddingNotConfiguredError(
             "尚未配置 Embedding 模型：请在设置页填写 base_url / 模型 / 维度并测试连通后重试"
         )
-    items = [str(t or "") for t in texts]
+    items = [str(t or "")[:EMBED_MAX_CHARS] for t in texts]
     if not items:
         return []
 
@@ -116,12 +182,26 @@ async def embed(
     vectors: list[list[float]] = []
     for start in range(0, len(items), EMBED_BATCH):
         batch = items[start : start + EMBED_BATCH]
+        # 走 chat 那道并发闸：它的设计前提是「上游看到的并发不超上限」，
+        # 而 embedding 此前是闸外流量——两者常指向同一个服务商（现场即如此）。
+        slot = await llm._acquire_slot(
+            cfg.base_url, case_id=None, step_key=None, model=cfg.model
+        )
+        token = llm._track_call(cfg.model, None)
         try:
-            resp = await client.embeddings.create(model=cfg.model, input=batch)
+            resp = await client.embeddings.create(
+                model=cfg.model, input=batch, **_dimension_kwargs(cfg)
+            )
         except Exception as exc:  # noqa: BLE001 —— 统一转成可呈现的领域异常
-            raise EmbeddingCallError(
-                f"Embedding 调用失败（模型 {cfg.model}）：{exc}"
-            ) from exc
+            if _drop_dimensions_on_error(cfg, exc):
+                # 该服务商不认 dimensions：摘掉重发一次，而不是让整次嵌入失败
+                resp = await client.embeddings.create(model=cfg.model, input=batch)
+            else:
+                raise EmbeddingCallError(embedding_error_hint(cfg, exc)) from exc
+        finally:
+            llm._untrack_call(token)
+            if slot is not None:
+                slot.release()
         data = sorted(resp.data or [], key=lambda d: int(getattr(d, "index", 0) or 0))
         if len(data) != len(batch):
             raise EmbeddingCallError(

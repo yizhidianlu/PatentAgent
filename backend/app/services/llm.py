@@ -177,7 +177,9 @@ def load_embedding_settings(override: dict[str, Any] | None = None) -> Embedding
         patch = {k: v for k, v in override.items() if v is not None}
         if not patch.get("api_key"):
             patch.pop("api_key", None)
-        cfg = cfg.model_copy(update=patch)
+        # 覆盖值来自设置页表单里刚敲进去、尚未保存的内容——「测试连接」的全部
+        # 意义就是校验它，所以合并后必须重新过一遍字段校验器（model_copy 不跑）。
+        cfg = load_tolerant(EmbeddingSettings, {**cfg.model_dump(), **patch})
     return cfg
 
 
@@ -270,8 +272,15 @@ def _thinking_params(cfg: LlmSettings) -> dict[str, Any]:
     glm-5.3-flash 因思维链默认开满，在 8/9 个真实步骤上比旗舰更慢。
     与其赌某家的默认值，不如显式声明要不要思考、思考多深。
 
-    供应商支持度不一（智谱 glm-5.3 按文档不可关闭），端点拒收时由 _learn_quirk
-    摘掉对应参数并重试一次——**声明意图是安全的，不支持只是回落到默认**。
+    供应商支持度不一，端点拒收时由 _learn_quirk 摘掉对应参数并重试一次——
+    **声明意图是安全的，不支持只是回落到默认**。
+
+    2026-08-28 实测（同一道挖专利点的题，取两次较优）：
+      deepseek-v4-flash   默认 18.2s / disabled 9.7s / enabled+low 12.0s / high 22.6s
+      glm-5.3-flash       默认 89.8s / disabled 18.3s / enabled+low 16.4s / high 75.7s
+    两条结论：①「不发参数」是最坏的一档，默认值可以差到 5 倍；②智谱文档称
+    glm-5.3 不可关闭思考，但经 extra_body 下发 disabled 确实生效（思维链 0 字）
+    ——**别把文档的支持度声明当成实现事实，两边都要量**。
     """
     extra: dict[str, Any] = {}
     if cfg.thinking in ("enabled", "disabled"):
@@ -1581,13 +1590,34 @@ async def test_embedding(override: dict[str, Any] | None = None) -> EmbeddingTes
     cfg = load_embedding_settings(override)
     if not cfg.model:
         return EmbeddingTestResult(ok=False, error="尚未配置 Embedding 模型")
+    # 延迟导入：vector 在模块级 import llm，放到函数里避免循环导入
+    from . import vector as vector_service
+
     client = _client(cfg.base_url, cfg.api_key, timeout=TEST_TIMEOUT)
     started = time.perf_counter()
     try:
-        resp = await client.embeddings.create(model=cfg.model, input="测试")
+        resp = await client.embeddings.create(
+            model=cfg.model, input="测试", **vector_service._dimension_kwargs(cfg)
+        )
         latency = int((time.perf_counter() - started) * 1000)
         dim = len(resp.data[0].embedding) if resp.data else None
+        if dim and cfg.dim and dim != cfg.dim:
+            # 此前只回传实测维度、从不比对：于是「测试通过，2048 维」和设置里存着的
+            # 1024 可以长期并存，真正的失败要等第一次入库才炸，而检索侧又把它
+            # 静默降级成了关键词——一个配置错误被伪装成两种无关现象。
+            return EmbeddingTestResult(
+                ok=False, model=cfg.model, dim=dim, latency_ms=latency,
+                error=(
+                    f"连接正常，但 {cfg.model} 返回 {dim} 维，与设置的向量维度 "
+                    f"{cfg.dim} 不一致——这会让每次入库都失败。"
+                    f"请把「向量维度」改为 {dim}（改完需重建向量库），"
+                    "或改用支持按需降维的模型。"
+                ),
+            )
         return EmbeddingTestResult(ok=True, model=cfg.model, dim=dim, latency_ms=latency)
     except Exception as exc:  # noqa: BLE001
         latency = int((time.perf_counter() - started) * 1000)
-        return EmbeddingTestResult(ok=False, model=cfg.model, latency_ms=latency, error=str(exc))
+        return EmbeddingTestResult(
+            ok=False, model=cfg.model, latency_ms=latency,
+            error=vector_service.embedding_error_hint(cfg, exc),
+        )
