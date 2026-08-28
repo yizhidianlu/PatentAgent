@@ -124,3 +124,44 @@ def test_all_invalid_raises_validation_error_for_feedback_retry() -> None:
 
     with pytest.raises(ValidationError):
         llm.validate_from_candidates('{"n": "甲"}', Strict)
+
+
+# ---------------------------------------------------------------------------
+# 上下文超限：配置错误要指向那个配置项
+# ---------------------------------------------------------------------------
+
+CTX_OVERFLOW = (
+    "Error code: 400 - {'error': {'message': \"This model's maximum context length "
+    "is 65536 tokens, however you requested 812345 tokens\", "
+    "'code': 'context_length_exceeded'}}"
+)
+
+
+def test_context_overflow_is_distinguished_from_rate_limits() -> None:
+    assert llm._is_context_overflow(RuntimeError(CTX_OVERFLOW)) is True
+    assert llm._is_context_overflow(RuntimeError(ZHIPU_CONCURRENCY)) is False
+    assert llm._is_context_overflow(RuntimeError("输入过长，请缩短后重试")) is True
+
+
+@pytest.mark.anyio
+async def test_context_overflow_fails_fast_and_names_the_setting() -> None:
+    """配置错误重试无用：第一次就上抛，且提示必须指向「上下文窗口」这个设置项。
+
+    供应商原话只有一串英文 token 数，既不提设置页也不提这个词——
+    用户猜不到问题出在一个自己填过的配置项上。部署端换模型时照抄了上一档的
+    100 万上下文，正是这条路径；他自己发现了，但下一个人未必。
+    """
+    calls = {"n": 0}
+
+    async def factory():
+        calls["n"] += 1
+        raise RuntimeError(CTX_OVERFLOW)
+
+    with pytest.raises(llm.LlmContextOverflowError) as info:
+        await llm._with_rate_limit_retry(factory, what="test", model="glm-4-flash")
+
+    assert calls["n"] == 1, "配置错误不该进退避循环"
+    text = str(info.value)
+    assert "上下文窗口" in text, "必须说清去改哪个设置项"
+    assert "重试不会改变结果" in text, "必须说清重试没用，否则用户会一直点重试"
+    assert "glm-4-flash" in text, "两档不同模型时要说清是哪一档"

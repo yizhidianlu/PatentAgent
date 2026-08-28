@@ -61,6 +61,13 @@ class LlmNotConfiguredError(RuntimeError):
     """LLM 尚未配置（缺 model 或 api_key/base_url）。"""
 
 
+class LlmContextOverflowError(RuntimeError):
+    """输入超过模型真实上下文上限——**配置错误，重试无用**。
+
+    与限流/连接故障不同：这是「设置页里的上下文窗口填得比模型实际能力大」，
+    每次重试都会以完全相同的方式失败，直到有人去改那个数。"""
+
+
 class LlmQuotaError(RuntimeError):
     """配额 / 余额类 429：与限流不同，**重试无法解决**。
 
@@ -505,6 +512,38 @@ def _server_message(exc: Exception) -> str:
     return str(exc)[:120]
 
 
+#: 上下文超限的措辞（各家不一，故取共有的关键片段）。
+_CONTEXT_TOKENS = (
+    "maximum context length", "context_length_exceeded", "context length",
+    "too many tokens", "input is too long", "prompt is too long",
+    "上下文长度", "输入过长", "超过模型最大", "token 数超过",
+)
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(token.lower() in message for token in _CONTEXT_TOKENS)
+
+
+def _context_overflow_hint(model: str, exc: Exception) -> str:
+    """把供应商原话翻译成「去哪儿改什么」。
+
+    原话里既没有「设置页」也没有「上下文窗口」这几个字——用户看到的是一串
+    英文 token 数，猜不到问题出在一个自己填过的配置项上。
+    """
+    cfg_ctx = ""
+    try:
+        cfg_ctx = f"（当前配置为 {load_llm_settings().context_window:,} tokens）"
+    except Exception:  # noqa: BLE001
+        pass
+    return (
+        f"发往 {model} 的输入超出了它的真实上下文上限{cfg_ctx}。"
+        "这是配置问题，重试不会改变结果：请到「设置 → 模型档位」把该档的"
+        "「上下文窗口」改为该模型文档标称的值，然后点「重试此步」。"
+        f"服务端原话：{_server_message(exc)}"
+    )
+
+
 def _is_transient(exc: Exception) -> bool:
     """连接类瞬时故障：推理型模型一次调用要几分钟，中途被掐断并不罕见。"""
     name = type(exc).__name__
@@ -578,6 +617,10 @@ async def _with_rate_limit_retry(
         try:
             return await factory()
         except Exception as exc:  # noqa: BLE001
+            if _is_context_overflow(exc):
+                hint = _context_overflow_hint(model or "该模型", exc)
+                await _notify(case_id, hint, step_key=step_key)
+                raise LlmContextOverflowError(hint) from exc
             if _is_quota_exhausted(exc):
                 message = _server_message(exc)
                 who = f"模型 {model} " if model else "模型服务"
@@ -1262,7 +1305,7 @@ async def structured(
                 temperature=temperature, max_output_tokens=max_output_tokens,
                 override=override, response_format=response_format, user_id=user_id,
             )
-        except (LlmEmptyOutputError, LlmQuotaError):
+        except (LlmEmptyOutputError, LlmQuotaError, LlmContextOverflowError):
             raise  # 空正文/配额受限与 response_format 无关，去掉它重发只会白烧一次额度
         except Exception as exc:  # noqa: BLE001
             # 限流/连接类故障与 response_format 无关（chat() 内部已按退避重试过），
