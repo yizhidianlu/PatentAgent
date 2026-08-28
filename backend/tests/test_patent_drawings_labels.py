@@ -148,3 +148,43 @@ def test_rendered_png_is_not_blank(tmp_path: Path) -> None:
     out = tmp_path / "f.png"
     gpd.render_png(asset, out)
     assert out.is_file() and out.stat().st_size > 2000
+
+
+# ---------------------------------------------------------------------------
+# 自适应：盒子迁就内容，不是内容迁就盒子
+# ---------------------------------------------------------------------------
+
+
+def test_long_real_world_steps_are_not_truncated() -> None:
+    """机主真实案子里的步骤长度（50+ 字），必须一个「…」都没有。
+
+    此前把上限从 20 提到 54 只是把截断线往后挪；真正的修法是盒子按内容变宽。
+    """
+    spec = (
+        "图1；S103，将多尺度特征图输入双向特征金字塔颈部，构建自顶向下通路与自底向上通路，"
+        "将不同分辨率的特征对齐至同一尺度后按归一化可学习权重加权聚合；"
+        "S104，在每个检测层前通过可变形注意力模块对多尺度融合特征图进行细化，"
+        "由轻量偏移网络根据查询嵌入预测空间偏移以确定采样位置。"
+    )
+    steps = gpd.extract_steps(spec)
+    assert len(steps) == 2
+    assert not any(s.endswith("…") for s in steps), steps
+    assert "加权聚合" in steps[0] and "确定采样位置" in steps[1]
+
+    layout = gpd.method_flow_layout(steps)
+    for step in steps:
+        lines = gpd.wrap_label(step, layout["max_width"], font_size=gpd.FLOW_FONT_SIZE)
+        assert len(lines) * int(gpd.FLOW_FONT_SIZE * 1.25) <= layout["node_h"]
+        for line in lines:
+            assert gpd.text_width(line, gpd.FLOW_FONT_SIZE) <= layout["max_width"]
+
+
+def test_box_width_grows_with_content_within_bounds() -> None:
+    """长内容加宽盒子，但不会宽到在 A4 上缩得看不清。"""
+    short = gpd.method_flow_layout(["S101 采集图像", "S102 输出结果"])["node_w"]
+    long_steps = gpd.extract_steps(
+        "图1；S101，" + "以极长的技术描述说明本步骤的输入输出与判定条件" * 4 + "。"
+    )
+    wide = gpd.method_flow_layout(long_steps)["node_w"]
+    assert wide > short, "长内容应当把盒子撑宽"
+    assert gpd.NODE_W_MIN <= wide <= gpd.NODE_W_MAX

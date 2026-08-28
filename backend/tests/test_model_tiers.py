@@ -569,3 +569,74 @@ def test_tier_test_reports_the_endpoint_it_actually_hit(
 
     assert deep["target_base_url"] == FOREIGN, "深度档应当打到它自己的地址"
     assert fast["target_base_url"] == "https://api.example.com/v1", "快速档应当回落主地址"
+
+
+# ---------------------------------------------------------------------------
+# 思考模式：「快档」真正的开关
+# ---------------------------------------------------------------------------
+
+
+def test_thinking_params_are_omitted_by_default() -> None:
+    """auto = 不发该参数：不改变任何既有模型的行为。"""
+    from app.models.settings import LlmSettings
+
+    assert llm_service._thinking_params(LlmSettings(model="m")) == {}
+
+
+def test_thinking_disabled_is_sent_explicitly() -> None:
+    """显式声明意图，而不是赌服务商默认。
+
+    今天的教训：模型名里的 flash 是命名不是性能承诺——glm-5.3-flash 因思维链
+    默认开满，在 8/9 个真实步骤上比旗舰更慢。快档要真的快，靠的是这个参数。
+    """
+    from app.models.settings import LlmSettings
+
+    got = llm_service._thinking_params(
+        LlmSettings(model="m", thinking="disabled", reasoning_effort="low")
+    )
+    # 必须包在 extra_body 里：SDK 对未知具名参数直接抛 TypeError（实测踩过），
+    # 那是客户端拒收，服务端 400 的 quirk 自愈路径够不着它
+    assert got == {"extra_body": {"thinking": {"type": "disabled"}, "reasoning_effort": "low"}}
+
+
+def test_tier_overlay_carries_thinking(admin_client: TestClient, configured) -> None:
+    """档位配置能把思考模式带到实际调用上。"""
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model", "thinking": "disabled", "reasoning_effort": "low"},
+            "deep": {"model": "thinking-model"},
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    llm_service.set_active_tier("fast")
+    cfg = llm_service.load_llm_settings()
+    assert cfg.thinking == "disabled" and cfg.reasoning_effort == "low"
+
+    llm_service.set_active_tier("deep")
+    deep = llm_service.load_llm_settings()
+    assert deep.thinking == "auto", "没配的档位不该被快档的设置串味"
+
+
+def test_endpoint_rejection_is_learned_not_fatal() -> None:
+    """不支持关闭思考的服务商（如 glm-5.3）拒收时摘掉参数，而不是让调用失败。
+
+    声明意图必须是安全的：不支持只回落到默认，不能变成一次硬失败。
+    """
+    model = "no-thinking-support"
+    try:
+        assert llm_service._learn_quirk(
+            model, RuntimeError("400 invalid_request: parameter 'thinking' is not supported")
+        ) is True
+        assert llm_service.model_quirks(model).get("no_thinking_param") is True
+        kw = llm_service._apply_quirks(
+            model,
+            {"model": model,
+             "extra_body": {"thinking": {"type": "disabled"}, "reasoning_effort": "low"}},
+        )
+        assert "thinking" not in kw.get("extra_body", {}), "学到之后必须摘掉该参数"
+    finally:
+        llm_service._MODEL_QUIRKS.pop(model, None)
+        llm_service._persist_quirks()

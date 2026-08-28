@@ -41,9 +41,31 @@ try:
 except ImportError:
     from tools.shared.stdio_utf8 import ensure_utf8_stdio
 
-# 插图最大尺寸（英寸）：在常见 A4、默认边距下保证整图可见、按比例缩放（不过宽也不过高）。
-_DEFAULT_IMAGE_MAX_W_IN = 5.5
-_DEFAULT_IMAGE_MAX_H_IN = 8.2
+# 插图最大尺寸（英寸）：**兜底值**，实际以文档真实版心为准（见 _usable_page_inches）。
+# 写死的后果是换纸张/边距就不对——A4 默认边距的可用宽度是 6.27 英寸，
+# 卡在 5.5 会白白窄掉 12%，而机主看到的正是「图偏小、内容显示不完整」。
+_DEFAULT_IMAGE_MAX_W_IN = 6.0
+_DEFAULT_IMAGE_MAX_H_IN = 8.5
+
+
+def _usable_page_inches(doc: Any) -> tuple[float, float]:
+    """文档版心尺寸（英寸）：页面尺寸减去左右/上下边距。
+
+    图片按它自适应，而不是按一个写死的常数——纸张、边距、横竖排都会变，
+    唯一不变的是「整图要落在版心里」。
+    """
+    try:
+        section = doc.sections[0]
+        w = float(section.page_width.inches - section.left_margin.inches
+                  - section.right_margin.inches)
+        h = float(section.page_height.inches - section.top_margin.inches
+                  - section.bottom_margin.inches)
+    except Exception:  # noqa: BLE001 —— 拿不到版心就用兜底值
+        return _DEFAULT_IMAGE_MAX_W_IN, _DEFAULT_IMAGE_MAX_H_IN
+    if w <= 0 or h <= 0:
+        return _DEFAULT_IMAGE_MAX_W_IN, _DEFAULT_IMAGE_MAX_H_IN
+    # 高度留一行图题的余量，免得图和图题被挤到两页
+    return w, max(1.0, h - 0.6)
 # 公式图 Word 嵌入上限（英寸）：在「按 PNG 像素/渲染 DPI 的自然尺寸」基础上封顶，禁止强行拉高导致单行式巨字
 _FORMULA_INLINE_MAX_H_IN = 0.22
 _FORMULA_BLOCK_MAX_H_IN = 0.36
@@ -1100,6 +1122,10 @@ def convert_md_to_docx(
     _PREFER_OMML = bool(prefer_omml)
     _MATH_STATS.reset()
     doc = Document()
+    # 图片尺寸随**真实版心**走：调用方没有显式指定时，按纸张与边距算出来。
+    # 写死常数在换纸张/边距时就不对了，表现为「图偏小、内容看不全」。
+    if image_max_w_in == _DEFAULT_IMAGE_MAX_W_IN and image_max_h_in == _DEFAULT_IMAGE_MAX_H_IN:
+        image_max_w_in, image_max_h_in = _usable_page_inches(doc)
     # 默认正文样式
     try:
         style = doc.styles["Normal"]

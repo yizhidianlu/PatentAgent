@@ -38,6 +38,38 @@ function optionalInt(raw: string): number | null {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : null
 }
 
+
+/** 小型分段选择：思考模式 / 推理强度共用。 */
+function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T
+  options: { key: T; label: string }[]
+  onChange: (next: T) => void
+}) {
+  return (
+    <div className="inline-flex rounded-full bg-gray-100 dark:bg-gray-800 p-0.5">
+      {options.map((o) => (
+        <button
+          key={o.key}
+          type="button"
+          onClick={() => onChange(o.key)}
+          className={
+            'rounded-full px-2.5 py-1 text-xs transition-colors ' +
+            (value === o.key
+              ? 'bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-50 shadow-sm'
+              : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300')
+          }
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function TierFields({
   title,
   value,
@@ -103,6 +135,35 @@ function TierFields({
           )}
         </Field>
       </div>
+
+      {/* 「快档」真正的开关：显式声明要不要思考，而不是赌模型名 */}
+      <Field label={zh.settings.tiers.thinkingLabel} hint={zh.settings.tiers.thinkingHint}>
+        {() => (
+          <div className="flex items-center gap-2 flex-wrap">
+            <Segmented
+              value={value.thinking}
+              onChange={(v) => onChange({ thinking: v })}
+              options={[
+                { key: 'auto', label: zh.settings.tiers.thinkingAuto },
+                { key: 'enabled', label: zh.settings.tiers.thinkingOn },
+                { key: 'disabled', label: zh.settings.tiers.thinkingOff },
+              ]}
+            />
+            <span className="text-[11px] text-gray-400">
+              {zh.settings.tiers.effortLabel}
+            </span>
+            <Segmented
+              value={value.reasoning_effort}
+              onChange={(v) => onChange({ reasoning_effort: v })}
+              options={[
+                { key: 'auto', label: zh.settings.tiers.effortAuto },
+                { key: 'low', label: 'low' },
+                { key: 'high', label: 'high' },
+              ]}
+            />
+          </div>
+        )}
+      </Field>
 
       {/* 跨供应商分档：地址与密钥都留空时，这一档完全跟随主配置 */}
       <Field label={zh.settings.tiers.baseUrlLabel}>

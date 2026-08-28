@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 # 围栏行：```lang 或 ~~~lang（缩进 ≤3 空格，与 CommonMark 一致）
@@ -76,3 +77,60 @@ class TailMuter:
         if self._line_starts_tail(line):
             return ""
         return line
+
+
+# ---------------------------------------------------------------------------
+# 交付边界：完整正文里的机器契约块清除
+# ---------------------------------------------------------------------------
+
+#: 已知的机器契约形状（键集）。**只删认得出的契约**——用户正文里合法的 JSON
+#: 示例（交底书里举例的配置片段、接口报文）必须原样保留。
+#: 误删正文比留下一个契约块更糟：前者丢的是内容，后者只是难看。
+_CONTRACT_KEYS: tuple[frozenset[str], ...] = (
+    frozenset({"terms_delta"}),
+    frozenset({"add", "update"}),
+    frozenset({"invention_name", "claims"}),
+)
+
+_ANY_FENCE_RE = re.compile(
+    r"^ {0,3}```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)\r?\n^ {0,3}```[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _is_contract_payload(body: str) -> bool:
+    """这块 JSON 是不是我们自己的机器契约。"""
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    keys = set(data)
+    return any(shape <= keys for shape in _CONTRACT_KEYS)
+
+
+def strip_contract_blocks(text: str) -> str:
+    """从**完整正文**里删掉机器契约 JSON 块（交付边界的兜底）。
+
+    逐块剥离（terminology.extract_terms_delta）只认「文末最后一块」——那是对的，
+    它要防的是误吞正文中间的示例。但模型不总把契约放在最末：尾巴后又补一句话、
+    或者分两块吐，漏网的那块会一路进到 Word 和 PDF 里。
+
+    交付物是要交到审查员手里的东西：**正文里出现 `"forbidden_variants": []`
+    这类内部字段，比任何排版瑕疵都严重**。所以在装配这一层再兜一道，
+    且只删「认得出是契约」的块，其余 JSON 与 mermaid 等围栏一律保留。
+    """
+    if not text or "```" not in text:
+        return text
+
+    def _sub(m: "re.Match[str]") -> str:
+        lang = (m.group(1) or "").lower()
+        if lang not in ("", "json"):
+            return m.group(0)                 # mermaid 等其它围栏原样保留
+        return "" if _is_contract_payload(m.group(2)) else m.group(0)
+
+    out = _ANY_FENCE_RE.sub(_sub, text)
+    if not out.strip():
+        return out
+    return re.sub(r"\n{3,}", "\n\n", out).strip() + "\n"

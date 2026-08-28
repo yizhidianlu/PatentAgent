@@ -256,6 +256,27 @@ def reasoning_budget(model: str, want: int | None) -> int:
     return min(max(base, floor, REASONING_RESERVE_TOKENS), REASONING_MAX_BUDGET)
 
 
+def _thinking_params(cfg: LlmSettings) -> dict[str, Any]:
+    """把配置里的思考意图翻译成请求参数（'auto' = 不发，沿用服务商默认）。
+
+    这是「快档」真正的开关。今天的教训：模型名里的 flash 是命名，不是性能承诺——
+    glm-5.3-flash 因思维链默认开满，在 8/9 个真实步骤上比旗舰更慢。
+    与其赌某家的默认值，不如显式声明要不要思考、思考多深。
+
+    供应商支持度不一（智谱 glm-5.3 按文档不可关闭），端点拒收时由 _learn_quirk
+    摘掉对应参数并重试一次——**声明意图是安全的，不支持只是回落到默认**。
+    """
+    extra: dict[str, Any] = {}
+    if cfg.thinking in ("enabled", "disabled"):
+        extra["thinking"] = {"type": cfg.thinking}
+    if cfg.reasoning_effort != "auto":
+        extra["reasoning_effort"] = cfg.reasoning_effort
+    # 必须走 extra_body：OpenAI SDK 对未知具名参数直接抛 TypeError（客户端拒收，
+    # 连请求都发不出去），而 quirk 学习只认服务端的 400——那条自愈路径够不着它。
+    # 实测踩过：`create() got an unexpected keyword argument 'thinking'`。
+    return {"extra_body": extra} if extra else {}
+
+
 def _apply_quirks(model: str, kwargs: dict[str, Any]) -> dict[str, Any]:
     """按已学到的 quirks 调整请求参数。"""
     _load_quirks_once()
@@ -275,6 +296,14 @@ def _apply_quirks(model: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         kwargs.pop("response_format", None)
     if quirks.get("no_stream_options"):
         kwargs.pop("stream_options", None)
+    extra_body = kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        if quirks.get("no_thinking_param"):
+            extra_body.pop("thinking", None)
+        if quirks.get("no_reasoning_effort"):
+            extra_body.pop("reasoning_effort", None)
+        if not extra_body:
+            kwargs.pop("extra_body", None)
     return kwargs
 
 
@@ -387,6 +416,13 @@ def _learn_quirk(model: str, exc: Exception) -> bool:
         learned = True
     if "stream_options" in message and not quirks.get("no_stream_options"):
         quirks["no_stream_options"] = True
+        learned = True
+    # 「不支持关闭思考」这类拒收：摘掉参数回落默认，而不是让整次调用失败
+    if "thinking" in message and not quirks.get("no_thinking_param"):
+        quirks["no_thinking_param"] = True
+        learned = True
+    if "reasoning_effort" in message and not quirks.get("no_reasoning_effort"):
+        quirks["no_reasoning_effort"] = True
         learned = True
     if learned:
         logger.info("模型 %s 参数兼容性已调整：%s", model, quirks)
@@ -829,6 +865,7 @@ async def chat(
             )
             if response_format is not None:
                 kw["response_format"] = response_format
+            kw.update(_thinking_params(cfg))
             return _apply_quirks(cfg.model, kw)
 
         async def _send() -> Any:
@@ -960,6 +997,7 @@ async def chat_stream(
             )
             if response_format is not None:
                 kw["response_format"] = response_format
+            kw.update(_thinking_params(cfg))
             return _apply_quirks(cfg.model, kw)
 
         async def _open_stream() -> Any:

@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..db import database as db
-from .stream_filter import TailMuter
+from .stream_filter import TailMuter, strip_contract_blocks
 from ..models.disclosure import ClaimFormAudit, FormulaPlan, Skeleton, TerminologySheet
 from . import assembler, assets_loader, terminology
 from . import figure_plan as figure_plan_service
@@ -1237,7 +1237,10 @@ def assemble_document(
     """
     blocks = [document_header(case_title, contact, patent_type)]
     for key in order if order is not None else chapter_order(patent_type):
-        body = (chapters.get(key) or "").strip()
+        # 交付边界兜底：逐章剥离只认「文末最后一块」，模型没把契约放最末时会漏网，
+        # 漏的那块会一路进 Word 与 PDF。交付物里出现 forbidden_variants 这类
+        # 内部字段，比任何排版瑕疵都严重
+        body = strip_contract_blocks((chapters.get(key) or "").strip())
         if body:
             blocks.append(body)
     return "\n\n".join(blocks).rstrip() + "\n"

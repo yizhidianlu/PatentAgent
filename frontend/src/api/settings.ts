@@ -33,9 +33,15 @@ export interface LlmSettings {
 }
 
 /** 一档模型：留空的字段沿用主配置（`settings.llm`）。 */
+export type ThinkingMode = 'auto' | 'enabled' | 'disabled'
+export type ReasoningEffort = 'auto' | 'low' | 'medium' | 'high'
+
 export interface LlmTierSettings {
   model: string
   label: string
+  /** 思考模式：auto=沿用主配置 / 服务商默认。「快档」真正的开关。 */
+  thinking: ThinkingMode
+  reasoning_effort: ReasoningEffort
   /** 空 = 沿用主配置的服务地址。 */
   base_url: string
   /** 空 = 沿用主配置的密钥；换 host 时后端会要求必须填。 */
@@ -65,6 +71,8 @@ export function emptyTier(): LlmTierSettings {
   return {
     model: '',
     label: '',
+    thinking: 'auto',
+    reasoning_effort: 'auto',
     base_url: '',
     api_key: '',
     temperature: null,

@@ -438,8 +438,11 @@ def orthogonal_points(
 
 
 #: 流程图方框里一条步骤最多留多少字。
-#: 取值依据是排版而不是美观：盒宽 12 字 × 5 行 = 60 字，减去「S101 」这类前缀。
-STEP_LABEL_LIMIT = 54
+#:
+#: 这是**跑飞保护**，不是排版约束——盒子会按内容变宽变高（见 method_flow_layout），
+#: 所以正常步骤不该碰到它。此前 20 → 54 只是把截断线往后挪，框里照样以「…」收尾；
+#: 真正的修法是让盒子适应内容，而不是让内容迁就盒子。
+STEP_LABEL_LIMIT = 120
 
 
 def extract_steps(spec: str) -> list[str]:
@@ -514,8 +517,28 @@ def inner_width(node_w: int) -> float:
     return float(max(FLOW_FONT_SIZE, node_w - NODE_PADDING_X))
 
 
+#: 方框宽度的取值区间。下限保证窄标签不至于排成细长条，
+#: 上限保证图不会宽到在 A4 上缩得看不清字。
+NODE_W_MIN, NODE_W_MAX = 560, 900
+#: 一个方框排到几行就该考虑加宽而不是继续往下堆
+FLOW_TARGET_LINES = 3
+
+
+def fit_node_width(labels: list[str], font_size: int = 24) -> int:
+    """按最长标签挑一个盒宽：先加宽，宽到上限再靠行数消化。
+
+    「自适应内容」的含义就是这个方向——不是把内容截到盒子里，
+    而是把盒子撑到内容的尺寸，直到撑不动了才换行、再多才截断。
+    """
+    longest = max((text_width(s, font_size) for s in labels), default=0.0)
+    if longest <= 0:
+        return NODE_W_MIN
+    want = int(longest / FLOW_TARGET_LINES) + NODE_PADDING_X
+    return max(NODE_W_MIN, min(NODE_W_MAX, want))
+
+
 def method_flow_layout(steps: list[str]) -> dict[str, Any]:
-    node_w = 560
+    node_w = fit_node_width(steps, FLOW_FONT_SIZE)
     max_width = inner_width(node_w)
     # 方框高度按**实际排几行**算，而不是写死。
     # 写死 82px 的后果是：文字多了就往框外溢或者被上游截掉，
@@ -524,6 +547,7 @@ def method_flow_layout(steps: list[str]) -> dict[str, Any]:
         (len(wrap_label(step, max_width, font_size=FLOW_FONT_SIZE)) for step in steps),
         default=1,
     )
+    line_count = min(line_count, MAX_LABEL_LINES)
     node_h = max(82, line_count * FLOW_LINE_HEIGHT + FLOW_PADDING_Y)
     gap = 48
     content_w = node_w
@@ -546,7 +570,7 @@ def method_flow_layout(steps: list[str]) -> dict[str, Any]:
 
 
 def vertical_block_layout(items: list[str], font_size: int = 23) -> dict[str, Any]:
-    node_w = 430
+    node_w = fit_node_width(items, font_size)
     max_width = inner_width(node_w)
     # 与流程图同一条规矩：盒子按真正排出来的行数长高，不写死
     line_count = max(

@@ -920,6 +920,14 @@ export const zh = {
         '两档当前指向同一个模型，聊天框上的档位开关不会显示——一个按下去没有任何区别的开关，比不给更糟。',
       onlyModelHint:
         '留空的字段沿用上方「模型服务」。只填模型名即可；要用另一家服务商时，再填该档自己的地址与密钥。',
+      thinkingLabel: '思考模式',
+      thinkingHint:
+        '「快档」真正的开关：模型名里的 flash 只是命名，不是速度承诺。支持关闭思考的服务商（如 DeepSeek）关掉后才是真快；不支持的会自动忽略。',
+      thinkingAuto: '默认',
+      thinkingOn: '开启',
+      thinkingOff: '关闭',
+      effortLabel: '推理强度',
+      effortAuto: '默认',
       baseUrlLabel: 'API Base URL（可选）',
       baseUrlPlaceholder: '留空沿用主配置',
       apiKeyLabel: 'API Key（换服务商时必填）',

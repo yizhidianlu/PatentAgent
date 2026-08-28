@@ -75,6 +75,10 @@ class LlmSettings(BaseModel):
     # 上下文窗口（能力位，供预算器使用）
     context_window: int = Field(default=131072, ge=MIN_POSITIVE)
     supports_json_mode: bool = True       # 是否支持 response_format=json_object（能力位）
+    #: 思考模式与推理强度：'auto' 表示不发该参数（沿用服务商默认，与历史行为一致）。
+    #: 「快档」要真的快，靠的就是把这两个显式关小——而不是指望模型名里的 flash。
+    thinking: ThinkingMode = "auto"
+    reasoning_effort: ReasoningEffort = "auto"
 
     def masked(self) -> "LlmSettings":
         """返回 api_key 掩码后的副本（GET 响应用）。"""
@@ -88,6 +92,13 @@ class LlmSettings(BaseModel):
 #: 档位标识。'default' 不是档位，而是「不指定，用主配置」。
 ModelTier = Literal["fast", "deep"]
 MODEL_TIERS: tuple[str, ...] = ("fast", "deep")
+
+#: 思考模式。'auto' = 不发该参数（用服务商默认，也是旧行为）。
+#: 供应商对此的支持不一：DeepSeek 允许 disabled，智谱 glm-5.3 系列按文档不可关闭——
+#: 端点拒收时由 quirk 学习自动摘掉，不会让调用失败。
+ThinkingMode = Literal["auto", "enabled", "disabled"]
+#: 推理强度。'auto' = 不发（服务商默认通常是 high）。
+ReasoningEffort = Literal["auto", "low", "medium", "high"]
 
 
 class LlmTierSettings(BaseModel):
@@ -113,6 +124,10 @@ class LlmTierSettings(BaseModel):
     max_output_tokens: int | None = Field(default=None, ge=MIN_POSITIVE)
     context_window: int | None = Field(default=None, ge=MIN_POSITIVE)
     supports_json_mode: bool | None = None
+    #: 'auto' = 不覆盖主配置（注意与 LlmSettings 上同名字段的 'auto' 含义不同：
+    #: 这里的 auto 是「本档不表态」，那里的 auto 是「不发该参数」）。
+    thinking: ThinkingMode = "auto"
+    reasoning_effort: ReasoningEffort = "auto"
 
     def overlay(self) -> dict[str, Any]:
         """真正要盖到主配置上的字段（空 / None 的一律不盖）。"""
@@ -124,6 +139,10 @@ class LlmTierSettings(BaseModel):
         for name in ("temperature", "max_output_tokens", "context_window", "supports_json_mode"):
             value = getattr(self, name)
             if value is not None:
+                patch[name] = value
+        for name in ("thinking", "reasoning_effort"):
+            value = getattr(self, name)
+            if value and value != "auto":
                 patch[name] = value
         return patch
 
