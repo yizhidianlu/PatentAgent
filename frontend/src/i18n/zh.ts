@@ -912,14 +912,26 @@ export const zh = {
       modelPlaceholder: '留空则沿用上方「模型服务」的模型',
       labelLabel: '显示名称（可选）',
       labelPlaceholder: '留空用默认文案',
-      maxOutputLabel: '最大输出 tokens（可选）',
+      maxOutputLabel: '最大输出（可选）',
       inheritPlaceholder: '留空沿用主配置',
       defaultTier: '新建案件的默认档位',
       effective: (name: string) => `实际使用：${name}`,
       sameModelWarning:
         '两档当前指向同一个模型，聊天框上的档位开关不会显示——一个按下去没有任何区别的开关，比不给更糟。',
       onlyModelHint:
-        '档位只换模型与生成参数，服务地址与密钥沿用上方「模型服务」。需要跨供应商分档请联系维护者。',
+        '留空的字段沿用上方「模型服务」。只填模型名即可；要用另一家服务商时，再填该档自己的地址与密钥。',
+      baseUrlLabel: 'API Base URL（可选）',
+      baseUrlPlaceholder: '留空沿用主配置',
+      apiKeyLabel: 'API Key（换服务商时必填）',
+      apiKeyPlaceholder: '留空沿用该档已存的密钥',
+      crossProviderNote:
+        '安全边界：一把密钥只会发往它所属的服务地址。指向另一家服务商的档位必须填该家自己的密钥；把地址清空时，那把密钥会被一并丢弃。',
+      effectiveAt: (url: string) => `地址：${url || '（主配置默认）'}`,
+      test: '测试该档',
+      testing: '测试中…',
+      testOk: (ms: number) => `连接正常（${ms} ms）`,
+      testFailed: '连接失败',
+      testHint: '按已保存的配置试连；请先保存再测试。',
     },
 
     model: {

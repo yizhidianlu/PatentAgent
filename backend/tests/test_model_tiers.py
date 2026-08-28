@@ -287,3 +287,246 @@ async def test_switching_tier_takes_effect_on_the_next_run(
     await start(case_id, [StepDef(key="b", name_zh="B", handler=record)], run_group="second")
 
     assert seen == ["quick-model", "thinking-model"]
+
+
+# ---------------------------------------------------------------------------
+# 跨供应商分档：能力要给，但密钥边界必须在这里显式守住
+# ---------------------------------------------------------------------------
+
+FOREIGN = "https://another-vendor.example.com/v1"
+
+
+def test_tier_can_point_at_another_provider(admin_client: TestClient, configured) -> None:
+    """带上自己的地址与密钥时，这一档整套都换过去。"""
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {
+                "model": "vendor-b-thinking",
+                "base_url": FOREIGN,
+                "api_key": "sk-vendor-b-own-key-0001",
+            },
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    llm_service.set_active_tier("deep")
+    cfg = llm_service.load_llm_settings()
+    assert cfg.model == "vendor-b-thinking"
+    assert cfg.base_url == FOREIGN
+    assert cfg.api_key == "sk-vendor-b-own-key-0001", "应当用这一档自己的密钥"
+
+    llm_service.set_active_tier("fast")
+    fast = llm_service.load_llm_settings()
+    assert fast.base_url == "https://api.example.com/v1", "没配地址的档位仍沿用主配置"
+    assert fast.api_key == "sk-tier-test-000"
+
+
+def test_changing_host_without_a_key_is_refused(admin_client: TestClient, configured) -> None:
+    """**核心边界**：换 host 又不给密钥 = 把主密钥发给另一家。
+
+    这与本项目此前修过的密钥外发是同一形态，只是换了个入口——
+    每一处能独立设置 base_url 的地方，都是一处要重新论证「密钥去哪」的边界。
+    """
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN},   # 没给 api_key
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 400, "换了 host 又不给密钥必须拒绝"
+    assert "API Key" in r.json()["detail"]
+
+    # 拒绝之后不能留下半套配置
+    data = admin_client.get(f"{API}/settings/model-tiers").json()
+    assert data["deep"]["base_url"] != FOREIGN, "被拒绝的配置不该落库"
+
+
+def test_masked_key_cannot_be_used_to_move_a_tier_to_another_host(
+    admin_client: TestClient, configured
+) -> None:
+    """掩码值是界面自己吐出来的，不能拿它当「我有密钥」。"""
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": "sk-real-b-0001"},
+            "default_tier": "deep",
+        },
+    )
+    masked = admin_client.get(f"{API}/settings/model-tiers").json()["deep"]["api_key"]
+    assert masked and masked != "sk-real-b-0001"
+
+    # 换到第三家，密钥框里放着上一家的掩码
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-c", "base_url": "https://vendor-c.example/v1",
+                     "api_key": masked},
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 400, "掩码回落的是上一家的密钥，不能带着它换到第三家"
+
+
+def test_same_host_different_path_still_inherits_the_key(
+    admin_client: TestClient, configured
+) -> None:
+    """同一供应商换版本号是常见操作，不该被误伤。"""
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model", "base_url": "https://api.example.com/v1beta"},
+            "deep": {"model": "thinking-model"},
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 200, r.text
+    llm_service.set_active_tier("fast")
+    cfg = llm_service.load_llm_settings()
+    assert cfg.base_url == "https://api.example.com/v1beta"
+    assert cfg.api_key == "sk-tier-test-000", "同 host 应当仍回落主密钥"
+
+
+def test_tier_key_is_masked_on_read(admin_client: TestClient, configured) -> None:
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": "sk-secret-b-9999"},
+            "default_tier": "deep",
+        },
+    )
+    body = admin_client.get(f"{API}/settings/model-tiers").text
+    assert "sk-secret-b-9999" not in body, "读接口不能回明文密钥"
+
+
+def test_empty_key_on_save_keeps_the_stored_one(admin_client: TestClient, configured) -> None:
+    """只想改模型名时不必重填密钥。"""
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": "sk-keepme-0001"},
+            "default_tier": "deep",
+        },
+    )
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b-v2", "base_url": FOREIGN},   # 不带 api_key
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 200, r.text
+    llm_service.set_active_tier("deep")
+    cfg = llm_service.load_llm_settings()
+    assert cfg.model == "vendor-b-v2"
+    assert cfg.api_key == "sk-keepme-0001", "留空应当沿用该档已存的密钥"
+
+
+def test_effective_base_url_is_reported(admin_client: TestClient, configured) -> None:
+    """界面要能一眼看出每一档实际打到哪儿。"""
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": "sk-b-1"},
+            "default_tier": "deep",
+        },
+    )
+    data = admin_client.get(f"{API}/settings/model-tiers").json()
+    assert data["effective_base_url"]["fast"] == "https://api.example.com/v1"
+    assert data["effective_base_url"]["deep"] == FOREIGN
+
+
+def test_tier_test_endpoint_uses_the_saved_profile(
+    admin_client: TestClient, configured, monkeypatch
+) -> None:
+    """试连要用已保存的那一档——配错了要在跑 40 分钟之前就知道。"""
+    from app.models.settings import LlmTestResult
+    from app.services import llm as llm_mod
+
+    seen: dict = {}
+
+    async def fake_test(override=None):
+        seen["override"] = override
+        return LlmTestResult(ok=True, model="x", latency_ms=1)
+
+    monkeypatch.setattr(llm_mod, "test_llm", fake_test)
+    r = admin_client.post(f"{API}/settings/model-tiers/deep/test")
+    assert r.status_code == 200, r.text
+    assert seen["override"]["model"] == "thinking-model"
+
+
+def test_unknown_tier_test_is_404(admin_client: TestClient) -> None:
+    assert admin_client.post(f"{API}/settings/model-tiers/turbo/test").status_code == 404
+
+
+def test_tier_test_requires_admin(client: TestClient) -> None:
+    assert client.post(f"{API}/settings/model-tiers/fast/test").status_code in (401, 403)
+
+
+def test_clearing_a_tier_url_drops_that_tiers_key(admin_client: TestClient, configured) -> None:
+    """把某档的地址清回主供应商时，上一家的密钥不该跟着走，也不该因此报错。
+
+    「我把自定义地址清空了」意图很明确，不该要求用户再解释一遍；
+    但那把属于上一家的密钥必须就地丢掉，不能被带到主供应商去。
+    """
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": "sk-b-should-be-dropped"},
+            "default_tier": "deep",
+        },
+    )
+    r = admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "thinking-model"},          # 地址清空、不给密钥
+            "default_tier": "deep",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    llm_service.set_active_tier("deep")
+    cfg = llm_service.load_llm_settings()
+    assert cfg.base_url == "https://api.example.com/v1"
+    assert cfg.api_key == "sk-tier-test-000", "应当回到主密钥"
+    assert cfg.api_key != "sk-b-should-be-dropped", "上一家的密钥被带过来了"
+
+
+def test_tier_key_never_appears_in_the_audit_log(admin_client: TestClient, configured) -> None:
+    """审计留「改没改过」，不留密钥本身——审计的查看门槛比设置页低。"""
+    import json
+
+    from app.db import database as db
+
+    secret = "sk-tier-audit-never-log-7777"
+    admin_client.put(
+        f"{API}/settings/model-tiers",
+        json={
+            "fast": {"model": "quick-model"},
+            "deep": {"model": "vendor-b", "base_url": FOREIGN, "api_key": secret},
+            "default_tier": "deep",
+        },
+    )
+    blob = " ".join(str(dict(r)) for r in db.query_all("SELECT * FROM audit_log"))
+    assert secret not in blob
+    assert "tier-audit-never-log" not in blob
+
+    rows = db.query_all(
+        "SELECT * FROM audit_log WHERE action='settings_updated' AND target_id='model_tiers'"
+        " ORDER BY rowid DESC LIMIT 1"
+    )
+    detail = json.loads(dict(rows[0])["detail_json"] or "{}")
+    assert detail["deep_api_key_changed"] is True
+    assert detail["deep_base_url"] == FOREIGN

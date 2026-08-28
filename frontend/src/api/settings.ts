@@ -36,6 +36,10 @@ export interface LlmSettings {
 export interface LlmTierSettings {
   model: string
   label: string
+  /** 空 = 沿用主配置的服务地址。 */
+  base_url: string
+  /** 空 = 沿用主配置的密钥；换 host 时后端会要求必须填。 */
+  api_key: string
   temperature: number | null
   max_output_tokens: number | null
   context_window: number | null
@@ -51,13 +55,18 @@ export interface ModelTiersSettings {
 /** GET/PUT /settings/model-tiers 的响应：比请求体多「实际生效的模型名」。 */
 export interface ModelTiersOut extends ModelTiersSettings {
   base_model: string
+  base_url: string
   effective: Record<string, string>
+  /** 各档实际会打到的服务地址（留空的档位显示回落到的那个）。 */
+  effective_base_url: Record<string, string>
 }
 
 export function emptyTier(): LlmTierSettings {
   return {
     model: '',
     label: '',
+    base_url: '',
+    api_key: '',
     temperature: null,
     max_output_tokens: null,
     context_window: null,
@@ -266,6 +275,18 @@ export function useUpdateModelTiers() {
       toastSuccess(zh.settings.common.saved)
     },
     onError: (error) => toastError(error, zh.settings.common.saveFailed),
+  })
+}
+
+
+/** 按**已保存**的档位配置试连。配错了要在跑 40 分钟之前就知道。 */
+export function useTestModelTier() {
+  return useMutation({
+    mutationFn: (tier: ModelTier) =>
+      api.post<LlmTestResult>(
+        `/settings/model-tiers/${encodeURIComponent(tier)}/test`,
+        {},
+      ),
   })
 }
 

@@ -903,20 +903,28 @@ export function installMockApi(): () => void {
       }
       if (method === 'GET' || method === 'PUT') return jsonResponse(llm, 200)
     }
+    if (/\/settings\/model-tiers\/[^/]+\/test$/.test(path) && method === 'POST') {
+      return jsonResponse({ ok: true, model: 'mock', latency_ms: 412 }, 200)
+    }
     if (path.endsWith(`${API_BASE}/settings/model-tiers`)) {
       // 两档指向不同模型，聊天框上的档位开关才会渲染（同模型时它会自己隐藏）
       const tiers = {
         fast: {
           model: 'deepseek-chat',
           label: '',
+          base_url: '',
+          api_key: '',
           temperature: null,
           max_output_tokens: null,
           context_window: null,
           supports_json_mode: null,
         },
+        // 深度档演示跨供应商：自己的地址 + 自己的密钥（读接口回掩码）
         deep: {
-          model: 'deepseek-reasoner',
+          model: 'claude-opus-5',
           label: '',
+          base_url: 'https://api.anthropic.example/v1',
+          api_key: 'sk-***9c41',
           temperature: null,
           max_output_tokens: 32768,
           context_window: null,
@@ -924,7 +932,12 @@ export function installMockApi(): () => void {
         },
         default_tier: 'deep',
         base_model: 'deepseek-chat',
-        effective: { fast: 'deepseek-chat', deep: 'deepseek-reasoner' },
+        base_url: 'https://api.deepseek.com/v1',
+        effective: { fast: 'deepseek-chat', deep: 'claude-opus-5' },
+        effective_base_url: {
+          fast: 'https://api.deepseek.com/v1',
+          deep: 'https://api.anthropic.example/v1',
+        },
       }
       if (method === 'GET' || method === 'PUT') return jsonResponse(tiers, 200)
     }

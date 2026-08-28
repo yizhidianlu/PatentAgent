@@ -93,19 +93,22 @@ MODEL_TIERS: tuple[str, ...] = ("fast", "deep")
 class LlmTierSettings(BaseModel):
     """一个模型档位。
 
-    **只覆盖「用哪个模型、怎么生成」，不覆盖服务地址与密钥。**
+    留空的字段一律沿用主配置（`settings.llm`）——所以只填一个 `model` 就能用；
+    要跨供应商分档时，再把 `base_url` 与 `api_key` 一并填上。
 
-    档位回答的是「这次要快还是要想清楚」，不是「换一家供应商」。把 base_url /
-    api_key 也做成可分档会带来两件坏事：界面翻倍，以及每多一个密钥输入框就多一个
-    密钥外发的入口（那类问题这个项目已经踩过一次）。真需要跨供应商分档时再单独谈。
-
-    留空的字段一律沿用主配置（`settings.llm`）——所以只填一个 `model` 就能用。
+    **跨供应商分档有一条硬边界（在 api/settings 落地）：**
+    档位一旦指向与主配置**不同的 host**，它必须带自己的 api_key，不许回落主配置的。
+    否则「改地址、密钥留空」就等于把主密钥发给另一家——那正是本项目修过的
+    密钥外发形态，只是换了个入口。每一处能独立设置 base_url 的地方，
+    都是一处需要重新论证「密钥去哪」的边界。
     """
 
     model_config = ConfigDict(extra="ignore")
 
     model: str = ""                                  # 空 = 沿用主配置的模型
     label: str = ""                                  # 界面上显示的名字（空则用默认文案）
+    base_url: str = ""                               # 空 = 沿用主配置的服务地址
+    api_key: str = ""                                # 空 = 沿用主配置的密钥（仅限同 host）
     temperature: float | None = Field(default=None, ge=TEMPERATURE_MIN, le=TEMPERATURE_MAX)
     max_output_tokens: int | None = Field(default=None, ge=MIN_POSITIVE)
     context_window: int | None = Field(default=None, ge=MIN_POSITIVE)
@@ -114,8 +117,10 @@ class LlmTierSettings(BaseModel):
     def overlay(self) -> dict[str, Any]:
         """真正要盖到主配置上的字段（空 / None 的一律不盖）。"""
         patch: dict[str, Any] = {}
-        if self.model.strip():
-            patch["model"] = self.model.strip()
+        for name in ("model", "base_url", "api_key"):
+            value = str(getattr(self, name) or "").strip()
+            if value:
+                patch[name] = value
         for name in ("temperature", "max_output_tokens", "context_window", "supports_json_mode"):
             value = getattr(self, name)
             if value is not None:
@@ -126,6 +131,14 @@ class LlmTierSettings(BaseModel):
     def configured(self) -> bool:
         """是否配了模型——没配的档位在界面上要显示成「未配置，将使用默认模型」。"""
         return bool(self.model.strip())
+
+    @property
+    def cross_provider(self) -> bool:
+        """这一档是否指向了自己的服务地址。"""
+        return bool(self.base_url.strip())
+
+    def masked(self) -> "LlmTierSettings":
+        return self.model_copy(update={"api_key": mask_api_key(self.api_key)})
 
 
 class ModelTiersSettings(BaseModel):
@@ -143,6 +156,11 @@ class ModelTiersSettings(BaseModel):
             return None
         return getattr(self, tier)
 
+    def masked(self) -> "ModelTiersSettings":
+        return self.model_copy(
+            update={"fast": self.fast.masked(), "deep": self.deep.masked()}
+        )
+
 
 class ModelTiersOut(ModelTiersSettings):
     """GET/PUT /settings/model-tiers 响应体。
@@ -152,7 +170,10 @@ class ModelTiersOut(ModelTiersSettings):
     """
 
     base_model: str = ""
+    base_url: str = ""
     effective: dict[str, str] = Field(default_factory=dict)
+    #: 各档实际会打到的服务地址（留空的档位显示回落到的那个）。
+    effective_base_url: dict[str, str] = Field(default_factory=dict)
 
 
 EmbeddingProvider = Literal["zhipu", "dashscope", "minimax", "local", "custom"]

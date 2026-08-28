@@ -4,6 +4,7 @@ import {
   emptyTier,
   errorMessage,
   useModelTiers,
+  useTestModelTier,
   useUpdateModelTiers,
   type LlmTierSettings,
   type ModelTiersSettings,
@@ -12,12 +13,16 @@ import type { ModelTier } from '../../api/sessions'
 import { Button } from '../../components/ui/Button'
 import { Input } from '../../components/ui/Input'
 import {
+  ApiKeyInput,
   Field,
   SettingsCard,
   SettingsLoadError,
   SettingsSkeleton,
+  TestResult,
   WarningBanner,
+  type TestStatus,
 } from './SettingsPrimitives'
+import { Spinner } from '../../components/ui/Spinner'
 
 const FALLBACK: ModelTiersSettings = {
   fast: emptyTier(),
@@ -37,12 +42,20 @@ function TierFields({
   title,
   value,
   effective,
+  effectiveUrl,
   onChange,
+  onTest,
+  testing,
+  status,
 }: {
   title: string
   value: LlmTierSettings
   effective: string
+  effectiveUrl: string
   onChange: (patch: Partial<LlmTierSettings>) => void
+  onTest: () => void
+  testing: boolean
+  status: TestStatus
 }) {
   return (
     <div className="rounded-xl border border-gray-200/60 dark:border-gray-700 p-4 space-y-3">
@@ -54,6 +67,9 @@ function TierFields({
           </span>
         )}
       </div>
+      <p className="text-[11px] text-gray-400 truncate">
+        {zh.settings.tiers.effectiveAt(effectiveUrl)}
+      </p>
       <Field label={zh.settings.tiers.modelLabel}>
         {(id) => (
           <Input
@@ -87,6 +103,43 @@ function TierFields({
           )}
         </Field>
       </div>
+
+      {/* 跨供应商分档：地址与密钥都留空时，这一档完全跟随主配置 */}
+      <Field label={zh.settings.tiers.baseUrlLabel}>
+        {(id) => (
+          <Input
+            id={id}
+            value={value.base_url}
+            placeholder={zh.settings.tiers.baseUrlPlaceholder}
+            onChange={(e) => onChange({ base_url: e.target.value })}
+          />
+        )}
+      </Field>
+      <Field label={zh.settings.tiers.apiKeyLabel}>
+        {(id) => (
+          <ApiKeyInput
+            id={id}
+            value={value.api_key}
+            placeholder={zh.settings.tiers.apiKeyPlaceholder}
+            onChange={(v) => onChange({ api_key: v })}
+          />
+        )}
+      </Field>
+
+      <div className="flex items-center gap-2 flex-wrap">
+        <Button variant="secondary" size="sm" onClick={onTest} disabled={testing}>
+          {testing ? (
+            <>
+              <Spinner size="sm" />
+              {zh.settings.tiers.testing}
+            </>
+          ) : (
+            zh.settings.tiers.test
+          )}
+        </Button>
+        <span className="text-[11px] text-gray-400">{zh.settings.tiers.testHint}</span>
+      </div>
+      <TestResult status={status} />
     </div>
   )
 }
@@ -101,7 +154,38 @@ function TierFields({
 export function TiersSection() {
   const query = useModelTiers()
   const update = useUpdateModelTiers()
+  const test = useTestModelTier()
   const [form, setForm] = useState<ModelTiersSettings>(FALLBACK)
+  const [status, setStatus] = useState<Record<ModelTier, TestStatus>>({
+    fast: { kind: 'idle' },
+    deep: { kind: 'idle' },
+  })
+  const [testingTier, setTestingTier] = useState<ModelTier | null>(null)
+
+  const runTest = async (tier: ModelTier) => {
+    setTestingTier(tier)
+    setStatus((s) => ({ ...s, [tier]: { kind: 'idle' } }))
+    try {
+      const result = await test.mutateAsync(tier)
+      setStatus((s) => ({
+        ...s,
+        [tier]: result.ok
+          ? { kind: 'ok', text: zh.settings.tiers.testOk(result.latency_ms ?? 0) }
+          : { kind: 'error', text: zh.settings.tiers.testFailed, detail: result.error },
+      }))
+    } catch (e) {
+      setStatus((s) => ({
+        ...s,
+        [tier]: {
+          kind: 'error',
+          text: zh.settings.tiers.testFailed,
+          detail: errorMessage(e, ''),
+        },
+      }))
+    } finally {
+      setTestingTier(null)
+    }
+  }
 
   useEffect(() => {
     if (query.data) {
@@ -125,6 +209,8 @@ export function TiersSection() {
 
   const base = query.data?.base_model ?? ''
   const effectiveOf = (tier: ModelTier): string => form[tier].model.trim() || base
+  const urlOf = (tier: ModelTier): string =>
+    form[tier].base_url.trim() || (query.data?.base_url ?? '')
   // 两档指向同一个模型时聊天框上的开关不会渲染——这里必须说出来，
   // 否则用户会以为自己配好了，回到聊天框却找不到开关
   const sameModel = Boolean(effectiveOf('fast')) && effectiveOf('fast') === effectiveOf('deep')
@@ -146,6 +232,9 @@ export function TiersSection() {
       <p className="text-xs text-gray-500 dark:text-gray-400">
         {zh.settings.tiers.onlyModelHint}
       </p>
+      <p className="text-xs text-gray-500 dark:text-gray-400">
+        {zh.settings.tiers.crossProviderNote}
+      </p>
 
       {sameModel && <WarningBanner>{zh.settings.tiers.sameModelWarning}</WarningBanner>}
 
@@ -154,13 +243,21 @@ export function TiersSection() {
           title={zh.settings.tiers.fastTitle}
           value={form.fast}
           effective={effectiveOf('fast')}
+          effectiveUrl={urlOf('fast')}
           onChange={(patch) => setForm((f) => ({ ...f, fast: { ...f.fast, ...patch } }))}
+          onTest={() => void runTest('fast')}
+          testing={testingTier === 'fast'}
+          status={status.fast}
         />
         <TierFields
           title={zh.settings.tiers.deepTitle}
           value={form.deep}
           effective={effectiveOf('deep')}
+          effectiveUrl={urlOf('deep')}
           onChange={(patch) => setForm((f) => ({ ...f, deep: { ...f.deep, ...patch } }))}
+          onTest={() => void runTest('deep')}
+          testing={testingTier === 'deep'}
+          status={status.deep}
         />
       </div>
 

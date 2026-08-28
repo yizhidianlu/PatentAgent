@@ -34,6 +34,8 @@ from ..models.settings import (
     load_tolerant,
     ModelTiersSettings,
     ModelTiersOut,
+    LlmTierSettings,
+    MODEL_TIERS,
 )
 from ..services import llm as llm_service
 from ..services import auth as auth_service
@@ -363,44 +365,146 @@ def _load_model_tiers() -> ModelTiersSettings:
 
 
 @router.get("/model-tiers", dependencies=[Depends(current_user)],
-            response_model=ModelTiersOut, summary="读取两档模型配置（含各档实际生效的模型名）")
+            response_model=ModelTiersOut, summary="读取两档模型配置（含各档实际生效的模型与地址）")
 async def get_model_tiers() -> ModelTiersOut:
     def op() -> ModelTiersOut:
         tiers = _load_model_tiers()
         base = load_tolerant(LlmSettings, db.get_setting_json("llm") or {})
-        # 把「实际会用哪个模型」一并回出去：档位留空时回落主配置，
+        # 把「实际会用哪个模型、打到哪个地址」一并回出去：档位留空时回落主配置，
         # 界面若只显示用户填的空值，用户会以为这一档没生效
+        masked = tiers.masked()
         return ModelTiersOut(
-            fast=tiers.fast,
-            deep=tiers.deep,
+            fast=masked.fast,
+            deep=masked.deep,
             default_tier=tiers.default_tier,
             base_model=base.model,
+            base_url=base.base_url,
             effective={
                 "fast": tiers.fast.model.strip() or base.model,
                 "deep": tiers.deep.model.strip() or base.model,
+            },
+            effective_base_url={
+                "fast": tiers.fast.base_url.strip() or base.base_url,
+                "deep": tiers.deep.base_url.strip() or base.base_url,
             },
         )
 
     return await db.arun(op)
 
 
+def _merge_tier(
+    name: str,
+    submitted: LlmTierSettings,
+    stored: LlmTierSettings,
+    base: LlmSettings,
+) -> LlmTierSettings:
+    """合并一档配置，并守住密钥边界。
+
+    **不变式：一把密钥只能发往它本来所属的那个 host。**
+
+    「掩码 / 留空 = 沿用已存密钥」这个约定本身没问题，问题在于**回落来的那把密钥
+    是有归属的**。只判断「有没有密钥」不够——先把某档配成 A 家并存下 A 家的密钥，
+    再把它改成 B 家、密钥框留着界面吐出来的掩码，就会把 A 家的密钥发给 B 家。
+    这与本项目此前修过的密钥外发是同一形态，只是换了个入口，而且更隐蔽：
+    界面上看起来「这一档明明有密钥」。
+
+    所以这里跟踪密钥的**来源地址**：自己新填的密钥可以发往任何地址；
+    回落来的密钥只能发往它原本所属的那个 host。
+    """
+    supplied = (submitted.api_key or "").strip()
+    fresh = bool(supplied) and not is_masked_key(supplied)
+    target = (submitted.base_url or "").strip() or base.base_url
+
+    if fresh:
+        return submitted.model_copy(update={"api_key": supplied})
+
+    # 回落：只有当已存密钥**本来就属于这个 host** 时才留着它
+    kept = ""
+    stored_key = (stored.api_key or "").strip()
+    if stored_key:
+        owner = (stored.base_url or "").strip() or base.base_url
+        if _same_host(target, owner):
+            kept = stored_key
+        # 否则丢弃：把这一档的地址改回主供应商（或换到第三家）时，
+        # 上一家的密钥就不该再跟着走。这里静静丢掉，而不是报错——
+        # 「我把自定义地址清空了」的意图很明确，不该要求用户再解释一遍。
+
+    if not kept and target and not _same_host(target, base.base_url):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"「{name}」指向了与主配置不同的服务地址，必须同时填写该地址的 API Key。"
+                "已保存的密钥不会被发往别的服务商。"
+            ),
+        )
+    return submitted.model_copy(update={"api_key": kept})
+
+
 @router.put("/model-tiers", response_model=ModelTiersOut,
-            summary="保存两档模型配置（留空的字段沿用主配置）")
+            summary="保存两档模型配置（留空的字段沿用主配置；换 host 必须自带密钥）")
 async def put_model_tiers(
     body: ModelTiersSettings,
     request: Request,
     admin: dict[str, Any] = Depends(require_admin),
 ) -> ModelTiersOut:
-    await db.arun(db.set_setting_json, "model_tiers", body.model_dump())
+    def op() -> dict[str, bool]:
+        stored = _load_model_tiers()
+        base = load_tolerant(LlmSettings, db.get_setting_json("llm") or {})
+        merged = body.model_copy(
+            update={
+                "fast": _merge_tier("快速档", body.fast, stored.fast, base),
+                "deep": _merge_tier("深度思考档", body.deep, stored.deep, base),
+            }
+        )
+        db.set_setting_json("model_tiers", merged.model_dump())
+        return {
+            "fast": bool(body.fast.api_key and not is_masked_key(body.fast.api_key)),
+            "deep": bool(body.deep.api_key and not is_masked_key(body.deep.api_key)),
+        }
+
+    changed = await db.arun(op)
     await db.arun(
         _audit_settings, admin, request, "model_tiers",
         {
             "fast_model": body.fast.model,
             "deep_model": body.deep.model,
+            "fast_base_url": body.fast.base_url,
+            "deep_base_url": body.deep.base_url,
+            "fast_api_key_changed": changed["fast"],
+            "deep_api_key_changed": changed["deep"],
             "default_tier": body.default_tier,
         },
     )
     return await get_model_tiers()
+
+
+@router.post("/model-tiers/{tier}/test", response_model=LlmTestResult,
+             summary="用某一档的配置发一次最小 chat 测试连通性")
+async def test_model_tier(
+    tier: str,
+    request: Request,
+    admin: dict[str, Any] = Depends(require_admin),
+) -> LlmTestResult:
+    """按**已保存**的档位配置试连。
+
+    只测已保存的，不接受请求体里的临时覆盖——临时覆盖会再开一个「密钥往哪发」
+    的入口，而这个端点的全部价值只是「我刚存的这一档能不能用」。
+    配错了要在跑 40 分钟之前就知道，不是跑到一半才发现。
+    """
+    if tier not in MODEL_TIERS:
+        raise HTTPException(status_code=404, detail=f"未知档位：{tier}")
+
+    def load() -> dict[str, Any] | None:
+        profile = _load_model_tiers().get(tier)
+        return profile.overlay() if profile is not None else None
+
+    override = await db.arun(load)
+    if override:
+        base = await db.arun(_load_llm)
+        target = str(override.get("base_url") or "").strip()
+        if target and not _same_host(target, base.base_url):
+            await _audit_test_target(admin, request, f"model_tier:{tier}", override, base.base_url)
+    return await llm_service.test_llm(override)
 
 @router.get("/general", dependencies=[Depends(current_user)], response_model=GeneralSettings, summary="读取通用设置")
 async def get_general() -> GeneralSettings:
