@@ -9,12 +9,13 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from .. import APP_NAME, __version__
 from ..config import get_config
 from ..db import database as db
 from ..services import llm as llm_service
+from .deps import require_admin
 
 router = APIRouter(prefix="/system", tags=["系统"])
 
@@ -74,13 +75,24 @@ async def health() -> dict:
         "time": db.now_str(),
         # 此刻的 LLM 运行态。llm_calls 只记已完成的调用，在途的长思维链调用
         # 在任何库表里都看不见——而「现在能不能重启」恰恰取决于它。
-        # 只暴露计数与模型名，不暴露 case_id（health 无需登录）。
-        "llm": llm_service.runtime_stats(),
+        # 本端点在中间件白名单里（看门狗与更新脚本要在无会话下 curl 它），
+        # 所以只给重启决策必需的计数：不给 case_id，也不给 inflight_models
+        # ——在途模型名会把「这台机器接的是哪家上游」告诉任何能连上端口的人。
+        "llm": {k: v for k, v in llm_service.runtime_stats().items()
+                if k != "inflight_models"},
     }
 
 
-@router.get("/env", summary="环境探测：Word/soffice/浏览器/sqlite-vec/playwright/磁盘余量")
+@router.get(
+    "/env",
+    dependencies=[Depends(require_admin)],
+    summary="环境探测：Word/soffice/浏览器/sqlite-vec/playwright/磁盘余量（仅管理员）",
+)
 async def env() -> dict:
+    """**仅管理员**。这里report的每一项都是服务器内部事实：数据目录绝对路径
+    （连带泄露服务器账户名与目录结构）、Python 可执行文件路径、操作系统精确版本、
+    已装软件清单、磁盘容量。它们对运维是诊断信息，对普通用户是侦察材料——
+    普通用户既不需要也不该看到，何况平台是多用户的。"""
     cfg = get_config()
 
     def probe() -> dict:

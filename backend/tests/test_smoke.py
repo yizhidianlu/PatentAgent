@@ -18,12 +18,22 @@ def test_health(client: TestClient) -> None:
     assert body["name"] == "引途医疗专利智能体"
 
 
-def test_system_env(client: TestClient) -> None:
-    resp = client.get("/api/v1/system/env")
+def test_system_env(admin_client: TestClient) -> None:
+    resp = admin_client.get("/api/v1/system/env")
     assert resp.status_code == 200
     body = resp.json()
     assert "sqlite_vec" in body and "loaded" in body["sqlite_vec"]
     assert body["python"]["version"]
+
+
+def test_system_env_is_admin_only(client: TestClient) -> None:
+    """环境自检对普通用户不可见。
+
+    它 report 的每一项都是服务器内部事实：数据目录绝对路径（连带泄露服务器账户名
+    与目录结构）、Python 可执行文件路径、操作系统精确版本、已装软件、磁盘容量。
+    对运维是诊断信息，对普通用户是侦察材料——平台是多用户的，普通用户不该看见。
+    """
+    assert client.get("/api/v1/system/env").status_code == 403
 
 
 def test_settings_llm_masked(admin_client: TestClient) -> None:

@@ -6,6 +6,7 @@ import {
   KeyIcon,
   PaintBrushIcon,
   PhotoIcon,
+  ServerStackIcon,
   ShieldExclamationIcon,
 } from '@heroicons/react/24/outline'
 import { cn } from '../lib/cn'
@@ -15,10 +16,12 @@ import { ModelSection } from './settings/ModelSection'
 import { TiersSection } from './settings/TiersSection'
 import { EmbeddingSection } from './settings/EmbeddingSection'
 import { ImageGenSection } from './settings/ImageGenSection'
+import { SystemSection } from './settings/SystemSection'
 import { AppearanceSection } from './settings/AppearanceSection'
 import { PasswordSection } from './settings/PasswordSection'
 
-type SectionKey = 'model' | 'tiers' | 'embedding' | 'imageGen' | 'appearance' | 'password'
+type SectionKey =
+  | 'model' | 'tiers' | 'embedding' | 'imageGen' | 'system' | 'appearance' | 'password'
 
 interface SectionDef {
   key: SectionKey
@@ -28,12 +31,16 @@ interface SectionDef {
   platform?: boolean
 }
 
-/** 平台级三节（模型 / 向量 / 图像）——后端已把它们收紧为 require_admin。 */
+/** 平台级分节——后端已把对应端点收紧为 require_admin。
+ *
+ * 「系统环境」原本混在人人可见的「外观」里：数据目录绝对路径、Word/Chrome 安装
+ * 路径、操作系统版本、磁盘容量，普通用户全看得见。那是服务器内部事实，不是外观。 */
 const PLATFORM_SECTIONS: SectionDef[] = [
   { key: 'model', label: zh.settings.nav.model, Icon: CpuChipIcon, platform: true },
   { key: 'tiers', label: zh.settings.nav.tiers, Icon: BoltIcon, platform: true },
   { key: 'embedding', label: zh.settings.nav.embedding, Icon: CircleStackIcon, platform: true },
   { key: 'imageGen', label: zh.settings.nav.imageGen, Icon: PhotoIcon, platform: true },
+  { key: 'system', label: zh.settings.nav.system, Icon: ServerStackIcon, platform: true },
 ]
 
 /** 人人可见的两节。 */
@@ -64,7 +71,7 @@ function PlatformNotice() {
  *
  * M8 起按角色分岔（auth-system.md §4.3）：
  * - 普通用户只见「外观」「修改密码」；
- * - 管理员额外见「模型服务」「向量与检索」「图像生成」，并在这三节顶部标注
+ * - 管理员额外见「模型服务」「模型档位」「向量与检索」「图像生成」「系统环境」，并在这些节顶部标注
  *   「平台级设置，对全部用户生效」。
  *
  * 前端隐藏只是体验，后端对这三个 settings 端点挂了 require_admin 做兜底。
@@ -147,6 +154,7 @@ export function SettingsPage() {
           {active === 'tiers' && <TiersSection />}
           {active === 'embedding' && <EmbeddingSection />}
           {active === 'imageGen' && <ImageGenSection />}
+          {active === 'system' && <SystemSection />}
           {active === 'appearance' && <AppearanceSection />}
           {active === 'password' && <PasswordSection />}
         </div>

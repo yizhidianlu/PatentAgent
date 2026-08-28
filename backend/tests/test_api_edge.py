@@ -1229,13 +1229,25 @@ def test_method_not_allowed_on_json_routes(client: TestClient) -> None:
     assert client.get(f"{API}/auth/login").status_code == 405
 
 
-def test_health_and_env(client: TestClient) -> None:
+def test_health_and_env(client: TestClient, admin_client: TestClient) -> None:
     health = client.get(f"{API}/system/health").json()
     assert health["ok"] is True and health["name"] == "引途医疗专利智能体"
 
-    env = client.get(f"{API}/system/env").json()
+    env = admin_client.get(f"{API}/system/env").json()
     for key in ("python", "word", "soffice", "chrome", "sqlite_vec", "data_dir", "playwright"):
         assert key in env, key
+    assert client.get(f"{API}/system/env").status_code == 403, "普通用户不该看到服务器环境"
+
+
+def test_public_health_does_not_name_upstream_models(client: TestClient) -> None:
+    """/system/health 在中间件白名单里（看门狗要在无会话下 curl 它）。
+
+    正因为它无需登录，就不能顺带告诉任何能连上端口的人「这台机器接的是哪家上游」。
+    重启决策要的是计数（inflight / queued），不是模型名。
+    """
+    llm = client.get(f"{API}/system/health").json()["llm"]
+    assert "inflight" in llm and "queued" in llm, "重启决策需要的计数必须保留"
+    assert "inflight_models" not in llm
 
 
 def test_browser_probe_never_raises(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

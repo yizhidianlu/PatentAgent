@@ -881,6 +881,7 @@ export const zh = {
       tiers: '模型档位',
       embedding: '向量与检索',
       imageGen: '图像生成',
+      system: '系统环境',
       appearance: '外观',
       password: '修改密码',
     },
@@ -1032,9 +1033,14 @@ export const zh = {
       previewLink: '查看原图',
       usageNote: '实用新型 / 外观线稿功能将使用此配置；测试出图会真实消耗服务商额度。',
     },
+    system: {
+      title: '系统环境',
+      desc: '服务器上的数据目录与运行环境自检。仅管理员可见。',
+    },
+
     appearance: {
       title: '外观',
-      desc: '主题、语言与本地环境信息。',
+      desc: '主题与语言。',
       theme: '主题',
       themeModes: {
         light: '浅色',
