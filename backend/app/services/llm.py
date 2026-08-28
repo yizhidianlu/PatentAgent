@@ -664,10 +664,19 @@ _inflight_seq = itertools.count(1)
 _gate_waiting = 0
 
 
-def _track_call(model: str) -> int:
+def _track_call(model: str, case_id: str | None = None) -> int:
     token = next(_inflight_seq)
-    _inflight[token] = {"model": model, "started": time.monotonic()}
+    _inflight[token] = {"model": model, "started": time.monotonic(), "case_id": case_id or ""}
     return token
+
+
+def _inflight_for_case(case_id: str) -> int:
+    """某案件此刻的在途上游调用数（progress 的停滞判定靠它区分「等待」与「失联」）。"""
+    return sum(1 for c in _inflight.values() if c.get("case_id") == case_id)
+
+
+# progress 不能反向 import llm（循环依赖），探针在此注入
+progress.set_inflight_probe(_inflight_for_case)
 
 
 def _untrack_call(token: int) -> None:
@@ -740,8 +749,13 @@ async def _acquire_slot(
     return gate
 
 
+# **不变量：REASONING_HEARTBEAT_MAX_SEC 必须严格小于 progress.STALL_AFTER_SEC。**
+# 曾经是 120 > 90：每个心跳周期的尾部 30 秒，停滞检测检测到的是自己的心跳周期，
+# 不是外部调用的死活——思考 500 秒的一步被冤枉三次「卡住」（部署端从调用账里挖出）。
+# 主判定已改为直接询问在途登记（不依赖分片到达）；这条不变量是给心跳文案节奏
+# 自身的兜底，有测试盯着，两个常量再各自演进也交叉不了。
 REASONING_HEARTBEAT_SEC = 20.0
-REASONING_HEARTBEAT_MAX_SEC = 120.0
+REASONING_HEARTBEAT_MAX_SEC = 60.0
 
 
 def _empty_output_hint(model: str, finish: Any) -> str:
@@ -821,7 +835,7 @@ async def chat(
             slot = await _acquire_slot(
                 cfg.base_url, case_id=case_id, step_key=step_key, model=cfg.model
             )
-            token = _track_call(cfg.model)
+            token = _track_call(cfg.model, case_id)
             try:
                 return await client.chat.completions.create(**_build())
             finally:
@@ -974,7 +988,7 @@ async def chat_stream(
         stream_slot = await _acquire_slot(
             cfg.base_url, case_id=case_id, step_key=step_key, model=cfg.model
         )
-        stream_token = _track_call(cfg.model)
+        stream_token = _track_call(cfg.model, case_id)
         while True:
             stream = await _open_learning()
             got_content = False
@@ -1003,6 +1017,10 @@ async def chat_stream(
                     thought = _reasoning_text(delta)
                     if thought:
                         reasoning_chars += len(thought)
+                        # 每一片思维链都是「还活着」的实证：直接刷新证据时钟，
+                        # 不等下一次周期性 notify——notify 的间隔只服务于
+                        # 「给用户看的文案节奏」，不该兼任停滞判定的数据源
+                        progress.touch(case_id)
                         now = time.perf_counter()
                         if not got_content and now - beat_at >= beat_gap:
                             beat_at = now

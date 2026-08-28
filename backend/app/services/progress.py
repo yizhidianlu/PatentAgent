@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,12 +40,36 @@ BEAT_SEC = 5.0
 # 长思维链模型有自己的 20 秒心跳会不断刷新证据，所以真的静默 90 秒基本都是异常。
 STALL_AFTER_SEC = 90.0
 
+# 「本案有没有在途的上游调用」探针，由 services/llm 在导入时注入
+# （progress 不能反向 import llm——那是循环依赖）。
+#
+# 为什么停滞判定必须问它而不是只看 idle：思维链模型的纯思考期可以静默几百秒，
+# 靠「分片到达才刷新证据」的心跳有两个死穴——间隔一旦超过停滞阈值就周期性误报；
+# 供应商不推分片时一次都不发，误报常亮。而在途登记在 create 发出时就存在，
+# **不依赖对方先说话**。真正的死连接由 read timeout 判死，那是它的职责。
+_inflight_probe: Callable[[str], int] | None = None
+
+
+def set_inflight_probe(probe: Callable[[str], int]) -> None:
+    global _inflight_probe
+    _inflight_probe = probe
+
+
+def _upstream_inflight(case_id: str) -> int:
+    if _inflight_probe is None:
+        return 0
+    try:
+        return int(_inflight_probe(case_id) or 0)
+    except Exception:  # noqa: BLE001 —— 探针坏了不能连累进度上报
+        return 0
+
 
 @dataclass
 class StepProgress:
     """一个正在执行的步骤的进度状态（进程内，随步骤结束丢弃）。"""
 
     step_key: str
+    case_id: str = ""
     name_zh: str = ""
     phase: str = ""                     # L2：这一步内部当前在做的事
     index: int | None = None            # L2：真实循环变量，禁止估算
@@ -64,8 +89,11 @@ class StepProgress:
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
         idle_ms = int((now - self.changed_at) * 1000)
-        # 挂起等用户时不判卡住——那不是异常，是设计好的停顿
-        stalled = (not self.suspended) and idle_ms >= STALL_AFTER_SEC * 1000
+        # 挂起等用户时不判卡住——那不是异常，是设计好的停顿。
+        # 上游有在途调用时同样不判卡住——那是等待，不是失联；
+        # 「等了很久」如实报 idle，但不配「无响应，可取消重试」那句话。
+        upstream = _upstream_inflight(self.case_id) if self.case_id else 0
+        stalled = (not self.suspended) and upstream == 0 and idle_ms >= STALL_AFTER_SEC * 1000
         data: dict[str, Any] = {
             "step_key": self.step_key,
             "name_zh": self.name_zh,
@@ -81,6 +109,10 @@ class StepProgress:
             data["total"] = self.total
         if self.waiting_for:
             data["waiting_for"] = self.waiting_for
+        if upstream:
+            data["upstream_inflight"] = upstream
+            if not data.get("waiting_for"):
+                data["waiting_for"] = "模型响应"
         if stalled:
             data["stall_hint"] = self._stall_hint(idle_ms)
         return data
@@ -100,7 +132,7 @@ _active: dict[str, StepProgress] = {}
 
 
 def begin(case_id: str, step_key: str, name_zh: str = "") -> StepProgress:
-    p = StepProgress(step_key=step_key, name_zh=name_zh)
+    p = StepProgress(step_key=step_key, case_id=case_id, name_zh=name_zh)
     _active[case_id] = p
     return p
 

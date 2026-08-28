@@ -242,3 +242,62 @@ def _fake_arun(rows):
         return fn(*args, **kwargs)
 
     return _arun
+
+
+# ---------------------------------------------------------------------------
+# 停滞判定 × 在途探针：等待 ≠ 失联
+# ---------------------------------------------------------------------------
+
+
+def test_inflight_upstream_call_suppresses_stall(monkeypatch) -> None:
+    """上游有在途调用时不判卡住——那是等待，不是失联。
+
+    部署端从调用账里挖出的误报：思维链心跳间隔上限（曾 120s）大于停滞阈值（90s），
+    每个心跳周期的尾部 30 秒界面都在对一个正常思考的调用喊「卡住」；
+    思考 500 秒的一步被冤枉三次。更糟的分支：供应商不推思维链分片时心跳一次不发，
+    停滞提示从 90 秒起常亮到正文开始。在途登记在 create 发出时就存在，
+    **不依赖对方先说话**——停滞判定问它，不问心跳。
+    """
+    from app.services import progress
+
+    p = progress.begin("stall-case", "extraction", "深读论文")
+    p.changed_at = time.monotonic() - 500          # 静默 500 秒（纯思考期形态）
+
+    monkeypatch.setattr(progress, "_inflight_probe", lambda case_id: 1)
+    snap = p.snapshot()
+    assert snap["stalled"] is False, "在途调用存在时不得判卡住"
+    assert snap["upstream_inflight"] == 1
+    assert snap["waiting_for"] == "模型响应"
+    assert snap["idle_ms"] >= 490_000, "idle 要如实报，只是不配「可取消重试」那句话"
+
+    monkeypatch.setattr(progress, "_inflight_probe", lambda case_id: 0)
+    snap2 = p.snapshot()
+    assert snap2["stalled"] is True, "在途归零后同样的静默必须立刻恢复可判"
+
+
+def test_probe_failure_never_breaks_progress(monkeypatch) -> None:
+    """探针坏了不能连累进度上报（宁可误报卡住，不能没有进度）。"""
+    from app.services import progress
+
+    def boom(case_id: str) -> int:
+        raise RuntimeError("probe broken")
+
+    monkeypatch.setattr(progress, "_inflight_probe", boom)
+    p = progress.begin("probe-broken", "s")
+    snap = p.snapshot()          # 不抛异常即通过
+    assert "stalled" in snap
+
+
+def test_heartbeat_interval_stays_below_stall_threshold() -> None:
+    """不变量：心跳间隔上限 < 停滞阈值。
+
+    两个常量在不同文件里各自演进，曾经交叉（120 > 90）——停滞检测检测到的
+    是自己的心跳周期。这条测试让它们再也交叉不了。
+    """
+    from app.services import llm as llm_mod
+    from app.services import progress
+
+    assert llm_mod.REASONING_HEARTBEAT_MAX_SEC < progress.STALL_AFTER_SEC, (
+        f"心跳间隔上限 {llm_mod.REASONING_HEARTBEAT_MAX_SEC}s 必须小于停滞阈值 "
+        f"{progress.STALL_AFTER_SEC}s，否则长思考期会周期性误报「卡住」"
+    )
