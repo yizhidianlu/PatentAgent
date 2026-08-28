@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..db import database as db
+from .stream_filter import TailMuter
 from ..models.disclosure import ClaimFormAudit, FormulaPlan, Skeleton, TerminologySheet
 from . import assembler, assets_loader, terminology
 from . import figure_plan as figure_plan_service
@@ -186,12 +187,22 @@ async def stream_gen(
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
     chunks: list[str] = []
+    # 契约 JSON 尾巴（terms_delta 等）不进人看的通道；完整文本原样返回给解析方。
+    # mermaid 围栏照常放行——TailMuter 只静音 ```json 与围栏外的裸 JSON 行
+    muter = TailMuter()
+
+    async def _forward(text: str) -> None:
+        if not text:
+            return
+        if channel == "chat":
+            await ctx.chat_delta(text)
+        else:
+            await ctx.doc_delta(doc_id, text)
+
     async for delta in ctx.llm.chat_stream(messages(system, user), **kwargs):
         chunks.append(delta)
-        if channel == "chat":
-            await ctx.chat_delta(delta)
-        else:
-            await ctx.doc_delta(doc_id, delta)
+        await _forward(muter.feed(delta))
+    await _forward(muter.flush())
     if channel == "chat":
         await ctx.chat_done()
     else:

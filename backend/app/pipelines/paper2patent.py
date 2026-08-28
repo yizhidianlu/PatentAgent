@@ -44,6 +44,7 @@ from ..services import artifacts as artifacts_service
 from ..services import paths as paths_service
 from ..services import assembler, claims_lint, faithfulness
 from ..services import drawings as drawings_service
+from ..services.stream_filter import TailMuter
 from ..services import export_pdf as export_pdf_service
 from ..services import llm as llm_service
 from ..services.convert import run_tool
@@ -214,12 +215,22 @@ async def _stream_gen(
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
     chunks: list[str] = []
+    # 契约 JSON 尾巴不进人看的通道：完整文本（含尾巴）原样返回给解析方，
+    # 但转发给 chat/doc 的只有正文——用户不该看到与正文重复的机器契约
+    muter = TailMuter()
+
+    async def _forward(text: str) -> None:
+        if not text:
+            return
+        if channel == "chat":
+            await ctx.chat_delta(text)
+        else:
+            await ctx.doc_delta(DOC_ID, text)
+
     async for delta in ctx.llm.chat_stream(_messages(system, user), **kwargs):
         chunks.append(delta)
-        if channel == "chat":
-            await ctx.chat_delta(delta)
-        else:
-            await ctx.doc_delta(DOC_ID, delta)
+        await _forward(muter.feed(delta))
+    await _forward(muter.flush())
     if channel == "chat":
         await ctx.chat_done()
     else:
