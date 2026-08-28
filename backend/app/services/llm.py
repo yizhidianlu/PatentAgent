@@ -638,6 +638,64 @@ def _record_call(
 
 # 长思维链期间的「还活着」心跳间隔（秒）：首拍 20s，之后逐次翻倍至 120s 封顶。
 # 推理型模型的正文可能几分钟后才开始吐，全程无反馈用户会以为程序卡死。
+# ---------------------------------------------------------------------------
+# 上游并发闸（按模型服务 host）
+# ---------------------------------------------------------------------------
+#
+# 多个用户的流水线同时在跑时，每条流水线都在向同一个订阅打思维链长调用。
+# 订阅的并发上限是硬的（超了就是 429/1302），而各调用方各自指数退避的结果是：
+# 谁都在等、谁也不知道自己排第几、重试撞车再退避——实测里这表现为
+# 「触发限流（第 N/8 次）」的雪崩。改成进程内按 host 排队（FIFO），
+# 上游看到的并发永远不超上限，429 从常态变成异常。
+#
+# 单进程部署下进程内信号量即全局闸（与 rate_limit.py 的前提一致：
+# Word COM 要求单进程，多 worker 本来就起不了）。
+
+_host_gates: dict[str, asyncio.Semaphore] = {}
+
+
+def _concurrency_limit() -> int:
+    """并发上限（独立函数便于测试替换；0 = 不设闸）。"""
+    from ..config import get_config
+
+    return int(getattr(get_config(), "llm_max_concurrency", 0) or 0)
+
+
+def _gate_for(base_url: str) -> asyncio.Semaphore | None:
+    limit = _concurrency_limit()
+    if limit <= 0:
+        return None
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit((base_url or "").strip()).netloc or "default").lower()
+    except ValueError:
+        host = "default"
+    gate = _host_gates.get(host)
+    if gate is None:
+        gate = _host_gates.setdefault(host, asyncio.Semaphore(limit))
+    return gate
+
+
+async def _acquire_slot(
+    base_url: str, *, case_id: str | None, step_key: str | None, model: str
+) -> asyncio.Semaphore | None:
+    """占一个上游通道；需要排队时告知用户在等什么（并刷新进度的证据时钟）。"""
+    gate = _gate_for(base_url)
+    if gate is None:
+        return None
+    if gate.locked():
+        # kind="progress"：排队是「确实在动」的一种，别让卡住检测误报
+        await _notify(
+            case_id,
+            f"同一模型服务的并发通道已满（上限 {_concurrency_limit()}），"
+            f"{model} 的调用正在排队等待空闲通道……",
+            persist=False, step_key=step_key, kind="progress",
+        )
+    await gate.acquire()
+    return gate
+
+
 REASONING_HEARTBEAT_SEC = 20.0
 REASONING_HEARTBEAT_MAX_SEC = 120.0
 
@@ -716,7 +774,14 @@ async def chat(
             return _apply_quirks(cfg.model, kw)
 
         async def _send() -> Any:
-            return await client.chat.completions.create(**_build())
+            slot = await _acquire_slot(
+                cfg.base_url, case_id=case_id, step_key=step_key, model=cfg.model
+            )
+            try:
+                return await client.chat.completions.create(**_build())
+            finally:
+                if slot is not None:
+                    slot.release()
 
         async def _send_learning() -> Any:
             # transient_budget=1：连接类故障在非流式路径上重试没有意义
@@ -819,6 +884,7 @@ async def chat_stream(
     started = time.perf_counter()
     status, error = "ok", None
     prompt_tokens = completion_tokens = None
+    stream_slot: asyncio.Semaphore | None = None
     try:
         def _build() -> dict[str, Any]:
             kw: dict[str, Any] = dict(
@@ -858,6 +924,9 @@ async def chat_stream(
         # （无法续传），只能把异常上抛，由用户决定是否重试该步。
         budget_grown = 0
         restarts = 0
+        stream_slot = await _acquire_slot(
+            cfg.base_url, case_id=case_id, step_key=step_key, model=cfg.model
+        )
         while True:
             stream = await _open_learning()
             got_content = False
@@ -951,6 +1020,8 @@ async def chat_stream(
         status, error = "error", str(exc)[:2000]
         raise
     finally:
+        if stream_slot is not None:
+            stream_slot.release()
         duration = int((time.perf_counter() - started) * 1000)
         # token 数来自 stream_options.include_usage 的收尾帧；端点不支持时仍为 None
         _record_call(
@@ -1227,11 +1298,16 @@ async def test_llm(override: dict[str, Any] | None = None) -> LlmTestResult:
     client = _client(cfg.base_url, cfg.api_key, timeout=TEST_TIMEOUT)
     started = time.perf_counter()
     try:
-        resp = await client.chat.completions.create(
-            model=cfg.model,
-            messages=[{"role": "user", "content": "你好"}],
-            max_tokens=1,
-        )
+        slot = await _acquire_slot(cfg.base_url, case_id=None, step_key=None, model=cfg.model)
+        try:
+            resp = await client.chat.completions.create(
+                model=cfg.model,
+                messages=[{"role": "user", "content": "你好"}],
+                max_tokens=1,
+            )
+        finally:
+            if slot is not None:
+                slot.release()
         latency = int((time.perf_counter() - started) * 1000)
         model_name = getattr(resp, "model", None) or cfg.model
         _record_call(case_id=None, step_key="settings.llm_test", model=cfg.model,

@@ -380,7 +380,14 @@ Add-Content -Path D:\PatentAgentRestoreTest\outputs\<case>\<正文>.md -Value "`
   `pre-*.db` 按天保留（默认 30 天，且无论多旧至少留最近 10 份）——按份数保留在
   一天推数次的节奏下会把上周那个唯一正确的回退点挤掉，而那种更新恰恰最需要回退点。
 - **忘记管理员密码**：无找回入口（设计如此）。可用 `backend/.venv` 的 Python 直连 `app.db`，调用 `app.services.auth.set_password(user_id, 新密码)` 重置。
-- **并发**：1–10 人规模下 SQLite（WAL）与单进程 asyncio 完全够用。Word COM 由全局锁串行，多人同时导出 PDF 会排队但不会出错。若将来超过这个规模，再考虑 PostgreSQL + 多实例。
+- **LLM 并发闸**：同一模型服务地址的并发调用数由 `LLM_MAX_CONCURRENCY` 控制（默认 3，
+  0 = 不设闸）。两档模型共用一个订阅时，多人同时跑流水线会撞订阅的并发上限——
+  在自己门口 FIFO 排队比在服务商门口被 429 后各自退避更快也更公平。排队会在
+  界面上显示「排队等待空闲通道」。订阅并发额度高的可以调大。
+- **并发**：1–10 人规模下 SQLite（WAL）与单进程 asyncio 完全够用。
+  压测参考（scripts\loadtest.py，回环网卡）：20 用户读写混合 259 ops/s、
+  全操作 p95 ≤ 126ms、零错误；20 路并发登录 p95 ≈ 1s（argon2id 属预期开销，
+  瞬时内存 +1.3GB 左右，服务器内存按此预留）。Word COM 由全局锁串行，多人同时导出 PDF 会排队但不会出错。若将来超过这个规模，再考虑 PostgreSQL + 多实例。
 - **磁盘**：交付物只增不改（版本永不覆盖），会持续增长。定期检查 `DATA_DIR` 占用，可按案件归档旧数据。
 
 ---
