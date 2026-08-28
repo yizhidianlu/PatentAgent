@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import random
@@ -653,6 +654,44 @@ def _record_call(
 
 _host_gates: dict[str, asyncio.Semaphore] = {}
 
+# 在途调用登记：token → {model, started}。
+#
+# llm_calls 表只在调用**结束**后记账——一个跑了 15 分钟还没回来的思维链调用
+# 在任何库表里都不可见。运维要判断「现在能不能重启」时，已完成记录的滞后
+# 恰好在最不该打断的时刻最长；这里登记的是**此刻**，配 /system/health 暴露。
+_inflight: dict[int, dict[str, Any]] = {}
+_inflight_seq = itertools.count(1)
+_gate_waiting = 0
+
+
+def _track_call(model: str) -> int:
+    token = next(_inflight_seq)
+    _inflight[token] = {"model": model, "started": time.monotonic()}
+    return token
+
+
+def _untrack_call(token: int) -> None:
+    _inflight.pop(token, None)
+
+
+def runtime_stats() -> dict[str, Any]:
+    """此刻的 LLM 运行态（给 /system/health 与更新前置检查用）。
+
+    - `inflight` > 0 ⇒ 正有生成在途，重启会烧掉几十分钟的产出；
+    - `queued` 持续 > 0 而 `inflight` < 并发闸上限 ⇒ 闸可能泄漏
+      （slot 被占却没有对应的在途调用）——这两种状态在 llm_calls 里
+      长得一模一样，只有这里能区分。
+    """
+    now = time.monotonic()
+    oldest = max((now - c["started"] for c in _inflight.values()), default=0.0)
+    return {
+        "inflight": len(_inflight),
+        "queued": _gate_waiting,
+        "oldest_inflight_sec": int(oldest),
+        "concurrency_limit": _concurrency_limit(),
+        "inflight_models": sorted({c["model"] for c in _inflight.values()}),
+    }
+
 
 def _concurrency_limit() -> int:
     """并发上限（独立函数便于测试替换；0 = 不设闸）。"""
@@ -684,6 +723,7 @@ async def _acquire_slot(
     gate = _gate_for(base_url)
     if gate is None:
         return None
+    global _gate_waiting
     if gate.locked():
         # kind="progress"：排队是「确实在动」的一种，别让卡住检测误报
         await _notify(
@@ -692,7 +732,11 @@ async def _acquire_slot(
             f"{model} 的调用正在排队等待空闲通道……",
             persist=False, step_key=step_key, kind="progress",
         )
-    await gate.acquire()
+    _gate_waiting += 1
+    try:
+        await gate.acquire()
+    finally:
+        _gate_waiting -= 1
     return gate
 
 
@@ -777,9 +821,11 @@ async def chat(
             slot = await _acquire_slot(
                 cfg.base_url, case_id=case_id, step_key=step_key, model=cfg.model
             )
+            token = _track_call(cfg.model)
             try:
                 return await client.chat.completions.create(**_build())
             finally:
+                _untrack_call(token)
                 if slot is not None:
                     slot.release()
 
@@ -885,6 +931,7 @@ async def chat_stream(
     status, error = "ok", None
     prompt_tokens = completion_tokens = None
     stream_slot: asyncio.Semaphore | None = None
+    stream_token: int | None = None
     try:
         def _build() -> dict[str, Any]:
             kw: dict[str, Any] = dict(
@@ -927,6 +974,7 @@ async def chat_stream(
         stream_slot = await _acquire_slot(
             cfg.base_url, case_id=case_id, step_key=step_key, model=cfg.model
         )
+        stream_token = _track_call(cfg.model)
         while True:
             stream = await _open_learning()
             got_content = False
@@ -1020,6 +1068,8 @@ async def chat_stream(
         status, error = "error", str(exc)[:2000]
         raise
     finally:
+        if stream_token is not None:
+            _untrack_call(stream_token)
         if stream_slot is not None:
             stream_slot.release()
         duration = int((time.perf_counter() - started) * 1000)

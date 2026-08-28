@@ -14,6 +14,7 @@ from fastapi import APIRouter
 from .. import APP_NAME, __version__
 from ..config import get_config
 from ..db import database as db
+from ..services import llm as llm_service
 
 router = APIRouter(prefix="/system", tags=["系统"])
 
@@ -71,6 +72,10 @@ async def health() -> dict:
         "version": __version__,
         "revision": _git_revision(),
         "time": db.now_str(),
+        # 此刻的 LLM 运行态。llm_calls 只记已完成的调用，在途的长思维链调用
+        # 在任何库表里都看不见——而「现在能不能重启」恰恰取决于它。
+        # 只暴露计数与模型名，不暴露 case_id（health 无需登录）。
+        "llm": llm_service.runtime_stats(),
     }
 
 

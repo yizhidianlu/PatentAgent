@@ -178,3 +178,51 @@ async def test_queueing_is_announced_as_progress(monkeypatch) -> None:
     finally:
         gate.release()
         gate.release()
+
+
+# ---------------------------------------------------------------------------
+# 在途可见性：记录有滞后，状态没有
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_inflight_calls_are_visible_while_running(monkeypatch) -> None:
+    """llm_calls 只记已完成的调用；「现在能不能重启」取决于在途的那些。
+
+    部署端的真实教训：一个跑了 15 分钟还没回来的思维链调用，在任何库表里
+    都不可见——「最近一次调用在 15 分钟前」既可能是空闲，也可能正是
+    最不该打断的时刻。runtime_stats 暴露的是此刻。
+    """
+    llm._MODEL_QUIRKS[MODEL] = {"stream_chat": True}
+    tracker = Tracker()
+    monkeypatch.setattr(llm, "_client", lambda *a, **k: FakeClient(tracker))
+
+    seen: dict = {}
+
+    async def one() -> str:
+        return await llm.chat([{"role": "user", "content": "hi"}], override=OVERRIDE)
+
+    async def watch() -> None:
+        await asyncio.sleep(0.05)          # 等调用真正在途
+        seen.update(llm.runtime_stats())
+
+    results, _ = await asyncio.gather(asyncio.gather(*[one() for _ in range(4)]), watch())
+
+    assert seen["inflight"] >= 1, "在途期间 runtime_stats 必须能看见调用"
+    assert seen["inflight"] <= 2, "在途数不该超过并发闸上限"
+    assert seen["queued"] >= 1, "闸满时排队数也要可见——泄漏判定靠 queued 与 inflight 的组合"
+    assert MODEL in seen["inflight_models"]
+
+    after = llm.runtime_stats()
+    assert after["inflight"] == 0 and after["queued"] == 0, "跑完必须清零，否则指标本身在说谎"
+    assert all(r == "片段一片段二" for r in results)
+
+
+def test_health_endpoint_exposes_llm_runtime(client) -> None:
+    """更新前置检查只需一次 GET /system/health，不必再做 netstat 取证。"""
+    r = client.get("/api/v1/system/health")
+    assert r.status_code == 200
+    stats = r.json().get("llm")
+    assert stats is not None, "health 必须带 llm 运行态"
+    for key in ("inflight", "queued", "oldest_inflight_sec", "concurrency_limit"):
+        assert key in stats, f"缺字段 {key}"
