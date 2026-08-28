@@ -540,7 +540,6 @@ def _utility_llm() -> FakeLLM:
         stream={
             "recap": "- 技术主题：电控盒壳体结构改进\n- 专利类型：实用新型\n- 技术联系人：李四",
             "points": U_POINTS_MD,
-            "preview": U_PREVIEW_MD,
             "u1": U_CH1,
             "u2": U_CH3,
             "u3": U_CH35,
@@ -548,6 +547,15 @@ def _utility_llm() -> FakeLLM:
         },
         chat={"u4.repair1": U_CH456_FIXED},
         struct_={
+            "preview": {
+                "case_title": "一种电控盒壳体的卡扣式装配结构",
+                "patent_type": "utility_model",
+                "tech_problems": ["螺钉装配效率低", "反复拆装导致孔位滑丝"],
+                "key_parts": ["壳体", "卡扣臂", "限位筋", "散热孔阵"],
+                "distinction": "以弹性卡扣臂与限位筋配合实现免工具装配。",
+                "searched": True,
+                "markdown": U_PREVIEW_MD,
+            },
             "digest.0": U_MATERIAL_DIGEST,
             "schema": U_STRUCTURE_SCHEMA,
             "figure_plan": U_FIGURE_PLAN,
@@ -748,11 +756,18 @@ def _design_llm() -> FakeLLM:
         stream={
             "recap": "- 技术主题：折叠台灯外观\n- 专利类型：外观设计\n- 技术联系人：李四",
             "points": D_POINTS_MD,
-            "preview": D_PREVIEW_MD,
             "d1": D_CH123,
             "d2": D_CH45,
         },
         struct_={
+            "preview": {
+                "case_title": "折叠台灯（曲面过渡型）",
+                "patent_type": "design",
+                "design_points": ["灯臂曲面过渡", "底座同心圆纹理"],
+                "distinction": "灯臂与底座以连续曲面过渡，区别于直角折弯的在先设计。",
+                "searched": False,
+                "markdown": D_PREVIEW_MD,
+            },
             "digest.0": D_MATERIAL_DIGEST,
             "schema": D_APPEARANCE_SCHEMA,
             "figure_plan": D_FIGURE_PLAN,

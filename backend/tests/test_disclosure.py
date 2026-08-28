@@ -506,7 +506,6 @@ CLAIM_BIAS_FIXED = {
 STREAM_SCRIPT: dict[str, str] = {
     "recap": "- 技术主题：批量作业调度\n- 专利类型：发明\n- 技术联系人：张三 / 13800000000 / zhangsan@example.com",
     "points": POINTS_MD,
-    "preview": PREVIEW_MD,
     "g1": CH1,
     "g2": CH3_BAD,
     "g3": CH34,
@@ -519,8 +518,19 @@ CHAT_SCRIPT: dict[str, str] = {
     "g2.repair1": CH3_FIXED,
 }
 
+PREVIEW_STRUCT: dict[str, Any] = {
+    "case_title": "一种基于负载画像的批量作业调度方法及系统",
+    "patent_type": "invention",
+    "tech_problems": ["固定权重不感知节点实时资源", "单阈值反复触发导致派发抖动"],
+    "core_modules": ["负载画像采集", "匹配分计算", "双条件限频裁决", "执行反馈回写"],
+    "distinction": "以滑动窗口平滑得到的负载画像参与匹配打分，并以双阈值限频抑制派发抖动。",
+    "searched": True,
+    "markdown": PREVIEW_MD,
+}
+
 STRUCT_SCRIPT: dict[str, Any] = {
     "digest.0": MATERIAL_DIGEST,
+    "preview": PREVIEW_STRUCT,
     "terms": SEARCH_TERMS,
     "digest.batch1": ABSTRACT_DIGESTS,
     "g0": SKELETON,

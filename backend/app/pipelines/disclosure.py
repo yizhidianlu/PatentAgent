@@ -41,6 +41,7 @@ from ulid import ULID
 from ..config import get_config
 from ..db import database as db
 from ..models.disclosure import (
+    PreviewSummary,
     AppearanceSchema,
     ClaimBias,
     Contact,
@@ -1760,6 +1761,41 @@ PREVIEW_SCHEMA: dict[str, Any] = {
 }
 
 
+_TYPE_LABELS = {"invention": "发明", "utility_model": "实用新型", "design": "外观设计"}
+
+
+def _preview_markdown(summary: "PreviewSummary") -> str:
+    """模型没填 markdown 字段时，从结构化字段确定性地拼一份摘要正文。"""
+    lines = ["### 交底书摘要预览", ""]
+    if summary.case_title:
+        lines.append(f"- **选定名称**：{summary.case_title}")
+    label = summary.patent_type_label or _TYPE_LABELS.get(summary.patent_type, summary.patent_type)
+    lines.append(f"- **专利类型**：{label}")
+    if summary.tech_problems:
+        lines.append("- **解决的技术问题**：" + "；".join(summary.tech_problems))
+    modules = summary.core_modules or summary.key_parts or summary.design_points
+    if modules:
+        lines.append("- **核心创新模块或步骤**：" + "；".join(modules))
+    if summary.figure_notes:
+        lines.append("- **附图**：" + "；".join(summary.figure_notes))
+    if summary.distinction:
+        suffix = "" if summary.searched else "（待查新）"
+        lines.append(f"- **与最相近现有技术的区别**：{summary.distinction}{suffix}")
+    return "\n".join(lines)
+
+
+def _summary_meaningful(summary: "PreviewSummary", markdown: str) -> bool:
+    """摘要是否有实质内容（全空的确认卡比失败更糟：它看起来像成功）。"""
+    return bool(
+        summary.case_title
+        or summary.tech_problems
+        or summary.core_modules
+        or summary.key_parts
+        or summary.design_points
+        or summary.markdown.strip()
+    ) and bool(markdown.strip())
+
+
 async def preview(ctx: Ctx) -> dict[str, Any]:
     """A5 摘要预览：GEN 结构化摘要 → 确认 / 调整方向（带反馈重跑）/ 跳过。"""
     feedback = ""
@@ -1784,26 +1820,49 @@ async def preview(ctx: Ctx) -> dict[str, Any]:
             },
         )
         user = (
-            "请按「摘要应包含」的条目（发明）输出结构化摘要：选定名称 / 专利类型 / 解决的技术问题 1–3 条 / "
-            "核心创新模块或步骤 3–6 条 / 与最相近现有技术的区别（未检索则标明「待查新」）。"
-            "markdown 小节标题清晰、逐条成 bullet，总长控制在一屏内；不要在末尾追加确认问句。"
+            "请按「摘要应包含」的条目输出结构化摘要：选定名称（case_title）/ 专利类型 / "
+            "解决的技术问题 1–3 条（tech_problems）/ 核心创新模块或步骤 3–6 条（core_modules，"
+            "实用新型写 key_parts、外观写 design_points）/ 与最相近现有技术的区别（distinction，"
+            "未检索则标明「待查新」）。另在 markdown 字段给出面向用户的摘要正文："
+            "小节标题清晰、逐条成 bullet，总长控制在一屏内；不要在末尾追加确认问句。"
         )
         if feedback:
             user += f"\n\n用户对上一版摘要的调整意见（须落实）：{feedback}"
-        markdown = await build_service.stream_gen(
+        summary: PreviewSummary = await build_service.call_struct(
             ctx,
+            PreviewSummary,
             tag="preview" if rounds == 1 else f"preview.round{rounds}",
             system=system,
             user=user,
-            channel="chat",
         )
+        markdown = summary.markdown.strip() or _preview_markdown(summary)
+        if not _summary_meaningful(summary, markdown):
+            # 宁可让本步失败可重试，也不能把一张五项全空的确认卡递给用户——
+            # 空卡上点「确认生成」等于对着空气拍板，后面 40 分钟成文全建立在虚无上
+            raise ValueError(
+                "模型未能产出有效的结构化摘要（名称/技术问题/核心模块全为空）。"
+                "请点「重试此步」；若反复出现，请到设置页检查当前档位的模型配置。"
+            )
+        await ctx.chat_delta(markdown)
+        await ctx.chat_done()
         answer = _answer(
             await ctx.await_user(
                 InteractionRequest(
                     kind="preview_confirm",
                     schema=PREVIEW_SCHEMA,
                     prompt="以上为成文前的结构化摘要，请确认方向；如需调整请填写反馈，平台会带反馈重跑本步。",
-                    default={"action": "confirm", "feedback": ""},
+                    default={
+                        "action": "confirm",
+                        "feedback": "",
+                        # 预览卡的五行数据从这里读。此前只发 action/feedback，
+                        # 卡片五行**在真后端上永远是「暂无」**——mock 带了这些字段
+                        # 而真后端从没带过，mock 驱动的开发把这个洞藏了几个月
+                        "name": summary.case_title,
+                        "patent_type": summary.patent_type,
+                        "problem": "；".join(summary.tech_problems),
+                        "modules": summary.core_modules or summary.key_parts or summary.design_points,
+                        "distinction": summary.distinction,
+                    },
                 )
             )
         )

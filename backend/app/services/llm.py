@@ -60,6 +60,14 @@ class LlmNotConfiguredError(RuntimeError):
     """LLM 尚未配置（缺 model 或 api_key/base_url）。"""
 
 
+class LlmQuotaError(RuntimeError):
+    """配额 / 余额类 429：与限流不同，**重试无法解决**。
+
+    限流等的是时间窗口，等就有用；配额受限等的是人（充值、等订阅窗口重置、
+    换模型）。把它们混在一起按 8 次退避重试，用户会看着倒计时白等三四分钟，
+    最后拿到一个语焉不详的失败。"""
+
+
 class LlmEmptyOutputError(RuntimeError):
     """模型返回了空正文（推理型模型最常见：token 预算被思维链吃光）。"""
 
@@ -431,6 +439,35 @@ def _is_rate_limited(exc: Exception) -> bool:
     )
 
 
+#: 「余额/配额已尽」的措辞。刻意不收「quota exceeded」这类含糊说法——
+#: 有些供应商把分钟级限流也叫 quota，误判成硬性耗尽会把可恢复的等待变成误报失败。
+_QUOTA_TOKENS = (
+    "余额不足", "无可用资源包", "请充值", "欠费",
+    "insufficient_quota", "insufficient balance", "exceeded your current quota",
+)
+
+_SERVER_MSG_RE = re.compile(r"[\"']message[\"']\s*:\s*[\"']([^\"']+)[\"']")
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    """余额/配额耗尽（重试无意义），区别于时间窗口限流（重试有意义）。"""
+    message = str(exc).lower()
+    return any(token.lower() in message for token in _QUOTA_TOKENS)
+
+
+def _server_message(exc: Exception) -> str:
+    """把服务端 JSON 里的 message 字段挖出来给用户看。
+
+    智谱那句「余额不足或无可用资源包,请充值」曾把我们引向充值，而真实含义是
+    「订阅 key 打到了按量计费端点」——错误原话的误导性再强，也强过一句
+    干巴巴的「触发限流」：至少用户和维护者拿到的是同一句话，可以去查。
+    """
+    match = _SERVER_MSG_RE.search(str(exc))
+    if match:
+        return match.group(1)[:160]
+    return str(exc)[:120]
+
+
 def _is_transient(exc: Exception) -> bool:
     """连接类瞬时故障：推理型模型一次调用要几分钟，中途被掐断并不罕见。"""
     name = type(exc).__name__
@@ -485,6 +522,7 @@ async def _with_rate_limit_retry(
     case_id: str | None = None,
     step_key: str | None = None,
     transient_budget: int = RATE_LIMIT_MAX_RETRY,
+    model: str = "",
 ) -> Any:
     """执行请求；遇限流则退避重试，其余异常原样抛出。
 
@@ -503,6 +541,17 @@ async def _with_rate_limit_retry(
         try:
             return await factory()
         except Exception as exc:  # noqa: BLE001
+            if _is_quota_exhausted(exc):
+                message = _server_message(exc)
+                who = f"模型 {model} " if model else "模型服务"
+                await _notify(
+                    case_id,
+                    f"{who}返回配额/余额受限：{message} —— 自动重试无法解决。"
+                    "请检查该模型的订阅额度或余额（订阅制额度按时间窗口重置），"
+                    "或到设置页换用其它档位/模型，然后点「重试此步」。",
+                    step_key=step_key,
+                )
+                raise LlmQuotaError(f"{who}配额或余额受限：{message}") from exc
             if not _is_retryable(exc):
                 raise
             last = exc
@@ -519,11 +568,14 @@ async def _with_rate_limit_retry(
                 "%s %s（第 %d/%d 次），%.1fs 后重试：%s",
                 what, reason, attempt + 1, RATE_LIMIT_MAX_RETRY, delay, str(exc)[:160],
             )
+            # 附上服务端原话：光说「触发限流」用户无从判断是并发超限还是
+            # 窗口配额将尽，两者的处置完全不同（等一等 vs 换档/升订阅）
+            who = f"模型 {model} " if model else "模型接口"
             await _notify(
                 case_id,
-                f"模型接口{'触发限流' if limited else '连接中断'}"
+                f"{who}{'触发限流' if limited else '连接中断'}"
                 f"（第 {attempt + 1}/{RATE_LIMIT_MAX_RETRY} 次），"
-                f"将在 {delay:.0f} 秒后自动重试，请稍候……",
+                f"将在 {delay:.0f} 秒后自动重试：{_server_message(exc)}",
                 step_key=step_key,
             )
             await asyncio.sleep(delay)
@@ -673,14 +725,14 @@ async def chat(
             try:
                 return await _with_rate_limit_retry(
                     _send, what=f"chat({cfg.model})", case_id=case_id, step_key=step_key,
-                    transient_budget=1,
+                    transient_budget=1, model=cfg.model,
                 )
             except Exception as exc:  # noqa: BLE001 —— 仅在学到参数 quirk 时重试一次
                 if not _learn_quirk(cfg.model, exc):
                     raise
                 return await _with_rate_limit_retry(
                     _send, what=f"chat({cfg.model})", case_id=case_id, step_key=step_key,
-                    transient_budget=1,
+                    transient_budget=1, model=cfg.model,
                 )
 
         # 推理型模型的思维链与正文共享预算：正文空 + finish_reason=length 时
@@ -790,14 +842,14 @@ async def chat_stream(
             try:
                 return await _with_rate_limit_retry(
                     _open_stream, what=f"chat_stream({cfg.model})",
-                    case_id=case_id, step_key=step_key,
+                    case_id=case_id, step_key=step_key, model=cfg.model,
                 )
             except Exception as exc:  # noqa: BLE001 —— 仅在学到参数 quirk 时重试一次
                 if not _learn_quirk(cfg.model, exc):
                     raise
                 return await _with_rate_limit_retry(
                     _open_stream, what=f"chat_stream({cfg.model})",
-                    case_id=case_id, step_key=step_key,
+                    case_id=case_id, step_key=step_key, model=cfg.model,
                 )
 
         # 只要**还没吐出过正文**，重开一条流永远是安全的（不会重复内容）。两类故障
@@ -915,6 +967,71 @@ async def chat_stream(
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n\s*```", re.DOTALL)
 
 
+_SCHEMA_SHAPE_KEYS = {"$schema", "properties", "required", "definitions", "$defs"}
+
+
+def _looks_like_json_schema(value: Any) -> bool:
+    """长得像 JSON Schema 的对象：模型偶尔会把提示里的约束原样回显一份。"""
+    if not isinstance(value, dict):
+        return False
+    if isinstance(value.get("properties"), dict):
+        return True
+    return len(_SCHEMA_SHAPE_KEYS & set(value)) >= 2
+
+
+def _iter_json_candidates(text: str):
+    """依次产出文本里的 JSON 候选：先 ```json 围栏块，再平衡扫描（跳过已消费段）。"""
+    for match in _JSON_FENCE_RE.finditer(text):
+        try:
+            yield json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+    decoder = json.JSONDecoder()
+    i = 0
+    while i < len(text):
+        if text[i] in "{[":
+            try:
+                value, end = decoder.raw_decode(text[i:])
+            except json.JSONDecodeError:
+                i += 1
+                continue
+            yield value
+            i += end
+        else:
+            i += 1
+
+
+def validate_from_candidates(text: str, model_cls: type[TModel]) -> TModel:
+    """在输出的全部 JSON 候选里找第一个**真正**符合目标结构的。
+
+    只取第一个 JSON 是不够的，而且错得很隐蔽：目标模型的字段多为可选时，
+    **任何 dict 都能「验证通过」成一个全默认值的空壳**——模型先回显 schema、
+    或用一层包装对象包住真数据，第一个候选就把空壳送进了流水线。
+    A5 预览卡五项全「暂无」正是这么来的：界面没报错，数据静默归零。
+
+    所以对 dict 候选加一道「至少命中一个目标字段」的门槛；
+    一个字段都对不上的，把它内层的 dict 再拆出来试（对付包装对象）。
+    """
+    fields = set(model_cls.model_fields)
+    pending: list[Any] = list(_iter_json_candidates(text))
+    last_error: ValidationError | None = None
+    while pending:
+        value = pending.pop(0)
+        if _looks_like_json_schema(value):
+            continue
+        if isinstance(value, dict) and fields and not (set(value) & fields):
+            # 零命中：本体多半是回显/包装，但真数据可能就在下一层
+            pending.extend(v for v in value.values() if isinstance(v, dict))
+            continue
+        try:
+            return model_cls.model_validate(value)
+        except ValidationError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise json.JSONDecodeError("模型输出中没有包含目标字段的合法 JSON", text[:200], 0)
+
+
 def extract_first_json(text: str) -> Any:
     """提取文本中首个合法 JSON 值：优先 ```json 围栏块，其次首个平衡的 {...} / [...]。"""
     for match in _JSON_FENCE_RE.finditer(text):
@@ -968,8 +1085,8 @@ async def structured(
                 temperature=temperature, max_output_tokens=max_output_tokens,
                 override=override, response_format=response_format, user_id=user_id,
             )
-        except LlmEmptyOutputError:
-            raise  # 空正文与 response_format 无关，去掉它重发只会白烧一次额度
+        except (LlmEmptyOutputError, LlmQuotaError):
+            raise  # 空正文/配额受限与 response_format 无关，去掉它重发只会白烧一次额度
         except Exception as exc:  # noqa: BLE001
             # 限流/连接类故障与 response_format 无关（chat() 内部已按退避重试过），
             # 再借"降级"的名义重发一遍只会把日志写歪、并把重试预算悄悄翻倍
@@ -988,8 +1105,7 @@ async def structured(
             else:
                 raise
         try:
-            data = extract_first_json(text)
-            return model_cls.model_validate(data)
+            return validate_from_candidates(text, model_cls)
         except (json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
             if attempt == 0:
