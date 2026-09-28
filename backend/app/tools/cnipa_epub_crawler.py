@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -76,8 +77,12 @@ from cnipa_epub_parse import EpubSearchHit, hits_to_jsonable, parse_search_resul
 from browser import launch_chromium
 from stdio_utf8 import ensure_utf8_stdio
 from patent_type import (
+    EPUB_CHECKBOX_IDS,
     TYPE_ALL,
+    TYPE_DESIGN,
+    TYPE_INVENTION,
     TYPE_LABEL_ZH,
+    TYPE_UTILITY_MODEL,
     epub_checkbox_states,
     epub_query_types,
     normalize_patent_type,
@@ -110,6 +115,29 @@ _RESULT_PAGE_READY_JS = """(titles) => {
     }
     return false;
 }"""
+# 结果页交互（2026-09-28 真站点取证）：
+# - 结果页按类型分页签（发明公布 / 发明授权 / 实用新型 / 外观设计），一次只显示一个页签；
+# - 默认每页 3 条，按公布公告日倒序；只有页面自己的「每页 10 条」下拉框能改，而站点只认
+#   可信的用户事件——脚本派发的 change 事件被忽略，键盘在下拉框上按 ↓ 则会带出请求；
+# - 切页签、翻页、改每页条数都是页内 AJAX（/Dxb/PageQuery），只替换 #result 的内容，
+#   点当前页签不会重新查询；请求里的 pageSize 取自隐藏域，改成 10 之后切页签、翻页都沿用。
+_MARK_JS = """() => {
+    const r = document.getElementById('result');
+    if (r) r.insertAdjacentHTML('afterbegin', '<i id="__epub_stale__"></i>');
+}"""
+_FRESH_JS = """() => {
+    const r = document.getElementById('result');
+    return !!r && !document.getElementById('__epub_stale__');
+}"""
+_PAGES_RE = re.compile(r"共\s*(\d+)\s*页")
+# 页签文字 → 类型。发明授权（B 文本）不读：内容与其发明公布（A 文本）相同，读了只会重复。
+_TAB_TYPES = {"发明公布": TYPE_INVENTION, "实用新型": TYPE_UTILITY_MODEL, "外观设计": TYPE_DESIGN}
+# 每页条数：站点只给 3 / 10 两档
+PAGE_SIZE = 10
+# 每个词每类最多翻到第几页（10 条一页）。宽泛的词命中成百上千条、按日期倒序，
+# 再往后翻拿到的也只是更多的近期无关文献；窄的词一两页就见底。
+MAX_PAGES_PER_TYPE = 2
+
 # 仅在拿不到真实内核版本时兜底用；正常路径见 desktop_user_agent()
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -131,11 +159,13 @@ TERM_STEP_CAP_MS = 45_000
 # 第 3 个词起开始卡——与此前「第 4~5 个词后耗时陡增」的观察一致，像是触发了限频。
 # 对政府站点放慢一点本来也是应有的礼貌。
 TERM_PACING_SEC = 4.0
-# 同一个词逐类检索（发明 / 实用新型……）时相邻两次提交的间隔。结果页一次只显示一类，
-# 多类范围只能逐类各提交一次；同一页面上的连续提交，间隔比换词短一些。
-TYPE_PACING_SEC = 2.0
-# 同一个词的下一类至少要剩这么多秒才提交（结果页直接提交通常 1~3s）
-TYPE_MIN_SEC = 8.0
+# 同一个词在结果页上相邻两次页内操作（切页签 / 翻页 / 改每页条数）的间隔。
+# 页内 AJAX 比整页导航轻得多，间隔可以比换词短一些。
+AJAX_PACING_SEC = 1.5
+# 再做一次页内操作至少要剩这么多秒（实测一次 1~3s）
+AJAX_MIN_SEC = 8.0
+# 一次页内操作等 #result 被替换的上限。站点慢的时候一次要十几秒；等不到就按当前页面读
+AJAX_CAP_MS = 30_000
 # 等待防护挑战期间，每隔这么多秒报一次「还在等」
 WAIT_BEAT_SEC = 15.0
 
@@ -280,9 +310,21 @@ def _type_box(page: Page, cid: str) -> Any:
     return page.query_selector(f"#{cid}") or page.query_selector(f"#{_RESULT_PAGE_BOX_PREFIX}{cid}")
 
 
-def apply_epub_type_filter(page: Page, patent_type: str = TYPE_ALL) -> None:
+def wanted_boxes(query_types: tuple[str, ...]) -> dict[str, bool]:
+    """一次提交要勾选的类型框：各类的并集，但不勾发明授权（见 _TAB_TYPES）。"""
+    states = dict.fromkeys(EPUB_CHECKBOX_IDS, False)
+    for ptype in query_types:
+        for cid, want in epub_checkbox_states(ptype).items():
+            states[cid] = states[cid] or want
+    states["fmsq"] = False
+    return states
+
+
+def apply_epub_type_filter(
+    page: Page, patent_type: str = TYPE_ALL, *, boxes: dict[str, bool] | None = None
+) -> None:
     """按类型勾选 发明公布/发明授权/实用新型/外观设计 四类（首页与结果页通用）。"""
-    states = epub_checkbox_states(patent_type)
+    states = boxes if boxes is not None else epub_checkbox_states(patent_type)
     for cid, want in states.items():
         box = _type_box(page, cid)
         if not box:
@@ -311,11 +353,12 @@ def submit_index_search(
     keyword: str,
     *,
     patent_type: str = TYPE_ALL,
+    boxes: dict[str, bool] | None = None,
     deadline: float | None = None,
     cap_ms: int = 120_000,
 ) -> None:
     """在当前页（首页或结果页）的 #indexForm 上提交一次检索并等结果页就绪。"""
-    apply_epub_type_filter(page, patent_type)
+    apply_epub_type_filter(page, patent_type, boxes=boxes)
     page.fill("#searchStr", keyword)
     with page.expect_navigation(timeout=_timeout_ms(deadline, cap_ms), wait_until="commit"):
         form = page.query_selector("#indexForm")
@@ -367,42 +410,130 @@ class EpubRun:
         return [term for term, _html, _hits in self.rows]
 
 
-def _search_term(
-    page: Page, term: str, query_types: tuple[str, ...], *, deadline: float | None
-) -> tuple[str, list[EpubSearchHit], dict[str, int], dict[str, str]]:
-    """一个词按类型逐类提交，合并去重。返回 ``(最后一页 html, 命中, {类型: 条数}, {类型: 失败原因})``。
+def _ajax(page: Page, action: Callable[[], Any], *, deadline: float | None) -> None:
+    """做一次页内操作（切页签 / 翻页 / 改每页条数）并等到 #result 被站点替换。
 
-    结果页按类型分页签、一次只显示一类，所以「发明 + 实用新型」必须各提交一次。
+    先往 #result 里塞一个标记元素：站点的 AJAX 回来会整个换掉 #result，标记随之消失。
+    不能只等「内容变了」——每页 3 条切到 10 条时，命中不足 3 条的页签内容一个字都不变。
+    """
+    page.evaluate(_MARK_JS)
+    action()
+    page.wait_for_function(_FRESH_JS, timeout=_timeout_ms(deadline, AJAX_CAP_MS))
+
+
+def _raise_page_size(page: Page, *, deadline: float | None) -> bool:
+    """把每页条数从 3 切到 10（顺带刷新当前页签）。切不过去返回 False，由调用方读默认的 3 条。"""
+    if not page.query_selector("#sizeSelect"):
+        return False
+    if page.input_value("#sizeSelect") == str(PAGE_SIZE):
+        return True
+    try:
+        # 下拉框只有 3 / 10 两项：焦点在框上按一次 ↓ 就是 10；键盘事件是可信事件
+        _ajax(page, lambda: (page.focus("#sizeSelect"), page.keyboard.press("ArrowDown")), deadline=deadline)
+    except Exception:  # noqa: BLE001 —— 切不过去不算失败，只是少拿几条
+        return False
+    return True
+
+
+def _tabs(page: Page) -> list[tuple[str, Any, bool]]:
+    """结果页左侧的类型页签：``(文字, 元素, 是否当前)``。"""
+    out: list[tuple[str, Any, bool]] = []
+    for el in page.query_selector_all(".j-select-item a"):
+        label = (el.inner_text() or "").strip()
+        current = "curr" in (el.get_attribute("class") or "")
+        out.append((label, el, current))
+    return out
+
+
+def _total_pages(page: Page) -> int:
+    el = page.query_selector(".page_total")
+    m = _PAGES_RE.search(el.inner_text() or "") if el else None
+    return int(m.group(1)) if m else 1
+
+
+def _next_page(page: Page, *, deadline: float | None) -> bool:
+    btn = page.query_selector(".next_page")
+    if not btn or "btn_dis" in (btn.get_attribute("class") or ""):
+        return False
+    _ajax(page, btn.click, deadline=deadline)
+    return True
+
+
+def _search_term(
+    page: Page,
+    term: str,
+    query_types: tuple[str, ...],
+    *,
+    deadline: float | None,
+    reserve_sec: float = 0.0,
+) -> tuple[str, list[EpubSearchHit], dict[str, int], dict[str, str]]:
+    """一个词：提交一次，把要读的类型页签逐个读全（每页 10 条、最多 MAX_PAGES_PER_TYPE 页）。
+
+    返回 ``(最后一页 html, 命中, {类型: 条数}, {类型: 失败原因})``。``reserve_sec`` 是要给
+    后面的词留的时间：页内翻页只在预算宽裕时做，宁可少翻一页，也要让每个词都检到。
     某一类失败就不再试后面的类：失败多半意味着页面被带偏或站点在限流，接着试只会把
     这个词拖成几倍的耗时。**一类都没检成才算这个词失败**（抛出，交给外层计入连续失败）。
     """
-    html = ""
+    if not _can_search_here(page):
+        # 上一个词把页面带偏了（失败页 / 无结果页都没有检索表单）：回首页，通常已有挑战 cookie
+        wait_for_epub_home_ready(page, deadline=deadline)
+    submit_index_search(
+        page, term, boxes=wanted_boxes(query_types), deadline=deadline, cap_ms=TERM_STEP_CAP_MS
+    )
+    html = _safe_page_content(page)
+    if not page.query_selector("#sizeSelect"):
+        # 「无查询结果」页：所有类型都没有命中，页上也没有页签和下拉框
+        return html, [], dict.fromkeys(query_types, 0), {}
+
     merged: list[EpubSearchHit] = []
     seen: set[str] = set()
     counts: dict[str, int] = {}
     errors: dict[str, str] = {}
-    for j, ptype in enumerate(query_types):
-        if j > 0:
-            if deadline is not None and deadline - time.monotonic() < TYPE_MIN_SEC:
-                errors[ptype] = "时间预算用尽，未检索"
-                break
-            page.wait_for_timeout(int(TYPE_PACING_SEC * 1000))
-        try:
-            if not _can_search_here(page):
-                # 上一次提交把页面带偏了：回首页（通常已有挑战 cookie，很快）
-                wait_for_epub_home_ready(page, deadline=deadline)
-            submit_index_search(page, term, patent_type=ptype, deadline=deadline, cap_ms=TERM_STEP_CAP_MS)
-            html = _safe_page_content(page)
-            hits = parse_search_result_html(html)
-        except Exception as exc:  # noqa: BLE001 —— 记下是哪一类，由调用方决定整词成败
-            errors[ptype] = _short(exc)
-            break
-        counts[ptype] = len(hits)
+
+    def take(ptype: str, hits: list[EpubSearchHit]) -> None:
+        counts[ptype] = counts.get(ptype, 0) + len(hits)
         for h in hits:
             key = h.pub_number or h.link or (h.title or "")[:120]
             if key not in seen:
                 seen.add(key)
                 merged.append(h)
+
+    def budget_ok() -> bool:
+        return deadline is None or deadline - time.monotonic() >= reserve_sec + AJAX_MIN_SEC
+
+    wanted = {label: t for label, t in _TAB_TYPES.items() if t in query_types}
+    tabs = [(label, el, cur) for label, el, cur in _tabs(page) if label in wanted]
+    tabs.sort(key=lambda x: not x[2])           # 当前页签先读：切每页条数会顺带刷新它
+    # 结果页「可解析」不等于「脚本装完」：页面脚本还没把下拉框、页签的处理绑上就去按，
+    # 站点要过十几秒才响应（真站点上第一页因此只读到 3 条）。等 load 完，再留一点间隔。
+    try:
+        page.wait_for_load_state("load", timeout=_timeout_ms(deadline, AJAX_CAP_MS))
+    except Exception:  # noqa: BLE001 —— 个别外链资源挂着不算数，靠间隔兜底
+        pass
+    for j, (label, el, current) in enumerate(tabs):
+        ptype = wanted[label]
+        try:
+            if j > 0 and not budget_ok():
+                errors[ptype] = "时间预算用尽，未检索"
+                continue
+            page.wait_for_timeout(int(AJAX_PACING_SEC * 1000))
+            if current:
+                _raise_page_size(page, deadline=deadline)
+            else:
+                _ajax(page, el.click, deadline=deadline)
+            html = _safe_page_content(page)
+            take(ptype, parse_search_result_html(html))
+            for _n in range(2, min(_total_pages(page), MAX_PAGES_PER_TYPE) + 1):
+                if not budget_ok():
+                    break
+                page.wait_for_timeout(int(AJAX_PACING_SEC * 1000))
+                if not _next_page(page, deadline=deadline):
+                    break
+                html = _safe_page_content(page)
+                take(ptype, parse_search_result_html(html))
+        except Exception as exc:  # noqa: BLE001 —— 记下是哪一类，由调用方决定整词成败
+            errors[ptype] = _short(exc)
+            break
     if not counts:
         raise RuntimeError(next(iter(errors.values()), "未检索"))
     # 停下之后没轮到的类也要如实记下
@@ -460,7 +591,9 @@ def run_epub_session(
                     page.wait_for_timeout(int(TERM_PACING_SEC * 1000))
                 started = time.monotonic()
                 try:
-                    html, hits, counts, type_errors = _search_term(page, term, query_types, deadline=deadline)
+                    html, hits, counts, type_errors = _search_term(
+                        page, term, query_types, deadline=deadline, reserve_sec=(total - i - 1) * MIN_TERM_SEC
+                    )
                 except Exception as exc:  # noqa: BLE001 —— 单词失败不连累其它词
                     fails_in_row += 1
                     reason = _short(exc)

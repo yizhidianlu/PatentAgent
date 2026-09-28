@@ -35,6 +35,7 @@ import httpx
 import yaml
 
 from . import assets_loader
+from . import ocr as ocr_service
 
 logger = logging.getLogger(__name__)
 
@@ -383,9 +384,10 @@ async def fetch_patent_pdf(
 # 找来的），交底书 1.1 里最该认真比对的条目反而只有一句推测。
 #
 # 取法按可靠性排：
-# 1. Google Patents 详情页：摘要、申请人、公开日都在 meta 里；**老专利的 PDF 是扫描件，
-#    没有文字层，这里是唯一的文字来源**（Google 自己做过识别）；
-# 2. 全文 PDF 的文字层：详情页被限流或没有摘要时，从扉页 (57) 摘要里取。
+# 1. Google Patents 详情页：摘要、申请人、公开日都在 meta 里——但整站限流、出口 IP 被
+#    标记时一条都拿不到；
+# 2. 全文 PDF 的文字层：从扉页 (57) 摘要里取；
+# 3. 扫描件（老专利多是）没有文字层：把扉页渲成图交给系统自带的 OCR（services/ocr）。
 
 
 @dataclass
@@ -398,13 +400,29 @@ class PatentSummary:
     applicant: str = ""
     pub_date: str = ""
     abstract: str = ""
-    source: str = ""        # google_patents_page | pdf_text
+    source: str = ""        # google_patents_page | pdf_text | pdf_ocr
     error: str = ""
     rate_limited: bool = False   # 详情页退避之后仍被限流（调用方据此别再逐条苦等）
+    scanned: bool = False        # 全文 PDF 是扫描件（没有文字层）
+
+
+SOURCE_LABELS = {
+    "google_patents_page": "Google Patents 详情页",
+    "pdf_text": "全文 PDF 文字层",
+    "pdf_ocr": "扫描件 OCR",
+}
 
 
 _PUB_IN_URL_RE = re.compile(r"(CN\d{7,13}[A-Z]\d?)", re.IGNORECASE)
 _DATE_RE = re.compile(r"\d{4}[-.]\d{2}[-.]\d{2}")
+# 扉页上的日期：2022.03.15 / 2010年2月24日 / 2010-02-24
+_CN_DATE_RE = re.compile(r"(\d{4})\s*[年.\-/]\s*(\d{1,2})\s*[月.\-/]\s*(\d{1,2})\s*日?")
+# OCR 常把著录项编号外面的方括号认成各式括号：[57]、〔57〕、【57】 → (57)
+_BRACKET_MAP = {ord(c): ord("(") for c in "[〔【［"} | {ord(c): ord(")") for c in "]〕】］"}
+# 著录项编号，如 (21)
+_ITEM_CODE_RE = re.compile(r"\(\s*\d{2}\s*\)")
+# 摘要最短长度：短于此多半是没认出来
+MIN_ABSTRACT_CHARS = 20
 
 
 def pub_no_from_url(url: str | None) -> str:
@@ -462,6 +480,46 @@ def parse_summary_page(html: str) -> dict[str, str]:
     }
 
 
+def _iso_date(raw: str) -> str:
+    m = _CN_DATE_RE.search(raw or "")
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else ""
+
+
+def _summary_from_biblio(biblio: dict[str, str], text: str) -> dict[str, str]:
+    """扉页著录项 → {title, abstract, applicant, pub_date}。"""
+    # 摘要单独取：parse_biblio 每个字段截 400 字，摘要接近这个数；且要一直取到页尾
+    m = re.search(r"\(\s*57\s*\)\s*(?:摘要)?\s*[:：]?\s*(.*)", text, re.DOTALL)
+    abstract_raw = m.group(1) if m else biblio.get("摘要", "")
+    abstract_raw = re.split(r"\n\s*\(\s*\d{2}\s*\)", abstract_raw, maxsplit=1)[0]
+    abstract = re.sub(r"\s+", "", abstract_raw)                  # 版面换行会把中文切出空格
+    if len(abstract) < MIN_ABSTRACT_CHARS:
+        abstract = ""
+    # 申请人：去掉「地址…」，以及 OCR 把右栏著录项并进来的尾巴「(21)申请号…」
+    applicant = _ITEM_CODE_RE.split(biblio.get("申请人", ""), maxsplit=1)[0]
+    applicant = re.sub(r"\s*地址.*$", "", applicant, flags=re.DOTALL).strip()
+    title = biblio.get("名称", "")
+    for label in _TITLE_LABELS:
+        title = re.sub(rf"^{label}\s*[:：]?\s*", "", title).strip()
+    title = _ITEM_CODE_RE.split(title, maxsplit=1)[0].strip()
+    return {
+        "title": re.sub(r"\s+", "", title),
+        "abstract": abstract,
+        "applicant": applicant,
+        "pub_date": _iso_date(biblio.get("公开日") or biblio.get("授权公告日") or ""),
+    }
+
+
+def parse_front_page_text(text: str) -> dict[str, str]:
+    """扉页文字（OCR 或文字层）→ {title, abstract, applicant, pub_date}（取不到的为空串）。
+
+    OCR 文字的两个特点这里都照顾到：著录项编号外面的括号五花八门（[57]、〔57〕），
+    汉字之间常有空格（services/ocr 已去掉大部分，这里再兜一次）。
+    """
+    normalized = normalize_patent_text((text or "").translate(_BRACKET_MAP))
+    normalized = "\n".join(ocr_service.normalize_lines(normalized).splitlines())
+    return _summary_from_biblio(parse_biblio(normalized), normalized)
+
+
 def pdf_text_summary(pdf: bytes) -> dict[str, str]:
     """全文 PDF 文字层 → 扉页著录项（摘要 / 申请人 / 名称）。
 
@@ -473,14 +531,8 @@ def pdf_text_summary(pdf: bytes) -> dict[str, str]:
         text = "\n".join(page.get_text() for page in doc)
     if len(text.strip()) < 50:
         raise ValueError("PDF 为扫描件，没有可抽取的文字层")
-    biblio = parse_patent_md(text).biblio
-    date = biblio.get("公开日", "")
-    return {
-        "title": biblio.get("名称", ""),
-        "abstract": re.sub(r"\s+", "", biblio.get("摘要", "")),   # 版面换行会把中文切出空格
-        "applicant": re.sub(r"\s*地址.*$", "", biblio.get("申请人", "")).strip(),
-        "pub_date": _DATE_RE.search(date).group(0) if _DATE_RE.search(date) else "",
-    }
+    structure = parse_patent_md(text)
+    return _summary_from_biblio(structure.biblio, normalize_patent_text(text))
 
 
 async def fetch_patent_summary(
@@ -522,19 +574,32 @@ async def fetch_patent_summary(
             except Exception as exc:  # noqa: BLE001 —— 补全失败不抛
                 errors.append(f"Google Patents 详情页 {type(exc).__name__}: {exc}")
 
-        # ② PDF 文字层
+        # ② PDF 文字层；③ 扫描件走 OCR
         if candidate_pdf:
             payload, error = await _download_pdf(client, candidate_pdf)
             if payload is None:
                 errors.append(f"全文 PDF {error}")
             else:
+                info: dict[str, str] | None = None
+                source = "pdf_text"
                 try:
                     info = pdf_text_summary(payload)
+                except ValueError as exc:                      # 没有文字层：扫描件
+                    out.scanned = True
+                    if await asyncio.to_thread(ocr_service.available):
+                        source = "pdf_ocr"
+                        text = await asyncio.to_thread(ocr_service.pdf_front_page_text, payload)
+                        info = parse_front_page_text(text) if text else None
+                        if not (info and info["abstract"]):
+                            errors.append(f"全文 PDF：{exc}，OCR 也没有识别出摘要")
+                            info = None
+                    else:
+                        errors.append(f"全文 PDF：{exc}；{ocr_service.unavailable_reason()}")
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"全文 PDF：{exc}")
-                else:
+                if info is not None:
                     if info["abstract"]:
-                        out.ok, out.source = True, "pdf_text"
+                        out.ok, out.source = True, source
                         out.title, out.abstract = info["title"], info["abstract"]
                         out.applicant, out.pub_date = info["applicant"], info["pub_date"]
                         return out

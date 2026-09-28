@@ -4,16 +4,18 @@
 
 - 首页：防护挑战通过后才出现 #searchStr；类型框 id 为 #fmgb / #fmsq / #xxsq / #wgsq
 - 结果页（/Dxb/IndexQuery）：**自带同一个检索表单**，类型框 id 却是 #indexSearchModel_fmgb 等
-- 结果页**按类型分页签、一次只显示一类**：勾了多类提交一次，只拿得到第一类
+- 结果页**按类型分页签、一次只显示一类**，默认每页 3 条；切页签 / 翻页 / 改每页条数都是页内
+  AJAX，只替换 #result；点当前页签不会重新查询；每页条数只能靠下拉框上的键盘操作切到 10
+- 一个词在所有类型里都没有命中时落到「无查询结果」页，页上没有检索表单
 
 这些行为都是 2026-09-28 对真站点逐帧取证得到的；改版时先重新取证，再改这里。
 
 钉住的事实：
 - 第 2 个词起在结果页上直接检索，**首页只访问一次**（早先每词都回首页重过挑战，一词约 35s）；
 - 结果页上的类型过滤不会被静默丢掉（它的勾选框 id 与首页不同）；
-- 截止时刻到了就停，没做的词如实列为 skipped，做完的保留；
-- 单词失败不连累其它词；连续失败才判为被拦截；
-- 多类范围（发明 + 实用新型）逐类各提交一次；某一类没检成如实记下，不当整词失败；
+- 每个词提交一次，先把每页条数切到 10，再逐个页签读、最多翻两页；发明授权页签不读；
+- 截止时刻到了就停，没做的词如实列为 skipped，做完的保留；翻页只在预算宽裕时做；
+- 单词失败不连累其它词；连续失败才判为被拦截；某个页签没读成只记缺口，不当整词失败；
 - 首页防护始终不过 ⇒ blocked；
 - UA 跟真实内核版本走，不带 HeadlessChrome。
 """
@@ -22,6 +24,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,15 +42,25 @@ import cnipa_epub_search as search_cli
 from cnipa_epub_parse import EpubSearchHit
 
 HOME_BOXES = ("fmgb", "fmsq", "xxsq", "wgsq")
+TAB_LABELS = {"fmgb": "发明公布", "fmsq": "发明授权", "xxsq": "实用新型", "wgsq": "外观设计"}
 
 
 class FakeElement:
-    def __init__(self, page: FakePage, el_id: str) -> None:
+    def __init__(self, page: FakePage, el_id: str, *, label: str | None = None, on_click: Any = None) -> None:
         self.page = page
         self.id = el_id
+        self.label = label
+        self._on_click = on_click
 
     def get_attribute(self, name: str) -> str | None:
-        return self.id if name == "id" else None
+        if name == "id":
+            return self.id
+        if name == "class":
+            return self.page._class_of(self)
+        return None
+
+    def inner_text(self) -> str:
+        return self.label or ""
 
     def check(self, force: bool = False) -> None:
         self.page.checked[self.id] = True
@@ -57,28 +71,77 @@ class FakeElement:
     def evaluate(self, _js: str) -> None:  # form.evaluate("el => el.submit()")
         self.page._submit()
 
+    def click(self) -> None:
+        if self._on_click is not None:
+            self._on_click()
+
+
+class FakeKeyboard:
+    def __init__(self, page: FakePage) -> None:
+        self.page = page
+
+    def press(self, key: str) -> None:
+        self.page._key(key)
+
 
 class FakePage:
-    """按真站点行为建模的页面。url ∈ blank / home / result / broken。"""
+    """按真站点行为建模的页面。url ∈ blank / home / result / nohit / broken。"""
 
     def __init__(
         self,
         *,
         home_ok: bool = True,
         fail_terms: tuple[str, ...] = (),
-        fail_types: tuple[tuple[str, str], ...] = (),
+        fail_tabs: tuple[tuple[str, str], ...] = (),
+        size_broken: bool = False,
+        catalog: dict[tuple[str, str], int] | None = None,
     ) -> None:
         self.url = "blank"
         self.home_ok = home_ok
         self.fail_terms = set(fail_terms)
-        self.fail_types = set(fail_types)          # {(词, 勾选的类别框)}，例 ("甲", "xxsq")
+        self.fail_tabs = set(fail_tabs)            # {(词, 页签文字)}：点这个页签会把页面搞坏
+        self.size_broken = size_broken             # 每页条数切不过去（站点没响应）
+        self.catalog = catalog or {}               # {(词, 页签文字): 命中数}；缺省每个勾选的页签 1 条
         self.home_visits = 0
         self.submitted: list[str] = []
-        self.submitted_types: list[str] = []       # 每次提交时勾着的类别框（本页的 id，去前缀）
+        self.submitted_boxes: list[str] = []       # 每次提交时勾着的类别框
+        self.ajax: list[dict[str, Any]] = []       # 页内操作 [{kind, term, tab, size, page}]
         self.checked: dict[str, bool] = {}
-        self._search = ""
         self.waits: list[int] = []
         self.result_timeouts: list[int] = []
+        self.keyboard = FakeKeyboard(self)
+        self._search = ""
+        self._focused: str | None = None
+        self._boxes_at_submit: dict[str, bool] = {}
+        self.stale = False
+        self.term: str | None = None
+        self.tab: str | None = None
+        self.size = 3
+        self.page_no = 1
+
+    # ---- 状态 ----
+    def _tabs_checked(self) -> list[str]:
+        return [TAB_LABELS[b] for b in HOME_BOXES if self._boxes_at_submit.get(b)]
+
+    def _count(self, tab: str | None) -> int:
+        return self.catalog.get((self.term or "", tab or ""), 1)
+
+    def _total_pages(self) -> int:
+        return max(1, math.ceil(self._count(self.tab) / self.size))
+
+    def _shown(self) -> int:
+        start = (self.page_no - 1) * self.size
+        return max(0, min(self.size, self._count(self.tab) - start))
+
+    def _class_of(self, el: FakeElement) -> str:
+        if el.id == "next_page":
+            return "next_page btn_dis" if self.page_no >= self._total_pages() else "next_page"
+        if el.id.startswith("tab:"):
+            return "curr" if el.label == self.tab else ""
+        return ""
+
+    def _has_form(self) -> bool:
+        return (self.url == "home" and self.home_ok) or self.url == "result"
 
     # ---- 导航 ----
     def goto(self, _url: str, **_kw: Any) -> None:
@@ -91,11 +154,23 @@ class FakePage:
     def wait_for_timeout(self, ms: int) -> None:
         self.waits.append(ms)
 
+    def wait_for_load_state(self, _state: str = "load", **_kw: Any) -> None:
+        return None
+
     # ---- DOM ----
     def query_selector(self, sel: str) -> FakeElement | None:
-        has_form = (self.url == "home" and self.home_ok) or self.url == "result"
         if sel in ("#searchStr", "#indexForm"):
-            return FakeElement(self, sel[1:]) if has_form else None
+            return FakeElement(self, sel[1:]) if self._has_form() else None
+        if sel == "#sizeSelect":
+            return FakeElement(self, "sizeSelect") if self.url == "result" else None
+        if sel == ".page_total":
+            if self.url == "result" and self._total_pages() > 1:
+                return FakeElement(self, "page_total", label=f"共 {self._total_pages()} 页, 到第")
+            return None
+        if sel == ".next_page":
+            if self.url == "result" and self._total_pages() > 1:
+                return FakeElement(self, "next_page", on_click=self._next)
+            return None
         box = sel[1:]
         if self.url == "home" and self.home_ok and box in HOME_BOXES:
             return FakeElement(self, box)
@@ -103,35 +178,84 @@ class FakePage:
             return FakeElement(self, box)
         return None
 
+    def query_selector_all(self, sel: str) -> list[FakeElement]:
+        if sel == ".j-select-item a" and self.url == "result":
+            return [
+                FakeElement(self, f"tab:{label}", label=label, on_click=lambda label=label: self._switch_tab(label))
+                for label in self._tabs_checked()
+            ]
+        return []
+
     def fill(self, _sel: str, value: str) -> None:
         self._search = value
 
-    def evaluate(self, _js: str, arg: Any = None) -> None:
-        if isinstance(arg, dict) and "id" in arg:  # 勾选兜底
+    def focus(self, sel: str) -> None:
+        self._focused = sel
+
+    def input_value(self, sel: str) -> str:
+        assert sel == "#sizeSelect"
+        return str(self.size)
+
+    def evaluate(self, js: str, arg: Any = None) -> None:
+        if js is crawler._MARK_JS:
+            self.stale = True
+        elif isinstance(arg, dict) and "id" in arg:  # 勾选兜底
             self.checked[arg["id"]] = bool(arg["checked"])
         else:
             self._submit()
 
-    def _boxes_on(self) -> str:
-        """当前页面上勾着的类别框（首页认 #fmgb，结果页认 #indexSearchModel_fmgb）。"""
-        prefix = "" if self.url == "home" else "indexSearchModel_"
-        return "+".join(b for b in HOME_BOXES if self.checked.get(prefix + b))
-
-    def _submit(self) -> None:
-        boxes = self._boxes_on()
-        self.submitted.append(self._search)
-        self.submitted_types.append(boxes)
-        self._shown = boxes
-        broken = self._search in self.fail_terms or (self._search, boxes) in self.fail_types
-        self.url = "broken" if broken else "result"
-
-    def wait_for_function(self, _js: str, **kw: Any) -> None:
+    def wait_for_function(self, js: str, **kw: Any) -> None:
+        if js is crawler._FRESH_JS:
+            if self.stale:
+                raise TimeoutError("Timeout 20000ms exceeded.")
+            return
         self.result_timeouts.append(int(kw.get("timeout") or 0))
-        if self.url != "result":
+        if self.url not in ("result", "nohit"):
             raise TimeoutError("Timeout 120000ms exceeded.")
 
     def content(self) -> str:
-        return f"<html><body>{self._search}|{getattr(self, '_shown', '')}</body></html>"
+        if self.url != "result":
+            return f"<html><body>{self.url}</body></html>"
+        shown = {"term": self.term, "tab": self.tab, "page": self.page_no, "n": self._shown()}
+        return "<html><body>" + json.dumps(shown, ensure_ascii=False) + "</body></html>"
+
+    # ---- 站点行为 ----
+    def _submit(self) -> None:
+        prefix = "" if self.url == "home" else "indexSearchModel_"
+        self._boxes_at_submit = {b: bool(self.checked.get(prefix + b)) for b in HOME_BOXES}
+        self.submitted.append(self._search)
+        self.submitted_boxes.append("+".join(b for b in HOME_BOXES if self._boxes_at_submit[b]))
+        self.term = self._search
+        if self.term in self.fail_terms:
+            self.url = "broken"
+            return
+        tabs = self._tabs_checked()
+        if not tabs or all(self._count(t) == 0 for t in tabs):
+            self.url = "nohit"                      # 「无查询结果」页：没有表单、页签和下拉框
+            return
+        self.url, self.tab, self.size, self.page_no = "result", tabs[0], 3, 1
+
+    def _ajax_done(self, kind: str) -> None:
+        self.ajax.append({"kind": kind, "term": self.term, "tab": self.tab, "size": self.size, "page": self.page_no})
+        self.stale = False
+
+    def _key(self, key: str) -> None:
+        if self._focused == "#sizeSelect" and key == "ArrowDown" and self.size == 3 and not self.size_broken:
+            self.size, self.page_no = 10, 1
+            self._ajax_done("size")
+
+    def _switch_tab(self, label: str) -> None:
+        if (self.term, label) in self.fail_tabs:
+            self.url = "broken"
+            return
+        if label == self.tab:                      # 点当前页签站点不会重新查询
+            return
+        self.tab, self.page_no = label, 1
+        self._ajax_done("tab")
+
+    def _next(self) -> None:
+        self.page_no += 1
+        self._ajax_done("next")
 
 
 class FakeBrowser:
@@ -149,9 +273,25 @@ class FakeBrowser:
         self.closed = True
 
 
+def _fake_parse(html: str) -> list[EpubSearchHit]:
+    """假页面的 content() 里写着「这一页显示了什么」，据此造出对应条数的命中。"""
+    m = re.search(r"\{.*\}", html)
+    if not m:
+        return []
+    d = json.loads(m.group(0))
+    return [
+        EpubSearchHit(
+            raw_html="", title=f"{d['term']}-{d['tab']}-{d['page']}-{k}",
+            pub_number=f"CN{d['term']}{d['tab']}{d['page']}-{k}",
+            link=f"http://epub.cnipa.gov.cn/p/{d['term']}/{d['tab']}/{d['page']}/{k}",
+        )
+        for k in range(d["n"])
+    ]
+
+
 @pytest.fixture
 def fake_site(monkeypatch: pytest.MonkeyPatch):
-    """构造一套假站点；返回 (page, browser, factory)。解析函数替换为按词造一条命中。"""
+    """构造一套假站点；返回 (page, browser, factory)。"""
 
     def make(**page_kw: Any):
         page = FakePage(**page_kw)
@@ -159,27 +299,112 @@ def fake_site(monkeypatch: pytest.MonkeyPatch):
         pw = SimpleNamespace(chromium=SimpleNamespace(launch=lambda **_kw: browser))
         return page, browser, (lambda: contextlib.nullcontext(pw))
 
-    monkeypatch.setattr(
-        crawler,
-        "parse_search_result_html",
-        lambda html: [EpubSearchHit(raw_html="", title=html, pub_number=f"CN{abs(hash(html)) % 10**9}A",
-                                    link=f"http://epub.cnipa.gov.cn/p/{abs(hash(html)) % 10**9}")],
-    )
+    monkeypatch.setattr(crawler, "parse_search_result_html", _fake_parse)
     monkeypatch.setenv("EPUB_WAF_MAX_WAIT_SEC", "30")
     return make
+
+
+def _term_events(events: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    return [d for kind, d in events if kind == "term"]
 
 
 def test_second_term_onwards_reuses_result_page(fake_site):
     page, _browser, factory = fake_site()
     run = crawler.run_epub_session(["甲", "乙", "丙"], patent_type="invention", playwright_factory=factory)
     assert run.searched == ["甲", "乙", "丙"]
-    assert run.stop is None and not run.failed and not run.skipped
+    assert run.stop is None and not run.failed and not run.skipped and not run.partial
     assert page.home_visits == 1, "只该过一次首页防护；每词回首页正是 7 个词要 248s 的原因"
     assert page.submitted == ["甲", "乙", "丙"]
     # 相邻两词之间放慢一点（真站点上请求太密会触发限频）
     assert page.waits.count(int(crawler.TERM_PACING_SEC * 1000)) == 2
     # 单个词等结果页的上限收紧到 45s：一个卡住的词不能再吃掉 120s
     assert page.result_timeouts and max(page.result_timeouts) <= crawler.TERM_STEP_CAP_MS
+    # 只有一个页签（发明公布）：每个词只做一次页内操作——把每页条数切到 10
+    assert [a["kind"] for a in page.ajax] == ["size", "size", "size"]
+
+
+def test_page_size_is_raised_and_pages_followed(fake_site):
+    """默认每页 3 条、按日期倒序，老文献根本排不进来：切到 10 条并翻到第 2 页。"""
+    page, _browser, factory = fake_site(catalog={("甲", "发明公布"): 25})
+    events: list[tuple[str, dict[str, Any]]] = []
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention", playwright_factory=factory, on_event=lambda k, d: events.append((k, d))
+    )
+    assert len(run.rows[0][2]) == 2 * crawler.PAGE_SIZE
+    assert [(a["kind"], a["size"], a["page"]) for a in page.ajax] == [("size", 10, 1), ("next", 10, 2)]
+    assert _term_events(events)[0]["types"] == {"发明": 20}
+    # 每次页内操作前都留一点间隔（含第一次：脚本装完前就按下拉框，站点要十几秒才响应）
+    assert page.waits.count(int(crawler.AJAX_PACING_SEC * 1000)) == 2
+
+
+def test_scope_reads_each_wanted_tab_without_reclicking_current(fake_site):
+    """发明 + 实用新型：一次提交、两个页签都读；当前页签由切每页条数顺带刷新，不再点它。
+
+    早先勾两类提交一次只拿到第一个页签——`all` 实际上只检了发明公布。
+    """
+    page, _browser, factory = fake_site(catalog={("甲", "发明公布"): 4, ("甲", "实用新型"): 6})
+    events: list[tuple[str, dict[str, Any]]] = []
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention_utility_model", playwright_factory=factory,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+    assert page.submitted == ["甲"]
+    assert page.submitted_boxes == ["fmgb+xxsq"]            # 不勾发明授权：B 文本与 A 文本内容相同
+    assert [(a["kind"], a["tab"]) for a in page.ajax] == [("size", "发明公布"), ("tab", "实用新型")]
+    assert len(run.rows[0][2]) == 10 and not run.partial
+    assert _term_events(events)[0]["types"] == {"发明": 4, "实用新型": 6}
+
+
+def test_all_types_really_means_all(fake_site):
+    page, _browser, factory = fake_site()
+    crawler.run_epub_session(["甲"], playwright_factory=factory)          # 缺省 all
+    assert page.submitted_boxes == ["fmgb+xxsq+wgsq"]
+    assert [a["tab"] for a in page.ajax] == ["发明公布", "实用新型", "外观设计"]
+
+
+def test_no_hit_term_is_zero_hits_not_failure(fake_site):
+    """一个词在所有类型里都没有命中：落到「无查询结果」页，是 0 条，不是失败；下一个词回首页再查。"""
+    page, _browser, factory = fake_site(catalog={("乙", "发明公布"): 0})
+    run = crawler.run_epub_session(["甲", "乙", "丙"], patent_type="invention", playwright_factory=factory)
+    assert run.searched == ["甲", "乙", "丙"] and not run.failed
+    assert [len(hits) for _t, _h, hits in run.rows] == [1, 0, 1]
+    assert page.home_visits == 2                    # 无结果页没有检索表单
+
+
+def test_one_tab_failing_keeps_the_term(fake_site):
+    """实用新型页签点了没反应：发明的结果保留，这个词算检过，缺口如实记下；下一个词照常。"""
+    page, _browser, factory = fake_site(fail_tabs=(("甲", "实用新型"),))
+    events: list[tuple[str, dict[str, Any]]] = []
+    run = crawler.run_epub_session(
+        ["甲", "乙"], patent_type="invention_utility_model", playwright_factory=factory,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+    assert run.searched == ["甲", "乙"] and not run.failed and run.stop is None
+    assert list(run.partial) == ["甲"] and "utility_model" in run.partial["甲"]
+    first = _term_events(events)[0]
+    assert first["types"] == {"发明": 1} and list(first["type_errors"]) == ["实用新型"]
+    assert page.home_visits == 2                    # 失败把页面带偏，下一个词先回首页
+
+
+def test_size_change_failing_falls_back_to_default_page_size(fake_site):
+    """每页条数切不过去：按默认的 3 条读、照常翻页，不算失败。"""
+    page, _browser, factory = fake_site(size_broken=True, catalog={("甲", "发明公布"): 25})
+    run = crawler.run_epub_session(["甲"], patent_type="invention", playwright_factory=factory)
+    assert len(run.rows[0][2]) == 2 * 3 and not run.partial and not run.failed
+    assert [a["kind"] for a in page.ajax] == ["next"]
+
+
+def test_depth_yields_to_remaining_terms(fake_site, monkeypatch: pytest.MonkeyPatch):
+    """预算紧时只读每个页签的第一页、不切后面的页签：宁可少翻一页，也要让每个词都检到。"""
+    import time
+
+    _page, _browser, factory = fake_site(catalog={("甲", "发明公布"): 25, ("甲", "实用新型"): 5})
+    monkeypatch.setattr(crawler, "AJAX_MIN_SEC", 10_000.0)
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention_utility_model", deadline=time.monotonic() + 60, playwright_factory=factory
+    )
+    assert len(run.rows[0][2]) == crawler.PAGE_SIZE              # 第一页签的第 1 页
+    assert run.partial == {"甲": {"utility_model": "时间预算用尽，未检索"}}
 
 
 def test_type_filter_is_applied_on_result_page(fake_site):
@@ -192,74 +417,6 @@ def test_type_filter_is_applied_on_result_page(fake_site):
     assert page.checked["indexSearchModel_fmgb"] is True
     assert page.checked["indexSearchModel_xxsq"] is False
     assert page.checked["indexSearchModel_wgsq"] is False
-
-
-def test_prior_art_scope_submits_each_type_separately(fake_site):
-    """结果页一次只显示一类：发明 + 实用新型必须各提交一次，否则实用新型那一页签永远看不到。
-
-    早先勾两类提交一次，拿到的只是「发明公布」；`all` 实际上也只检了发明公布。
-    """
-    page, _browser, factory = fake_site()
-    events: list[dict[str, Any]] = []
-    run = crawler.run_epub_session(
-        ["甲", "乙"],
-        patent_type="invention_utility_model",
-        playwright_factory=factory,
-        on_event=lambda kind, d: events.append(d) if kind == "term" else None,
-    )
-    assert run.searched == ["甲", "乙"] and not run.partial
-    assert page.submitted == ["甲", "甲", "乙", "乙"]
-    assert page.submitted_types == ["fmgb+fmsq", "xxsq", "fmgb+fmsq", "xxsq"]
-    assert page.home_visits == 1
-    # 两类的命中合并进同一个词
-    assert len(run.rows[0][2]) == 2
-    assert events[0]["types"] == {"发明": 1, "实用新型": 1} and events[0]["type_errors"] == {}
-    # 同一个词两类之间也放慢一点
-    assert page.waits.count(int(crawler.TYPE_PACING_SEC * 1000)) == 2
-
-
-def test_all_types_really_means_all(fake_site):
-    page, _browser, factory = fake_site()
-    crawler.run_epub_session(["甲"], playwright_factory=factory)          # 缺省 all
-    assert page.submitted_types == ["fmgb+fmsq", "xxsq", "wgsq"]
-
-
-def test_one_type_failing_keeps_the_term(fake_site):
-    """实用新型那次提交失败：发明的结果保留，这个词算检过，缺口如实记下；下一个词照常。"""
-    page, _browser, factory = fake_site(fail_types=(("甲", "xxsq"),))
-    events: list[dict[str, Any]] = []
-    run = crawler.run_epub_session(
-        ["甲", "乙"],
-        patent_type="invention_utility_model",
-        playwright_factory=factory,
-        on_event=lambda kind, d: events.append(d) if kind == "term" else None,
-    )
-    assert run.searched == ["甲", "乙"] and not run.failed and run.stop is None
-    assert list(run.partial) == ["甲"] and "utility_model" in run.partial["甲"]
-    assert events[0]["types"] == {"发明": 1} and list(events[0]["type_errors"]) == ["实用新型"]
-    assert page.home_visits == 2                  # 失败把页面带偏，下一个词先回首页
-
-
-def test_first_type_failing_fails_the_term_without_trying_the_rest(fake_site):
-    """第一类就失败：不再接着试后面的类（站点多半在拦截，接着试只会把这个词拖成几倍耗时）。"""
-    page, _browser, factory = fake_site(fail_types=(("甲", "fmgb+fmsq"),))
-    run = crawler.run_epub_session(
-        ["甲", "乙"], patent_type="invention_utility_model", playwright_factory=factory
-    )
-    assert [t for t, _ in run.failed] == ["甲"] and run.searched == ["乙"]
-    assert page.submitted == ["甲", "乙", "乙"]
-
-
-def test_deadline_between_types_is_reported_not_overrun(fake_site, monkeypatch: pytest.MonkeyPatch):
-    import time
-
-    _page, _browser, factory = fake_site()
-    monkeypatch.setattr(crawler, "TYPE_MIN_SEC", 10_000.0)   # 第一类之后剩余时间一定不够
-    run = crawler.run_epub_session(
-        ["甲"], patent_type="invention_utility_model", deadline=time.monotonic() + 60, playwright_factory=factory
-    )
-    assert run.searched == ["甲"]
-    assert run.partial == {"甲": {"utility_model": "时间预算用尽，未检索"}}
 
 
 def test_deadline_stops_before_next_term_and_keeps_done(fake_site, monkeypatch: pytest.MonkeyPatch):

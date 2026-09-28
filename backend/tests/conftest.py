@@ -230,6 +230,18 @@ def _no_real_cnipa_search(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(cnipa, "spawn_tool", _refuse)
 
+    # 同理：扫描件 OCR 的引擎探测会起 PowerShell、Google 不通时还会起浏览器去国知局取扉页图。
+    # 测试里缺省当作「本机没有 OCR 引擎」；要走这两条路的用例自己 monkeypatch ocr.available。
+    from app.services import ocr
+
+    def _no_engine(*_args: Any, **_kwargs: Any) -> Any:
+        import subprocess
+
+        return subprocess.CompletedProcess(["powershell"], 0, stdout="en-US\n", stderr="")
+
+    ocr.available.cache_clear()
+    monkeypatch.setattr(ocr, "_powershell", _no_engine)
+
     # 同理：查新条目缺摘要时会去 Google Patents 补全。用例里的命中大多不带摘要，
     # 不拦的话每跑一遍流水线用例就对 Google 发一串真实请求（它对密集请求会整站回 503）。
     import httpx

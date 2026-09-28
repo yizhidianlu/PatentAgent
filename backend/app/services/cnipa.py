@@ -39,11 +39,13 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 import httpx
 from ulid import ULID
 
+from ..config import get_config
 from ..db import database as db
 from ..models.search import (
     MAX_TERMS,
@@ -54,6 +56,7 @@ from ..models.search import (
     SearchResult,
     hit_row_to_model,
 )
+from . import ocr as ocr_service
 from . import patent_fetch
 from . import progress as progress_service
 from .convert import kill_process_tree, run_tool, spawn_tool
@@ -63,6 +66,8 @@ logger = logging.getLogger(__name__)
 
 # 检索脚本 / 探测脚本
 SEARCH_SCRIPT = "cnipa_epub_search.py"
+# 按公开号取单行本扉页图（Google 拿不到、又没有 PDF 链接的老文献，OCR 认摘要）
+FRONT_PAGE_SCRIPT = "cnipa_epub_front_page.py"
 BROWSER_SCRIPT = "browser.py"
 
 # 检索时间预算（秒）= 基础 + 每词 × 词数，封顶。
@@ -125,6 +130,14 @@ TYPE_LABELS = {
     "all": "全部类型",
     "invention_utility_model": "发明+实用新型",
 }
+
+# 取单行本扉页图：一场的时间预算 = 基数 + 每篇；最多取几篇。
+# 真站点实测一篇 40~70s（检索、弹窗、阅读器起来、取图各要几秒到几十秒），外加一次首页挑战。
+FRONT_PAGE_BASE_SEC = 45
+FRONT_PAGE_PER_PUB_SEC = 75
+MAX_FRONT_PAGE_PUBS = 3
+_PAGE_MARKER = "EPUB_PAGE_JSON:"
+_PAGE_FAIL_MARKER = "EPUB_PAGE_FAIL_JSON:"
 
 # 一场检索入库的上限。逐类检索后每个词每类最多 3 条，8 个词、两类可达四十多条；消化改写
 # 每 8 条一次 LLM 调用，全收会把这一步拖得很长，而排在后面的多是只在申请人、地址这类字段里
@@ -403,6 +416,73 @@ def _type_gaps(terms: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, str]]:
     return gaps
 
 
+def parse_front_page_protocol(lines: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """扉页脚本的输出 → {公开号: 数据}（失败的条目只有 error）。"""
+    out: dict[str, dict[str, Any]] = {}
+    for raw in lines:
+        s = raw.strip()
+        if s.startswith(_PAGE_MARKER):
+            data = _json_after(s, _PAGE_MARKER)
+            if isinstance(data, dict) and data.get("pub"):
+                out[str(data["pub"])] = data
+        elif s.startswith(_PAGE_FAIL_MARKER):
+            data = _json_after(s, _PAGE_FAIL_MARKER)
+            if isinstance(data, dict) and data.get("pub"):
+                out.setdefault(str(data["pub"]), {"pub": data["pub"], "error": str(data.get("error") or "失败")})
+    return out
+
+
+def _run_front_page_script(pubs: Sequence[str], out_dir: Path, budget: int, on_line: LineCallback | None) -> dict[str, dict[str, Any]]:
+    """跑一次扉页脚本（同步；供线程池调用）。每个公开号都有交代：拿到图，或失败原因。"""
+    pubs = list(pubs)
+    args = ["--out", str(out_dir), *pubs]
+    env = _browser_env()
+    env["EPUB_DEADLINE_SEC"] = str(budget)
+    env["EPUB_WAF_MAX_WAIT_SEC"] = str(min(WAF_MAX_WAIT_SEC, budget))
+    try:
+        lines, rc, killed = _stream_script(args, env, budget + TEARDOWN_GRACE_SEC, on_line, script=FRONT_PAGE_SCRIPT)
+    except OSError as exc:
+        return {pub: {"pub": pub, "error": f"无法启动脚本：{exc}"} for pub in pubs}
+    out = parse_front_page_protocol(lines)
+    if killed:
+        reason = f"{budget}s 内没有完成"
+    elif rc == _EXIT_BLOCKED:
+        reason = "国知局访问验证未通过"
+    else:
+        notes = [ln for ln in lines if ln.startswith(("CNIPA_EPUB_ERROR", "ERROR"))]
+        reason = (notes[-1][:200] if notes else f"脚本退出码 {rc}") if rc not in (0, None) else "脚本没有交代这一篇"
+    for pub in pubs:
+        out.setdefault(pub, {"pub": pub, "error": reason})
+    return out
+
+
+async def fetch_front_pages(
+    pubs: Sequence[str], *, on_progress: ProgressCallback | None = None
+) -> dict[str, dict[str, Any]]:
+    """到国知局公布公告取这些公开号的单行本扉页图（子进程 + 浏览器，一次挑战多篇）。"""
+    pubs = [p for p in dict.fromkeys(str(x).strip() for x in pubs) if p]
+    if not pubs:
+        return {}
+    out_dir = get_config().tmp_dir / "epub_front_pages"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    budget = FRONT_PAGE_BASE_SEC + FRONT_PAGE_PER_PUB_SEC * len(pubs)
+    loop = asyncio.get_running_loop()
+
+    def on_line(line: str) -> None:
+        s = line.strip()
+        msg = _progress_message(s)
+        if s.startswith(_PAGE_MARKER):
+            d = _json_after(s, _PAGE_MARKER) or {}
+            msg = f"已取到「{d.get('title') or d.get('pub')}」的扉页图（{d.get('sec')}s）"
+        elif s.startswith(_PAGE_FAIL_MARKER):
+            d = _json_after(s, _PAGE_FAIL_MARKER) or {}
+            msg = f"「{d.get('pub')}」的扉页图取不到：{d.get('error')}"
+        if msg and on_progress is not None:
+            asyncio.run_coroutine_threadsafe(_notify(on_progress, "enrich", msg), loop)
+
+    return await db.arun(_run_front_page_script, pubs, out_dir, budget, on_line)
+
+
 def _merge_term_hits(terms: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """逐词行里的命中合并去重（强杀后抢救用；与脚本的合并口径一致：按公开号/链接）。"""
     seen: set[str] = set()
@@ -449,14 +529,19 @@ def _progress_message(line: str) -> str | None:
 
 
 def _stream_script(
-    args: list[str], env: dict[str, str], hard_limit: float, on_line: LineCallback | None
+    args: list[str],
+    env: dict[str, str],
+    hard_limit: float,
+    on_line: LineCallback | None,
+    *,
+    script: str = SEARCH_SCRIPT,
 ) -> tuple[list[str], int | None, bool]:
     """起子进程并逐行读，超过 `hard_limit` 秒强杀整棵进程树。返回 `(行, 退出码, 是否被强杀)`。
 
     读管道放在单独线程：主循环按剩余时间 `queue.get(timeout)`，这样子进程卡死不出声时
     也能按时强杀，而不是被一个阻塞的 readline 永远挂住。
     """
-    proc = spawn_tool(SEARCH_SCRIPT, args, extra_env=env)
+    proc = spawn_tool(script, args, extra_env=env)
     lines: list[str] = []
     q: queue.Queue[str | None] = queue.Queue()
 
@@ -1153,8 +1238,24 @@ async def enrich_hits(
         return list(hits), []
     gap = ENRICH_SPACING_SEC if spacing is None else spacing
 
-    problems: list[str] = []
     updated: dict[str, SearchHit] = {}
+    failed: list[tuple[SearchHit, str, str, str]] = []      # (条目, 公开号, 标签, 原因)
+
+    async def fill(hit: SearchHit, pub: str, info: Mapping[str, Any]) -> None:
+        fields: dict[str, Any] = {"abstract": info["abstract"]}
+        if not hit.applicant and info.get("applicant"):
+            fields["applicant"] = info["applicant"]
+        if not hit.pub_date and info.get("pub_date"):
+            fields["pub_date"] = info["pub_date"]
+        if not hit.title and info.get("title"):
+            fields["title"] = info["title"]
+        if not hit.pub_no and pub:
+            fields["pub_no"] = pub
+        try:
+            updated[hit.id] = await _patch_hit(hit.id, fields)
+        except KeyError:  # 内存态条目（无对应行）：只更新返回值
+            updated[hit.id] = hit.model_copy(update=fields)
+
     # Google 整站限流（多见于代理出口 IP 被标记）时，退避重试救不回来：同一批里第一条
     # 退避完仍被限流，后面的条目就只试一次，尽快转 PDF 兜底，别每条都苦等十几秒
     retry_delays = patent_fetch.RATE_LIMIT_RETRY_DELAYS
@@ -1173,21 +1274,43 @@ async def enrich_hits(
             if summary.rate_limited:
                 retry_delays = ()
             if not summary.ok:
-                problems.append(f"{pub or label}：{summary.error}")
+                failed.append((hit, pub, label, summary.error))
                 continue
-            fields: dict[str, Any] = {"abstract": summary.abstract}
-            if not hit.applicant and summary.applicant:
-                fields["applicant"] = summary.applicant
-            if not hit.pub_date and summary.pub_date:
-                fields["pub_date"] = summary.pub_date
-            if not hit.title and summary.title:
-                fields["title"] = summary.title
-            if not hit.pub_no and pub:
-                fields["pub_no"] = pub
-            try:
-                updated[hit.id] = await _patch_hit(hit.id, fields)
-            except KeyError:  # 内存态条目（无对应行）：只更新返回值
-                updated[hit.id] = hit.model_copy(update=fields)
+            await _notify(
+                on_progress,
+                "enrich",
+                f"「{label}」摘要已补全（来源：{patent_fetch.SOURCE_LABELS.get(summary.source, summary.source)}）",
+            )
+            await fill(hit, pub, {"abstract": summary.abstract, "applicant": summary.applicant,
+                                  "pub_date": summary.pub_date, "title": summary.title})
+
+    # Google 拿不到、PDF 也没有的：到国知局公布公告取单行本的扉页图，OCR 认摘要。
+    # 这是老文献（扫描件、站上无摘要）在 Google 不通时唯一的文字来源。
+    rescue = [(h, pub, label, err) for h, pub, label, err in failed if pub]
+    if rescue and await asyncio.to_thread(ocr_service.available):
+        rescue = rescue[:MAX_FRONT_PAGE_PUBS]
+        await _notify(
+            on_progress, "enrich",
+            f"Google 取不到，改从国知局公布公告取 {len(rescue)} 篇的扉页图识别摘要（每篇约 1 分钟）…",
+        )
+        pages = await fetch_front_pages([pub for _h, pub, _l, _e in rescue], on_progress=on_progress)
+        for hit, pub, label, err in rescue:
+            data = pages.get(pub) or {}
+            info: dict[str, str] | None = None
+            if data.get("path"):
+                text = await asyncio.to_thread(ocr_service.image_text_upscaled, Path(str(data["path"])))
+                info = patent_fetch.parse_front_page_text(text) if text else None
+            if info and info["abstract"]:
+                await _notify(on_progress, "enrich", f"「{label}」摘要已补全（来源：国知局单行本扉页 OCR）")
+                await fill(hit, pub, {**info, "title": info["title"] or data.get("title") or "",
+                                      "applicant": info["applicant"] or data.get("applicant") or "",
+                                      "pub_date": info["pub_date"] or data.get("pub_date") or ""})
+                failed = [f for f in failed if f[0].id != hit.id]
+            else:
+                why = data.get("error") or "扉页图 OCR 没有识别出摘要"
+                failed = [(h, p, lb, f"{e}；国知局单行本：{why}" if h.id == hit.id else e) for h, p, lb, e in failed]
+
+    problems = [f"{pub or label}：{err}" for _h, pub, label, err in failed]
     return [updated.get(h.id, h) for h in hits], problems
 
 
