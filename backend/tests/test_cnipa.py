@@ -378,6 +378,7 @@ async def test_search_type_gap_is_reported_and_not_cached(client: TestClient, mo
 
     result = await cnipa.search(case_id, ["缺口甲", "缺口乙"], "invention_utility_model", on_progress=on_progress)
     assert result.status == "done" and len(result.hits) == 1
+    assert result.gap_terms == ["缺口甲"]                     # 交给流水线自动补检
     done = next(m for st, m in stages if st == "done")
     assert "「缺口甲」的实用新型未检成" in done
     await cnipa.search(case_id, ["缺口甲", "缺口乙"], "invention_utility_model")
@@ -545,6 +546,9 @@ def test_search_budget_scales_with_terms():
     """预算随词数伸缩、封顶——早先一个 180s 写死套在任意词数上，7 个词实测要 248s。"""
     assert cnipa.search_budget(1) < cnipa.search_budget(4) < cnipa.search_budget(7)
     assert cnipa.search_budget(7) > 180
+    # 每词要读两个类型页签、每页 10 条、按需翻页：6 个词至少要给到 5 分钟
+    #（真实案件里 210s 只做完 4 个词，还有两个词的实用新型页签因预算没读）
+    assert cnipa.search_budget(6) >= 300
     assert cnipa.search_budget(100) == cnipa.SEARCH_BUDGET_CAP
     assert cnipa.search_budget(0) == cnipa.search_budget(1)
 

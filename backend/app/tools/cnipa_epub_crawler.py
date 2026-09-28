@@ -491,51 +491,93 @@ def _search_term(
     errors: dict[str, str] = {}
 
     def take(ptype: str, hits: list[EpubSearchHit]) -> None:
-        counts[ptype] = counts.get(ptype, 0) + len(hits)
+        # 只数新条目：翻回一个页签时第一页会再出现一次
+        fresh = 0
         for h in hits:
             key = h.pub_number or h.link or (h.title or "")[:120]
             if key not in seen:
                 seen.add(key)
                 merged.append(h)
+                fresh += 1
+        counts[ptype] = counts.get(ptype, 0) + fresh
 
     def budget_ok() -> bool:
         return deadline is None or deadline - time.monotonic() >= reserve_sec + AJAX_MIN_SEC
 
+    def pace() -> None:
+        page.wait_for_timeout(int(AJAX_PACING_SEC * 1000))
+
     wanted = {label: t for label, t in _TAB_TYPES.items() if t in query_types}
     tabs = [(label, el, cur) for label, el, cur in _tabs(page) if label in wanted]
     tabs.sort(key=lambda x: not x[2])           # 当前页签先读：切每页条数会顺带刷新它
+    # 站点只给有命中的类型出页签：勾了却没有页签的类型就是 0 条，不是「没检成」
+    shown = {label for label, _el, _cur in tabs}
+    for label, ptype in wanted.items():
+        if label not in shown:
+            counts[ptype] = 0
     # 结果页「可解析」不等于「脚本装完」：页面脚本还没把下拉框、页签的处理绑上就去按，
     # 站点要过十几秒才响应（真站点上第一页因此只读到 3 条）。等 load 完，再留一点间隔。
     try:
         page.wait_for_load_state("load", timeout=_timeout_ms(deadline, AJAX_CAP_MS))
     except Exception:  # noqa: BLE001 —— 个别外链资源挂着不算数，靠间隔兜底
         pass
+
+    # 第一轮：每个页签读第一页。第二页价值远低于另一类的第一页——预算紧时先保住每一类的
+    # 第一页（真实案件里曾因先翻发明第 2 页，把「纤维支气管镜训练箱」的三篇实用新型挤掉）。
+    on_tab: str | None = None
+    more: list[str] = []
+    read_ok: set[str] = set()               # 真正读到了页面的类型
+    broken = False
     for j, (label, el, current) in enumerate(tabs):
         ptype = wanted[label]
+        if j > 0 and not budget_ok():
+            errors[ptype] = "时间预算用尽，未检索"
+            continue
         try:
-            if j > 0 and not budget_ok():
-                errors[ptype] = "时间预算用尽，未检索"
-                continue
-            page.wait_for_timeout(int(AJAX_PACING_SEC * 1000))
+            pace()
             if current:
                 _raise_page_size(page, deadline=deadline)
             else:
                 _ajax(page, el.click, deadline=deadline)
+            on_tab = label
             html = _safe_page_content(page)
             take(ptype, parse_search_result_html(html))
+            read_ok.add(ptype)
+            if _total_pages(page) > 1:
+                more.append(label)
+        except Exception as exc:  # noqa: BLE001 —— 记下是哪一类，由调用方决定整词成败
+            errors[ptype] = _short(exc)
+            broken = True
+            break
+
+    # 第二轮：还有下一页的页签按需翻页（当前所在的页签先翻，省一次切换）。
+    # 翻页失败不算缺口：这一类的第一页已经在手。
+    more.sort(key=lambda lb: lb != on_tab)
+    for label in [] if broken else more:
+        if not budget_ok():
+            break
+        try:
+            if label != on_tab:
+                el = next((e for lb, e, _c in _tabs(page) if lb == label), None)
+                if el is None:
+                    continue
+                pace()
+                _ajax(page, el.click, deadline=deadline)
+                on_tab = label
+                take(wanted[label], parse_search_result_html(_safe_page_content(page)))
             for _n in range(2, min(_total_pages(page), MAX_PAGES_PER_TYPE) + 1):
                 if not budget_ok():
                     break
-                page.wait_for_timeout(int(AJAX_PACING_SEC * 1000))
+                pace()
                 if not _next_page(page, deadline=deadline):
                     break
                 html = _safe_page_content(page)
-                take(ptype, parse_search_result_html(html))
-        except Exception as exc:  # noqa: BLE001 —— 记下是哪一类，由调用方决定整词成败
-            errors[ptype] = _short(exc)
+                take(wanted[label], parse_search_result_html(html))
+        except Exception:  # noqa: BLE001
             break
-    if not counts:
-        raise RuntimeError(next(iter(errors.values()), "未检索"))
+
+    if errors and not read_ok:
+        raise RuntimeError(next(iter(errors.values())))
     # 停下之后没轮到的类也要如实记下
     for ptype in query_types:
         if ptype not in counts and ptype not in errors:

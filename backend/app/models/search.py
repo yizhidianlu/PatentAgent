@@ -95,6 +95,8 @@ class SearchResult(BaseModel):
     searched_terms: list[str] = Field(default_factory=list)
     skipped_terms: list[str] = Field(default_factory=list)
     failed_terms: list[str] = Field(default_factory=list)
+    # 检过了、但有类型页签没读到的词（预算用尽或那一类的页内操作失败）
+    gap_terms: list[str] = Field(default_factory=list)
     failure_kind: FailureKind | None = None
 
     @property

@@ -77,8 +77,11 @@ BROWSER_SCRIPT = "browser.py"
 # 直接检索（一词约 2~8s），预算又随词数伸缩——两道保险，任何一道单独都不够：
 # 结果页复用若失效会退回「每词回首页」，那时仍要靠预算够宽 + 部分结果兜底。
 SEARCH_BUDGET_BASE = 60        # 浏览器冷启动 + 首页 + 过一次防护挑战，实测 10~25s
-SEARCH_BUDGET_PER_TERM = 25
-SEARCH_BUDGET_CAP = 300
+# 每个词现在要读两个类型页签、每页 10 条、按需翻页（每次页内操作约 1~3s，另有 1.5s 间隔），
+# 实测一词 8~30s。原先的 25s/词是按「每词只取 3 条」定的：真实案件里 6 个词 210s 的预算
+# 只做完 4 个，其中两个词的实用新型页签因预算用尽没读，漏掉了三篇最相关的实用新型。
+SEARCH_BUDGET_PER_TERM = 45
+SEARCH_BUDGET_CAP = 480
 # 预算到点后子进程收尾（完成当前这一步、关浏览器、打出结果）的宽限；超过才强杀整棵进程树
 TEARDOWN_GRACE_SEC = 30
 # 首页防护挑战的最长等待；实测 5~15s 通过，等 90s 还不过基本就是被拦了
@@ -1091,6 +1094,7 @@ async def search(
         searched_terms=searched,
         skipped_terms=skipped,
         failed_terms=failed,
+        gap_terms=[t for t, gaps in type_gaps.items() if gaps],
     )
 
 

@@ -121,7 +121,11 @@ class FakePage:
 
     # ---- 状态 ----
     def _tabs_checked(self) -> list[str]:
-        return [TAB_LABELS[b] for b in HOME_BOXES if self._boxes_at_submit.get(b)]
+        """结果页左侧的页签：勾选了**且有命中**的类型（站点不给 0 条的类型出页签）。"""
+        return [
+            TAB_LABELS[b] for b in HOME_BOXES
+            if self._boxes_at_submit.get(b) and self._count(TAB_LABELS[b]) > 0
+        ]
 
     def _count(self, tab: str | None) -> int:
         return self.catalog.get((self.term or "", tab or ""), 1)
@@ -230,7 +234,7 @@ class FakePage:
             self.url = "broken"
             return
         tabs = self._tabs_checked()
-        if not tabs or all(self._count(t) == 0 for t in tabs):
+        if not tabs:
             self.url = "nohit"                      # 「无查询结果」页：没有表单、页签和下拉框
             return
         self.url, self.tab, self.size, self.page_no = "result", tabs[0], 3, 1
@@ -353,6 +357,43 @@ def test_scope_reads_each_wanted_tab_without_reclicking_current(fake_site):
     assert [(a["kind"], a["tab"]) for a in page.ajax] == [("size", "发明公布"), ("tab", "实用新型")]
     assert len(run.rows[0][2]) == 10 and not run.partial
     assert _term_events(events)[0]["types"] == {"发明": 4, "实用新型": 6}
+
+
+def test_first_page_of_every_tab_before_any_second_page(fake_site):
+    """第二页的价值远低于另一类的第一页：先读完每一类的第一页，再回头翻页。
+
+    真实案件里先翻了发明的第 2 页，预算就不够读实用新型了——「纤维支气管镜训练箱」的
+    三篇同名实用新型就这样漏掉。
+    """
+    page, _browser, factory = fake_site(catalog={("甲", "发明公布"): 25, ("甲", "实用新型"): 25})
+    events: list[tuple[str, dict[str, Any]]] = []
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention_utility_model", playwright_factory=factory,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+    assert [(a["kind"], a["tab"], a["page"]) for a in page.ajax] == [
+        ("size", "发明公布", 1),
+        ("tab", "实用新型", 1),
+        ("next", "实用新型", 2),                      # 当前在实用新型：先就地翻页，省一次切换
+        ("tab", "发明公布", 1),
+        ("next", "发明公布", 2),
+    ]
+    # 翻回发明时第一页又出现一次：不重复计数
+    assert _term_events(events)[0]["types"] == {"发明": 20, "实用新型": 20}
+    assert len(run.rows[0][2]) == 40 and not run.partial
+
+
+def test_type_without_a_tab_is_zero_hits_not_a_gap(fake_site):
+    """站点不给 0 条的类型出页签：那是「这一类没有命中」，不是「没检成」，不能让整场被判为不完整。"""
+    _page, _browser, factory = fake_site(catalog={("甲", "发明公布"): 0, ("甲", "实用新型"): 5})
+    events: list[tuple[str, dict[str, Any]]] = []
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention_utility_model", playwright_factory=factory,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+    assert not run.partial and not run.failed
+    first = _term_events(events)[0]
+    assert first["types"] == {"发明": 0, "实用新型": 5} and first["type_errors"] == {}
 
 
 def test_all_types_really_means_all(fake_site):

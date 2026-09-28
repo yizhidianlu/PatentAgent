@@ -69,6 +69,15 @@ def test_parse_summary_page_reads_meta_in_any_attribute_order():
     assert info["pdf_url"].endswith("/CN114186982A.pdf")
 
 
+def test_parse_summary_page_prefers_original_assignee_name():
+    """中文页的 DC.contributor 常是英译名；交底书里要的是原文申请人名。"""
+    html_text = (
+        '<meta name="DC.contributor" content="Eye and ENT Hospital of Fudan University" scheme="assignee">'
+        '<dd itemprop="assigneeOriginal">复旦大学附属眼耳鼻喉科医院</dd>'
+    )
+    assert patent_fetch.parse_summary_page(html_text)["applicant"] == "复旦大学附属眼耳鼻喉科医院"
+
+
 def test_parse_summary_page_falls_back_to_abstract_section():
     html_text = '<section itemprop="abstract"><h2>Abstract</h2><div class="abstract">一种训练箱，包括箱体。</div></section>'
     assert patent_fetch.parse_summary_page(html_text)["abstract"] == "一种训练箱，包括箱体。"

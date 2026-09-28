@@ -464,9 +464,10 @@ def parse_summary_page(html: str) -> dict[str, str]:
         m = re.search(r'<section[^>]*itemprop="abstract".*?</section>', html or "", re.DOTALL)
         if m:
             abstract = re.sub(r"^(Abstract|摘要)\s*", "", _clean(re.sub(r"<[^>]+>", " ", m.group(0))))
+    # 原文名称优先：中文页的 DC.contributor 常是英译名（「Eye and ENT Hospital of Fudan University」）
     applicant = (
-        _meta(html, "DC.contributor", scheme="assignee")
-        or _itemprop(html, "assigneeOriginal")
+        _itemprop(html, "assigneeOriginal")
+        or _meta(html, "DC.contributor", scheme="assignee")
         or [""]
     )[0]
     dates = _itemprop(html, "publicationDate") or _meta(html, "citation_publication_date")

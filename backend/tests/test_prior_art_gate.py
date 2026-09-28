@@ -158,15 +158,31 @@ def _fails(kind: str, searched: list[str], pending: list[str], error: str = "原
     return step
 
 
-def _succeeds(hits: list[dict[str, Any]], searched: list[str], pending: list[str] = ()):
+def _succeeds(
+    hits: list[dict[str, Any]], searched: list[str], pending: list[str] = (), gaps: list[str] = ()
+):
     async def step(case_id: str, norm: list[str], ptype: str) -> SearchResult:
         rows = await cnipa.add_manual_hits(case_id, hits, note="测试桩命中")
         return SearchResult(
             status="done", hits=rows, terms=norm, patent_type=ptype,
-            searched_terms=searched, skipped_terms=list(pending),
+            searched_terms=searched, skipped_terms=list(pending), gap_terms=list(gaps),
         )
 
     return step
+
+
+async def test_follow_up_also_covers_terms_with_missing_types(gate):
+    """词检过了、但实用新型页签因预算没读：也要进自动补检（那一类可能恰好是最相关的）。"""
+    make_ctx, calls, script = gate
+    script += [
+        _succeeds([_hit(21)], searched=["甲", "乙"], pending=["丙"], gaps=["乙"]),
+        _succeeds([_hit(22)], searched=["丙", "乙"]),
+    ]
+    ctx = make_ctx("门控-补类型缺口", [{}])
+    out = await disclosure.prior_art_search(ctx)
+    assert calls == [["甲", "乙", "丙"], ["丙", "乙"]]
+    assert any("有类型没检到" in m for m in ctx.logs)
+    assert sorted(n["url"] for n in out["prior_art_notes"]) == sorted(_hit(n)["url"] for n in (21, 22))
 
 
 async def test_budget_failure_retry_only_searches_pending_terms(gate):

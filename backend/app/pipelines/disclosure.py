@@ -1750,13 +1750,19 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
     # 新会话重新过一次防护挑战，站点对上一个会话的限频也随之不再作用——真站点上
     # 常见的形态是「前两三个词很快，后面的词开始卡」。不补的话，这些词用户根本没有机会再检索：
     # 有命中就不会弹失败门控，流程直接往下走了。
-    follow_up = [t for t in result.pending_terms if t not in zero_terms] if (result.ok and hits) else []
+    # 检过了、但有类型页签因预算没读到的词也要补：那一类可能恰好是最相关的（真实案件里
+    # 「支气管镜训练箱」的实用新型页签没读，三篇同名实用新型就这么漏了）。
+    follow_up = (
+        list(dict.fromkeys(t for t in [*result.pending_terms, *result.gap_terms] if t not in zero_terms))
+        if (result.ok and hits)
+        else []
+    )
     if follow_up:
         await ctx.emit(
             "log",
             {
                 "message": (
-                    f"有 {len(follow_up)} 个检索词未完成（{'、'.join(follow_up)}），"
+                    f"有 {len(follow_up)} 个检索词未完成或有类型没检到（{'、'.join(follow_up)}），"
                     "换一个新会话自动补检索一次…"
                 )
             },
