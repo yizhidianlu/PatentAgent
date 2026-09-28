@@ -125,9 +125,16 @@ _MARK_JS = """() => {
     const r = document.getElementById('result');
     if (r) r.insertAdjacentHTML('afterbegin', '<i id="__epub_stale__"></i>');
 }"""
-_FRESH_JS = """() => {
+# 等到 #result 被替换、且（给了类型时）里面的条目确实是这一类：条目标题带「[实用新型]」
+# 这样的前缀。只看「被替换了」不够——上一次操作的响应可能迟到，恰好在切到下一个页签后
+# 才回来，把页面刷回上一类的内容；那时读到的全是重复条目，一类就被误记成 0 条
+# （真实案件里「支气管镜训练箱」的三篇实用新型就这样丢了）。
+_FRESH_JS = """(label) => {
     const r = document.getElementById('result');
-    return !!r && !document.getElementById('__epub_stale__');
+    if (!r || document.getElementById('__epub_stale__')) return false;
+    if (!label) return true;
+    const titles = [...r.querySelectorAll('div.item h1.title')].map(h => h.textContent.trim());
+    return titles.length > 0 && titles.every(t => !t.startsWith('[') || t.startsWith('[' + label + ']'));
 }"""
 _PAGES_RE = re.compile(r"共\s*(\d+)\s*页")
 # 页签文字 → 类型。发明授权（B 文本）不读：内容与其发明公布（A 文本）相同，读了只会重复。
@@ -410,7 +417,7 @@ class EpubRun:
         return [term for term, _html, _hits in self.rows]
 
 
-def _ajax(page: Page, action: Callable[[], Any], *, deadline: float | None) -> None:
+def _ajax(page: Page, action: Callable[[], Any], *, deadline: float | None, label: str | None = None) -> None:
     """做一次页内操作（切页签 / 翻页 / 改每页条数）并等到 #result 被站点替换。
 
     先往 #result 里塞一个标记元素：站点的 AJAX 回来会整个换掉 #result，标记随之消失。
@@ -418,10 +425,10 @@ def _ajax(page: Page, action: Callable[[], Any], *, deadline: float | None) -> N
     """
     page.evaluate(_MARK_JS)
     action()
-    page.wait_for_function(_FRESH_JS, timeout=_timeout_ms(deadline, AJAX_CAP_MS))
+    page.wait_for_function(_FRESH_JS, arg=label, timeout=_timeout_ms(deadline, AJAX_CAP_MS))
 
 
-def _raise_page_size(page: Page, *, deadline: float | None) -> bool:
+def _raise_page_size(page: Page, *, deadline: float | None, label: str | None = None) -> bool:
     """把每页条数从 3 切到 10（顺带刷新当前页签）。切不过去返回 False，由调用方读默认的 3 条。"""
     if not page.query_selector("#sizeSelect"):
         return False
@@ -429,7 +436,12 @@ def _raise_page_size(page: Page, *, deadline: float | None) -> bool:
         return True
     try:
         # 下拉框只有 3 / 10 两项：焦点在框上按一次 ↓ 就是 10；键盘事件是可信事件
-        _ajax(page, lambda: (page.focus("#sizeSelect"), page.keyboard.press("ArrowDown")), deadline=deadline)
+        _ajax(
+            page,
+            lambda: (page.focus("#sizeSelect"), page.keyboard.press("ArrowDown")),
+            deadline=deadline,
+            label=label,
+        )
     except Exception:  # noqa: BLE001 —— 切不过去不算失败，只是少拿几条
         return False
     return True
@@ -451,11 +463,11 @@ def _total_pages(page: Page) -> int:
     return int(m.group(1)) if m else 1
 
 
-def _next_page(page: Page, *, deadline: float | None) -> bool:
+def _next_page(page: Page, *, deadline: float | None, label: str | None = None) -> bool:
     btn = page.query_selector(".next_page")
     if not btn or "btn_dis" in (btn.get_attribute("class") or ""):
         return False
-    _ajax(page, btn.click, deadline=deadline)
+    _ajax(page, btn.click, deadline=deadline, label=label)
     return True
 
 
@@ -536,9 +548,9 @@ def _search_term(
         try:
             pace()
             if current:
-                _raise_page_size(page, deadline=deadline)
+                _raise_page_size(page, deadline=deadline, label=label)
             else:
-                _ajax(page, el.click, deadline=deadline)
+                _ajax(page, el.click, deadline=deadline, label=label)
             on_tab = label
             html = _safe_page_content(page)
             take(ptype, parse_search_result_html(html))
@@ -562,14 +574,14 @@ def _search_term(
                 if el is None:
                     continue
                 pace()
-                _ajax(page, el.click, deadline=deadline)
+                _ajax(page, el.click, deadline=deadline, label=label)
                 on_tab = label
                 take(wanted[label], parse_search_result_html(_safe_page_content(page)))
             for _n in range(2, min(_total_pages(page), MAX_PAGES_PER_TYPE) + 1):
                 if not budget_ok():
                     break
                 pace()
-                if not _next_page(page, deadline=deadline):
+                if not _next_page(page, deadline=deadline, label=label):
                     break
                 html = _safe_page_content(page)
                 take(wanted[label], parse_search_result_html(html))

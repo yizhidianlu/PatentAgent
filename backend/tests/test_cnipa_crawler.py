@@ -94,6 +94,7 @@ class FakePage:
         fail_terms: tuple[str, ...] = (),
         fail_tabs: tuple[tuple[str, str], ...] = (),
         size_broken: bool = False,
+        late_size: bool = False,
         catalog: dict[tuple[str, str], int] | None = None,
     ) -> None:
         self.url = "blank"
@@ -101,6 +102,9 @@ class FakePage:
         self.fail_terms = set(fail_terms)
         self.fail_tabs = set(fail_tabs)            # {(词, 页签文字)}：点这个页签会把页面搞坏
         self.size_broken = size_broken             # 每页条数切不过去（站点没响应）
+        self.late_size = late_size                 # 「每页 10 条」的响应迟到：等超时后才回来
+        self._late_pending = False
+        self._pending_tab: str | None = None
         self.catalog = catalog or {}               # {(词, 页签文字): 命中数}；缺省每个勾选的页签 1 条
         self.home_visits = 0
         self.submitted: list[str] = []
@@ -210,8 +214,16 @@ class FakePage:
 
     def wait_for_function(self, js: str, **kw: Any) -> None:
         if js is crawler._FRESH_JS:
-            if self.stale:
-                raise TimeoutError("Timeout 20000ms exceeded.")
+            label = kw.get("arg")
+            if self._late_pending or self.stale:
+                raise TimeoutError("Timeout 30000ms exceeded.")
+            if label and self.url == "result" and self.tab != label:
+                if self._pending_tab == label:     # 轮询期间，这次操作真正的响应到了
+                    self._pending_tab = None
+                    self.tab, self.page_no = label, 1
+                    self._ajax_done("tab")
+                    return
+                raise TimeoutError("Timeout 30000ms exceeded.")
             return
         self.result_timeouts.append(int(kw.get("timeout") or 0))
         if self.url not in ("result", "nohit"):
@@ -245,6 +257,9 @@ class FakePage:
 
     def _key(self, key: str) -> None:
         if self._focused == "#sizeSelect" and key == "ArrowDown" and self.size == 3 and not self.size_broken:
+            if self.late_size:
+                self._late_pending = True          # 请求发出去了，响应要过很久才回来
+                return
             self.size, self.page_no = 10, 1
             self._ajax_done("size")
 
@@ -253,6 +268,14 @@ class FakePage:
             self.url = "broken"
             return
         if label == self.tab:                      # 点当前页签站点不会重新查询
+            return
+        if self._late_pending:
+            # 迟到的「每页 10 条」响应此刻才回来：#result 被刷成**上一类**的内容（标记随之消失），
+            # 这次切页签的响应还在路上
+            self._late_pending = False
+            self.size, self.page_no = 10, 1
+            self._ajax_done("size-late")
+            self._pending_tab = label
             return
         self.tab, self.page_no = label, 1
         self._ajax_done("tab")
@@ -381,6 +404,24 @@ def test_first_page_of_every_tab_before_any_second_page(fake_site):
     # 翻回发明时第一页又出现一次：不重复计数
     assert _term_events(events)[0]["types"] == {"发明": 20, "实用新型": 20}
     assert len(run.rows[0][2]) == 40 and not run.partial
+
+
+def test_late_response_does_not_pass_for_the_next_tab(fake_site):
+    """上一次操作的响应迟到、在切到实用新型之后才回来，把页面刷回发明的内容：不能把它当成
+    实用新型的结果读（那样读到的全是重复条目，实用新型被误记成 0 条）。
+
+    真实案件里「支气管镜训练箱」就这样丢了三篇同名实用新型：切每页 10 条的请求等了 30s 没回，
+    切到实用新型后它才回来。
+    """
+    page, _browser, factory = fake_site(late_size=True, catalog={("甲", "发明公布"): 2, ("甲", "实用新型"): 3})
+    events: list[tuple[str, dict[str, Any]]] = []
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention_utility_model", playwright_factory=factory,
+        on_event=lambda k, d: events.append((k, d)),
+    )
+    assert [a["kind"] for a in page.ajax] == ["size-late", "tab"]
+    assert _term_events(events)[0]["types"] == {"发明": 2, "实用新型": 3}
+    assert len(run.rows[0][2]) == 5 and not run.partial
 
 
 def test_type_without_a_tab_is_zero_hits_not_a_gap(fake_site):

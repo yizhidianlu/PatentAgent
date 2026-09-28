@@ -219,6 +219,17 @@ def test_prior_art_scope_covers_both_technical_types():
     assert cnipa.normalize_type("invention_utility_model") == "invention_utility_model"
 
 
+def test_search_terms_prompt_does_not_seed_foreign_objects():
+    """检索词提示里不能举具体领域的对象名：上一版举了「胃镜、气管插管」，模型就原样当成了检索词，
+    而那份材料里根本没有这两样——30 个名额被气管插管训练模型占掉 13 个。"""
+    from app.services import assets_loader
+
+    text = assets_loader.get_raw("prompts/disclosure/prior_art/search_terms.md")
+    for foreign in ("气管插管", "胃镜", "支气管镜训练箱"):
+        assert foreign not in text
+    assert "只用材料里出现过的对象" in text
+
+
 def test_rank_hits_puts_title_matches_first_and_is_stable():
     hits = [
         {"title": "某公司", "abstract": "", "url": "u1"},                         # 只在别的字段撞上

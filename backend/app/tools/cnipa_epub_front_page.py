@@ -98,11 +98,11 @@ def _search_pub(page: Any, pub: str, *, deadline: float | None) -> tuple[Any, Ep
         if found:
             return found
         # 类型未知时勾了全部、落在第一个页签：到别的页签上找
-        for _label, el, current in crawler._tabs(page):
+        for tab_label, el, current in crawler._tabs(page):
             if current:
                 continue
             page.wait_for_timeout(int(crawler.AJAX_PACING_SEC * 1000))
-            crawler._ajax(page, el.click, deadline=deadline)
+            crawler._ajax(page, el.click, deadline=deadline, label=tab_label)
             found = _find_item(page, digits)
             if found:
                 return found
