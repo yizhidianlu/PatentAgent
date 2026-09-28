@@ -1684,6 +1684,35 @@ async def _enrich_for_digest(ctx: Ctx, hits: list[Any], progress: Any) -> list[A
     return enriched
 
 
+async def _cap_hits(ctx: Ctx, hits: list[Any], terms: Sequence[str]) -> list[Any]:
+    """几场检索的命中合在一起，按**全部**检索词统一排序，只留前 `MAX_SEARCH_HITS` 条进入比对。
+
+    每场检索各自有上限，合起来却可能翻倍：真实案件里自动补检那一场的词是「检测节点」，
+    一场就带进 30 条配电室漏雨检测、电池保护电路之类的无关文献，1.1 要写 60 篇、一半是噪音。
+    其余条目照样留档（取消勾选），不进消化改写与 1.1。
+    """
+    limit = cnipa.MAX_SEARCH_HITS
+    if len(hits) <= limit:
+        return hits
+    ranked = cnipa.rank_hit_models(hits, list(dict.fromkeys(t for t in terms if t)))
+    keep, drop = ranked[:limit], ranked[limit:]
+    for hit in drop:
+        try:
+            await cnipa.set_selected(str(hit.id), False)
+        except Exception as exc:  # noqa: BLE001 —— 内存态命中（缓存复用）无对应行
+            logger.debug("取消勾选超限命中失败：%s", exc)
+    await ctx.emit(
+        "log",
+        {
+            "message": (
+                f"几场检索共取得 {len(hits)} 条命中，按与全部检索词的重合度取前 {len(keep)} 条进入比对，"
+                f"其余 {len(drop)} 条留档、不纳入 1.1。"
+            )
+        },
+    )
+    return keep
+
+
 def _merge_terms(into: list[str], terms: Iterable[str]) -> None:
     for t in terms:
         if t and t not in into:
@@ -1883,6 +1912,7 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
     notes: list[dict[str, Any]] = []
     selected_count = 0
     if hits:
+        hits = await _cap_hits(ctx, hits, [*planned, *searched_all])
         hits = await _enrich_for_digest(ctx, hits, progress)
         notes = await _digest_hits(ctx, hits)
         answer = _answer(

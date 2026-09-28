@@ -220,19 +220,28 @@ def prior_art_scope(case_type: str | None) -> str:
     return "design" if normalize_type(case_type) == "design" else "invention_utility_model"
 
 
+def hit_relevance(title: str | None, abstract: str | None, terms: Sequence[str]) -> int:
+    """与检索词的重合度：词出现在标题里计 2 分、只在摘要里计 1 分（每词只计一次）。"""
+    t, a = str(title or ""), str(abstract or "")
+    return sum(2 if x in t else 1 if x in a else 0 for x in terms if x)
+
+
 def rank_hits(hits: Sequence[Mapping[str, Any]], terms: Sequence[str]) -> list[dict[str, Any]]:
-    """按与检索词的重合度排序：词出现在标题里计 2 分、只在摘要里计 1 分，同分保持原顺序。
+    """按与检索词的重合度排序，同分保持原顺序。
 
     公布站是多字段「或」检索，只在申请人、地址、代理机构里撞上检索词的条目也会进结果；
     它们与方案无关，应该排在后面、超上限时先被舍弃。
     """
+    return sorted(
+        (dict(h) for h in hits),
+        key=lambda h: hit_relevance(h.get("title"), h.get("abstract"), terms),
+        reverse=True,
+    )
 
-    def score(hit: Mapping[str, Any]) -> int:
-        title = str(hit.get("title") or "")
-        abstract = str(hit.get("abstract") or "")
-        return sum(2 if t in title else 1 if t in abstract else 0 for t in terms if t)
 
-    return sorted((dict(h) for h in hits), key=score, reverse=True)
+def rank_hit_models(hits: Sequence[SearchHit], terms: Sequence[str]) -> list[SearchHit]:
+    """同 `rank_hits`，作用于入库后的命中对象。"""
+    return sorted(hits, key=lambda h: hit_relevance(h.title, h.abstract, terms), reverse=True)
 
 
 def normalize_terms(terms: Iterable[str] | None) -> list[str]:

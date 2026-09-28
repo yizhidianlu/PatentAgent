@@ -425,3 +425,34 @@ async def test_missing_abstracts_are_filled_before_digest(gate, monkeypatch: pyt
     assert by_pub["CN101656028A"] == "一种纤维支气管镜训练箱……"       # 消化改写拿到的是补全后的
     assert any("已补全 1 条" in m for m in ctx.logs)
     assert any("未能补全摘要" in m and "CN9A" in m for m in ctx.logs)  # 补不上的如实说
+
+
+async def test_hits_from_all_sessions_are_capped_by_overall_relevance(gate, monkeypatch: pytest.MonkeyPatch):
+    """补检那一场若是个宽泛词，会带进一整场无关文献：合并后按全部检索词统一排序、只留前 N 条。
+
+    真实案件里补检的词是「检测节点」，一场带进 30 条配电室漏雨检测、电池保护电路之类的专利。
+    """
+    make_ctx, calls, script = gate
+    monkeypatch.setattr(cnipa, "MAX_SEARCH_HITS", 3)
+    relevant = [{**_hit(41), "title": "甲乙训练箱"}, {**_hit(42), "title": "甲的装置"}]
+    follow = [{**_hit(43), "title": "无关的配电箱"}, {**_hit(44), "title": "丙结构"}]
+    script += [
+        _succeeds(relevant, searched=["甲", "乙"], pending=["丙"]),
+        _succeeds(follow, searched=["丙"]),
+    ]
+    digested: list[str] = []
+    real_digest = disclosure._digest_hits
+
+    async def spy(ctx_: Any, hits: Any):
+        digested.extend(str(h.title) for h in hits)
+        return await real_digest(ctx_, hits)
+
+    monkeypatch.setattr(disclosure, "_digest_hits", spy)
+    ctx = make_ctx("门控-全局上限", [{}])
+    await disclosure.prior_art_search(ctx)
+
+    assert calls == [["甲", "乙", "丙"], ["丙"]]
+    assert digested == ["甲乙训练箱", "甲的装置", "丙结构"]            # 相关度高的在前，无关的被挤出
+    assert any("按与全部检索词的重合度取前 3 条" in m for m in ctx.logs)
+    stored = {h.title: h for h in await cnipa.list_hits(ctx.case_id)}
+    assert stored["无关的配电箱"].selected is False                    # 留档、不纳入
