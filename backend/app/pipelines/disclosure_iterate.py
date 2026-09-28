@@ -847,6 +847,19 @@ async def _supplementary_search(ctx: Ctx, new_terms: Sequence[str]) -> dict[str,
     )
     report["status"] = result.status
     report["error"] = result.error
+    report["searched_terms"] = list(result.searched_terms)
+    report["unsearched_terms"] = list(result.pending_terms)
+    if result.ok and result.hits and result.partial:
+        await ctx.emit(
+            "log",
+            {
+                "message": (
+                    f"补充查新部分完成：{len(result.pending_terms)} 个词未检索"
+                    f"（{'、'.join(result.pending_terms)}），1.1 只写实际检索过的词。"
+                ),
+                "kind": "iteration",
+            },
+        )
     if not (result.ok and result.hits):
         await ctx.emit(
             "log",
@@ -926,6 +939,13 @@ async def _rewrite_merge(ctx: Ctx) -> dict[str, Any]:
             prior["searched"] = True
             prior["selected_count"] = len(notes)
             prior["hit_count"] = int(prior.get("hit_count") or 0) + int(search_report["added"])
+            # 补充检索用到的新词也要进 1.1 的检索说明：新文献是用这些词查到的，
+            # 只列原来的词等于隐去了真实的检索过程
+            terms = [str(t) for t in (prior.get("terms") or [])]
+            for t in search_report.get("searched_terms") or []:
+                if t and t not in terms:
+                    terms.append(str(t))
+            prior["terms"] = terms
             output["prior_art"] = prior
             ctx.state["prior_art"] = prior
             if "g1" not in affected and "g1" in chapters:

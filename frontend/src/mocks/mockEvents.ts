@@ -730,12 +730,14 @@ function buildDisclosureTimeline(): MockTimelineEvent[] {
     chatDone('prior_art_search'),
   )
   t.push(
+    // 与真后端 disclosure.prior_art_search 的勾选门控同形（selected_ids）。
+    // 这里曾写成 hit_ids，卡片照着 mock 写、真后端却一个字段都认不出——mock 必须跟后端契约走。
     ask('prior_art_search', 'prior_art', '请确认纳入 1.1 的命中文献（可取消勾选无关项或手动补录）', {
       schema: {
         type: 'object',
-        properties: { hit_ids: { type: 'array', items: { type: 'string' } } },
+        properties: { selected_ids: { type: 'array', items: { type: 'string' } } },
       },
-      default: { hits: disclosureHits, failed: false },
+      default: { hits: disclosureHits, selected_ids: disclosureHits.map((h) => h.id), failed: false },
     }),
   )
   t.push({ ...step('prior_art_search', 'waiting_user', '联网查新', 120), gate: 'input' })

@@ -18,6 +18,13 @@ SearchSource = Literal["cnipa", "manual", "fallback_web"]
 SearchStatus = Literal["running", "done", "failed", "manual_pending"]
 PatentTypeParam = Literal["invention", "utility_model", "design", "all"]
 
+# 失败归类——处置方式完全不同，所以不能共用一句话：
+#   blocked : 首页防护没过（被拦截/网络不通）→ 稍后重试可能恢复，或手工检索
+#   budget  : 防护过了、站点正常，只是时间预算内没做完 → 减少词数或只补检索没做的词
+#   empty   : 全部检索完了，确实零命中 → 原词重试结果不会变，要换词
+#   script  : 脚本/环境错误（浏览器起不来等）
+FailureKind = Literal["blocked", "budget", "empty", "script"]
+
 # 单次会话最多检索词数（与 tools/cnipa_epub_search.py 的 _MAX_TERMS 一致）
 MAX_TERMS = 8
 
@@ -83,11 +90,27 @@ class SearchResult(BaseModel):
     patent_type: str = "all"
     cached: bool = False
     elapsed_ms: int = 0
+    # 实际检索完成的词 / 因预算没来得及的词 / 检索时失败的词。
+    # 交底书 1.1 的「检索说明」只能写 searched_terms——写没检索过的词就是编造检索过程。
+    searched_terms: list[str] = Field(default_factory=list)
+    skipped_terms: list[str] = Field(default_factory=list)
+    failed_terms: list[str] = Field(default_factory=list)
+    failure_kind: FailureKind | None = None
 
     @property
     def ok(self) -> bool:
         """检索是否成功（供调用方门控判断）。"""
         return self.status == "done"
+
+    @property
+    def partial(self) -> bool:
+        """有词没检索到（预算用尽或失败）。部分结果照样可用，但必须如实说明。"""
+        return bool(self.skipped_terms or self.failed_terms)
+
+    @property
+    def pending_terms(self) -> list[str]:
+        """还没有真正检索过的词（重试时只补这些才有意义）。"""
+        return [*self.skipped_terms, *self.failed_terms]
 
 
 class BrowserProbe(BaseModel):

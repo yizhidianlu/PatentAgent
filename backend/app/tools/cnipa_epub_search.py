@@ -7,8 +7,22 @@
 
 **输出约定**（便于 Agent 抓取且不触发误判降级）：
 
-- **stdout**：**仅一行** ``EPUB_HITS_JSON:`` + JSON 数组（UTF-8，含中文标题与 ``abstract``）。
+- **stdout**：机读行，每行一个前缀 + JSON（UTF-8）。**最终结果永远是 ``EPUB_HITS_JSON:`` 那一行**
+  （合并去重后的全部命中；旧消费方只认这一行即可，其余行按前缀忽略）。其余行随检索进行逐行打出：
+
+  - ``EPUB_WAIT:``           等待防护挑战中（``{"stage":"home","sec":15}``），证明「还在等」
+  - ``EPUB_HOME_READY:``     首页防护已通过（``{"sec":8.6}``）
+  - ``EPUB_TERM_JSON:``      某个词完成（``{"i":1,"n":7,"term":…,"sec":…,"hits":[…]}``）
+  - ``EPUB_TERM_FAIL_JSON:`` 某个词失败（``{"i":…,"n":…,"term":…,"error":…}``），会继续下一个词
+  - ``EPUB_SUMMARY_JSON:``   收尾摘要（``{"searched":[…],"failed":[…],"skipped":[…],"stop":…,"error":…}``）
+
+  逐词行的意义：父进程被迫强杀子进程时，**已完成词的命中仍可从这些行里抢救出来**。
 - **stderr**：``EPUB_MERGE:`` / ``EPUB_NOTE:`` / ``EPUB_HINT:`` 等为 **ASCII**。
+- **退出码**：0 = 至少检索完成了一个词（可能是部分完成，见摘要）；3 = 首页防护未通过（被拦截/不可达）；
+  1 = 其它错误（浏览器起不来等）；2 = 参数错误。
+
+**时间预算**：环境变量 ``EPUB_DEADLINE_SEC``（秒，自脚本启动起算）。给了就按截止时刻收口：
+来不及的词如实列为 skipped，已完成的词照常输出。
 
 **专利类型**：``--type invention|utility_model|design|all``（默认 ``all``）。
 对应首页勾选：发明公布+发明授权 / 实用新型 / 外观设计（见 ``tools/shared/patent_type.py``）。
@@ -26,7 +40,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 _CRAWL = Path(__file__).resolve().parent
 _SHARED = _CRAWL.parent / "shared"
@@ -85,6 +101,19 @@ def _dedupe_hits(hits_lists: list) -> list:
     return out
 
 
+def _deadline_from_env() -> float | None:
+    raw = os.environ.get("EPUB_DEADLINE_SEC", "").strip()
+    try:
+        sec = float(raw)
+    except ValueError:
+        return None
+    return time.monotonic() + sec if sec > 0 else None
+
+
+def _out(prefix: str, payload: Any) -> None:
+    print(prefix, json.dumps(payload, ensure_ascii=False), flush=True)
+
+
 def _usage() -> None:
     print(
         "usage: python tools/crawl/cnipa_epub_search.py [--type invention|utility_model|design|all] <term> [...]",
@@ -131,25 +160,55 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    from cnipa_epub_crawler import search_epub_keywords
+    from cnipa_epub_crawler import run_epub_session
     from cnipa_epub_parse import hits_to_jsonable
 
     multi = len(terms) > 1
+    deadline = _deadline_from_env()
+
+    def on_event(kind: str, data: dict[str, Any]) -> None:
+        if kind == "term":
+            _out("EPUB_TERM_JSON:", {**data, "hits": hits_to_jsonable(data.get("hits") or [])})
+        elif kind == "term_failed":
+            _out("EPUB_TERM_FAIL_JSON:", data)
+        elif kind == "home_ready":
+            _out("EPUB_HOME_READY:", data)
+        elif kind == "wait":
+            _out("EPUB_WAIT:", data)
 
     try:
-        rows = search_epub_keywords(terms, patent_type=patent_type)
+        run = run_epub_session(terms, patent_type=patent_type, deadline=deadline, on_event=on_event)
     except Exception as e:
         print("CNIPA_EPUB_ERROR:", e, file=sys.stderr)
         return 1
 
+    _out(
+        "EPUB_SUMMARY_JSON:",
+        {
+            "searched": run.searched,
+            "failed": [term for term, _reason in run.failed],
+            "skipped": run.skipped,
+            "stop": run.stop,
+            "error": run.error,
+        },
+    )
+    if run.stop == "blocked" and not run.rows:
+        print("CNIPA_EPUB_ERROR:", run.error, file=sys.stderr, flush=True)
+        return 3
+
+    rows = [(html, hits) for _term, html, hits in run.rows]
     last_html = rows[-1][0] if rows else ""
     all_batches = [hits for _html, hits in rows]
 
-    if multi:
+    if not all_batches:
+        # 首页过了但一个词都没完成（全失败或预算极紧）：仍给出空结果行，原因在摘要里
+        hits = []
+        print("EPUB_NOTE: no term completed stop=%s" % (run.stop or "-"), file=sys.stderr, flush=True)
+    elif multi:
         hits = _dedupe_hits(all_batches)
         print(
-            "EPUB_MERGE: terms=%d type=%s merged_hits=%d"
-            % (len(terms), patent_type, len(hits)),
+            "EPUB_MERGE: terms=%d searched=%d type=%s merged_hits=%d"
+            % (len(terms), len(rows), patent_type, len(hits)),
             file=sys.stderr,
             flush=True,
         )

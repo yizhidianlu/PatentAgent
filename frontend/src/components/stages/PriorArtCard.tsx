@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import {
+  ArrowPathIcon,
   ArrowTopRightOnSquareIcon,
   ExclamationTriangleIcon,
   GlobeAltIcon,
@@ -47,11 +48,27 @@ function readHits(payload: InteractionRequiredEvent | null): PriorArtHit[] {
 
 const EMPTY_MANUAL = { pub_number: '', title: '', url: '', abstract: '' }
 
+/** 检索词输入框 → 词表（空白、逗号、顿号、分号都算分隔）。 */
+function splitTerms(text: string): string[] {
+  const seen = new Set<string>()
+  return text
+    .split(/[\s,，、;；]+/)
+    .map((t) => t.trim())
+    .filter((t) => t && !seen.has(t) && (seen.add(t), true))
+}
+
 /**
  * §2.8 模块 A / A4 联网查新确认卡：
  * 命中列表（外链标题 + 公开号/日期/申请人 meta + 摘要 line-clamp-3 可展开 + 逐条纳入勾选）、
  * 「手动添加现有技术」内联表单、「跳过查新」与「确认继续」。
  * 空结果 / 查新失败时手动补录表单前置显著展示（A4 失败分支：禁止编造检索结果）。
+ *
+ * **提交形状按后端契约**（disclosure.prior_art_search）：
+ * - 失败态：`{action: 'retry', terms}` / `{action: 'manual', hits}` / 跳过；
+ * - 勾选态：`{selected_ids, manual}`。
+ * 早先卡片是对着 mock 写的（mock 里叫 hit_ids、从不模拟失败态），真后端一个字段都认不出：
+ * 失败态点确认会被当成「跳过」、手工补录的文献被丢弃；勾选态取消勾选被忽略；
+ * 提示文案里写着「重试检索」，卡片上却没有这个入口。为兼容，hit_ids 仍一并带上。
  */
 export function PriorArtCard({ stage, submit, skip, busy }: StageCardProps) {
   const payload = stage.payload as InteractionRequiredEvent | null
@@ -70,8 +87,23 @@ export function PriorArtCard({ stage, submit, skip, busy }: StageCardProps) {
   const [manualOpen, setManualOpen] = useState(() => hits.length === 0 || failed)
   const [draft, setDraft] = useState({ ...EMPTY_MANUAL })
   const [draftError, setDraftError] = useState<string | null>(null)
+  // 失败态的重试词：后端已按失败类型预填（超预算时只填还没检索的词）
+  const [retryText, setRetryText] = useState(() =>
+    pickArray(defaults, 'terms')
+      .map((t) => String(t))
+      .join('、'),
+  )
+  const retryTerms = splitTerms(retryText)
 
   const allHits = [...hits, ...manualHits]
+  const selectedManual = manualHits.filter((h) => selected.includes(h.id))
+  const manualPayload = selectedManual.map((h) => ({
+    pub_number: h.pubNumber,
+    pub_no: h.pubNumber,
+    title: h.title,
+    url: h.url,
+    abstract: h.abstract,
+  }))
 
   const toggle = (id: string) =>
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
@@ -81,6 +113,11 @@ export function PriorArtCard({ stage, submit, skip, busy }: StageCardProps) {
   const addManual = () => {
     if (!draft.pub_number.trim() && !draft.title.trim()) {
       setDraftError(zh.stages.priorArt.manualIncomplete)
+      return
+    }
+    // 后端对缺链接的条目整条拒收（1.1 每条都要可核验）——在这里就说清楚，而不是提交后静默丢掉
+    if (!draft.url.trim()) {
+      setDraftError(zh.stages.priorArt.manualUrlRequired)
       return
     }
     const entry: PriorArtHit = {
@@ -165,21 +202,19 @@ export function PriorArtCard({ stage, submit, skip, busy }: StageCardProps) {
         resultIds.length > 0 ? resultIds.length : selected.length,
       )}
       onConfirm={() =>
-        submit({
-          hit_ids: selected,
-          manual: manualHits
-            .filter((h) => selected.includes(h.id))
-            .map((h) => ({
-              pub_number: h.pubNumber,
-              title: h.title,
-              url: h.url,
-              abstract: h.abstract,
-            })),
-          skipped: false,
-        })
+        failed
+          ? submit({ action: 'manual', hits: manualPayload, skipped: false })
+          : submit({
+              selected_ids: selected.filter((id) => !id.startsWith('manual-')),
+              hit_ids: selected,
+              manual: manualPayload,
+              skipped: false,
+            })
       }
       onSkip={skip}
-      confirmLabel={zh.stages.priorArt.confirm}
+      confirmLabel={failed ? zh.stages.priorArt.confirmManual : zh.stages.priorArt.confirm}
+      // 失败态下「确认」的含义是纳入手工补录；一条都没有时不给按，免得被误当成继续
+      confirmDisabled={failed && selectedManual.length === 0}
       skipLabel={zh.stages.priorArt.skip}
       busy={busy}
     >
@@ -204,9 +239,39 @@ export function PriorArtCard({ stage, submit, skip, busy }: StageCardProps) {
                 {failed ? zh.stages.priorArt.failed : zh.stages.priorArt.empty}
               </span>
               <span className="block mt-0.5 leading-relaxed opacity-90">
-                {failureMessage || zh.stages.priorArt.emptyHint}
+                {/* 失败原因已在上方提示里说清；这里只给能做什么 */}
+                {payload?.prompt ? zh.stages.priorArt.emptyHint : failureMessage || zh.stages.priorArt.emptyHint}
               </span>
             </span>
+          </div>
+        )}
+
+        {failed && (
+          <div className="rounded-xl border border-gray-200 dark:border-gray-700 p-3 space-y-2">
+            <p className="text-xs font-medium text-gray-600 dark:text-gray-300">
+              {zh.stages.priorArt.retryTitle}
+            </p>
+            <Input
+              value={retryText}
+              placeholder={zh.stages.priorArt.retryPlaceholder}
+              aria-label={zh.stages.priorArt.retryTitle}
+              onChange={(e) => setRetryText(e.target.value)}
+            />
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-[11px] text-gray-400 dark:text-gray-500">
+                {zh.stages.priorArt.retryHint(retryTerms.length)}
+              </p>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="gap-1 shrink-0"
+                disabled={busy || retryTerms.length === 0}
+                onClick={() => submit({ action: 'retry', terms: retryTerms })}
+              >
+                <ArrowPathIcon className="w-3.5 h-3.5" strokeWidth={2} />
+                {zh.stages.priorArt.retry}
+              </Button>
+            </div>
           </div>
         )}
         {(hits.length === 0 || failed) && manualOpen && manualForm}

@@ -1,20 +1,27 @@
 """国知局（CNIPA）公布公告查新服务（prompt-porting-spec §2 A4 / R8）。
 
 子进程调移植脚本 `app/tools/cnipa_epub_search.py`（Playwright，浏览器顺序
-chrome → msedge → chromium，见 `tools/browser.py`），沿用其机读 stdout 协议：
+chrome → msedge → chromium，见 `tools/browser.py`），**流式**读其机读 stdout 协议：
 
-    stdout 仅一行： ``EPUB_HITS_JSON:`` + JSON 数组（[{title, pub_number, link, abstract}]）
-    stderr 为 ASCII 的 ``EPUB_MERGE:`` / ``EPUB_NOTE:`` / ``EPUB_HINT:`` 等
+    EPUB_WAIT: / EPUB_HOME_READY: / EPUB_TERM_JSON: / EPUB_TERM_FAIL_JSON:   运行中逐行
+    EPUB_SUMMARY_JSON:                                                         收尾摘要
+    EPUB_HITS_JSON: + JSON 数组（[{title, pub_number, link, abstract}]）      最终结果
+    其余为 ASCII 的 EPUB_MERGE: / EPUB_NOTE: / EPUB_HINT: 提示（stderr 已合并进 stdout）
 
 铁律：
 
 - **URL 照抄**：`search_hits.url` 一律取条目的 `link` 字段，缺 link 的条目直接丢弃
   （宁可少一条，也不给下游拼一个能编造的 URL）；
-- **失败即降级**：超时 / WAF / 退出码非零 / 无 EPUB_HITS_JSON / 零解析，全部返回
-  `status='failed'` 并写库，**绝不抛异常、绝不阻塞流水线** —— 由 A4 的三选项门控
-  （重试 / 用户粘贴在先文献 / 跳过并如实写明未检索）兜底；
-- **6 小时缓存**：同 terms+type（归一化哈希）命中 6 小时内的成功会话即复用，
-  减少对 CNIPA 的请求频次（WAF 缓解手段之一）。
+- **失败即降级**：全部返回 `status='failed'` 并写库，**绝不抛异常、绝不阻塞流水线**——
+  由 A4 的门控（重试 / 用户粘贴在先文献 / 跳过并如实写明未检索）兜底；
+- **失败要说真话**：被拦截（blocked）、超预算（budget）、零命中（empty）、脚本错误（script）
+  处置完全相反，报错必须分开说。早先它们共用「检索超时，疑似 WAF 拦截或网络不可达」一句话，
+  而那次的真实情况是站点正常、检索正在成功进行，只是 7 个词需要 248 秒、预算只给了 180 秒；
+- **已完成的永远保留**：预算按词数伸缩；来不及的词如实列为未检索，完成的词照常入库；
+- **进度即心跳**：逐词进度推到界面，同时刷新流水线的「卡住」计时——国知局子进程不是 LLM 调用，
+  不会出现在在途登记里，没有这条通路，检索跑到第 90 秒界面就会劝用户取消；
+- **6 小时缓存**：同 terms+type（归一化哈希）命中 6 小时内的**完整**成功会话即复用
+  （部分完成的会话不进缓存，否则会被当成完整结果复用）。
 
 本模块只做「子进程 + 落库 + 进度回调」，不调 LLM。
 """
@@ -25,9 +32,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import queue
 import re
 import sqlite3
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -44,7 +53,8 @@ from ..models.search import (
     SearchResult,
     hit_row_to_model,
 )
-from .convert import run_tool
+from . import progress as progress_service
+from .convert import kill_process_tree, run_tool, spawn_tool
 from .sse import hub
 
 logger = logging.getLogger(__name__)
@@ -53,14 +63,38 @@ logger = logging.getLogger(__name__)
 SEARCH_SCRIPT = "cnipa_epub_search.py"
 BROWSER_SCRIPT = "browser.py"
 
-# 单次检索会话超时（秒）：backend-architecture §6 风险 1
-SEARCH_TIMEOUT = 180
+# 检索时间预算（秒）= 基础 + 每词 × 词数，封顶。
+#
+# 早先是**一个写死的 180s 套在整场多词检索上**，而脚本对每个词都回首页重过一遍防护挑战，
+# 一词约 35s：7 个词实测 248s，于是每次都在第 180s 被杀、全部作废。现在第 2 个词起在结果页上
+# 直接检索（一词约 2~8s），预算又随词数伸缩——两道保险，任何一道单独都不够：
+# 结果页复用若失效会退回「每词回首页」，那时仍要靠预算够宽 + 部分结果兜底。
+SEARCH_BUDGET_BASE = 60        # 浏览器冷启动 + 首页 + 过一次防护挑战，实测 10~25s
+SEARCH_BUDGET_PER_TERM = 25
+SEARCH_BUDGET_CAP = 300
+# 预算到点后子进程收尾（完成当前这一步、关浏览器、打出结果）的宽限；超过才强杀整棵进程树
+TEARDOWN_GRACE_SEC = 30
+# 首页防护挑战的最长等待；实测 5~15s 通过，等 90s 还不过基本就是被拦了
+WAF_MAX_WAIT_SEC = 90
 # 浏览器探测超时（秒）：含冷启动
 PROBE_TIMEOUT = 120
 # 结果缓存有效期（小时）
 CACHE_TTL_HOURS = 6
 
 _HITS_MARKER = "EPUB_HITS_JSON:"
+_SUMMARY_MARKER = "EPUB_SUMMARY_JSON:"
+_TERM_MARKER = "EPUB_TERM_JSON:"
+_TERM_FAIL_MARKER = "EPUB_TERM_FAIL_JSON:"
+_HOME_READY_MARKER = "EPUB_HOME_READY:"
+_WAIT_MARKER = "EPUB_WAIT:"
+# 脚本退出码 3 = 首页防护未通过
+_EXIT_BLOCKED = 3
+
+
+def search_budget(n_terms: int) -> int:
+    """一场 n 个词的检索给多少秒。"""
+    n = max(1, int(n_terms or 1))
+    return min(SEARCH_BUDGET_CAP, SEARCH_BUDGET_BASE + SEARCH_BUDGET_PER_TERM * n)
 
 # stderr 里对人有用的提示行前缀
 _STDERR_KEEP = ("EPUB_", "CNIPA_EPUB_ERROR", "ERROR", "BROWSER:", "HINT")
@@ -111,9 +145,14 @@ def hub_progress(case_id: str, step_key: str | None = None) -> ProgressCallback:
 
     persist=False：滚动进度是瞬时值，UI 语义是「同一行原地更新」。
     落库的话界面只留一条、库里却存了几十条，重放时还会把它们一条条铺开。
+
+    每条进度同时 touch 流水线的进度计时：流水线的「卡住」判定只认 LLM 在途登记，
+    而国知局子进程不是 LLM 调用——不 touch 的话，一场三分钟的检索在第 90 秒就会被
+    界面判成「长时间无反馈，可取消本步骤后重试」，而它明明正一个词一个词地往前走。
     """
 
     async def _cb(stage: str, msg: str) -> None:
+        progress_service.touch(case_id, msg)
         await hub.emit(
             case_id,
             "search_progress",
@@ -259,36 +298,278 @@ async def probe_browser(timeout: int = PROBE_TIMEOUT) -> BrowserProbe:
     return await db.arun(probe_browser_sync, timeout)
 
 
-def _run_search_script(terms: Sequence[str], patent_type: str, timeout: int) -> dict[str, Any]:
-    """跑一次检索子进程，返回 `{ok, hits, error, stderr}`（同步；供线程池调用）。"""
+LineCallback = Callable[[str], None]
+
+
+def _json_after(line: str, marker: str) -> Any:
+    """取 `marker` 之后的 JSON；解析失败返回 None（坏行不拖垮整次解析）。"""
+    try:
+        return json.loads(line[len(marker):].strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def parse_search_protocol(lines: Sequence[str]) -> dict[str, Any]:
+    """把脚本输出逐行归类：结果、摘要、逐词完成/失败、首页是否已过防护。"""
+    out: dict[str, Any] = {
+        "hits": None,          # 最终 EPUB_HITS_JSON（合并去重后的全部命中）
+        "summary": None,       # EPUB_SUMMARY_JSON
+        "terms": [],           # 逐词完成 [{i,n,term,sec,hits}]
+        "term_fails": [],      # 逐词失败 [{i,n,term,error}]
+        "home_ready": False,
+        "notes": [],           # 其余行（提示、报错、浏览器信息）
+    }
+    for raw in lines:
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith(_HITS_MARKER):
+            data = _json_after(s, _HITS_MARKER)
+            out["hits"] = data if isinstance(data, list) else None
+        elif s.startswith(_SUMMARY_MARKER):
+            data = _json_after(s, _SUMMARY_MARKER)
+            out["summary"] = data if isinstance(data, dict) else None
+        elif s.startswith(_TERM_FAIL_MARKER):
+            data = _json_after(s, _TERM_FAIL_MARKER)
+            if isinstance(data, dict):
+                out["term_fails"].append(data)
+        elif s.startswith(_TERM_MARKER):
+            data = _json_after(s, _TERM_MARKER)
+            if isinstance(data, dict):
+                out["terms"].append(data)
+        elif s.startswith(_HOME_READY_MARKER):
+            out["home_ready"] = True
+        elif s.startswith(_WAIT_MARKER):
+            continue
+        else:
+            out["notes"].append(s)
+    # 逐词行出现过，说明首页必然已通过
+    if out["terms"] or out["term_fails"]:
+        out["home_ready"] = True
+    return out
+
+
+def _merge_term_hits(terms: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """逐词行里的命中合并去重（强杀后抢救用；与脚本的合并口径一致：按公开号/链接）。"""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for t in terms:
+        for h in t.get("hits") or []:
+            if not isinstance(h, Mapping):
+                continue
+            key = str(h.get("pub_number") or h.get("link") or h.get("title") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(h))
+    return out
+
+
+def _progress_message(line: str) -> str | None:
+    """脚本的一行输出 → 给用户看的进度文案（不认识的行不上报）。"""
+    s = line.strip()
+    if s.startswith(_TERM_MARKER):
+        d = _json_after(s, _TERM_MARKER) or {}
+        n_hits = len(d.get("hits") or [])
+        return f"已完成 {d.get('i')}/{d.get('n')}：「{d.get('term')}」{n_hits} 条命中（{d.get('sec')}s）"
+    if s.startswith(_TERM_FAIL_MARKER):
+        d = _json_after(s, _TERM_FAIL_MARKER) or {}
+        return f"第 {d.get('i')}/{d.get('n')} 个词「{d.get('term')}」检索失败，继续下一个"
+    if s.startswith(_HOME_READY_MARKER):
+        d = _json_after(s, _HOME_READY_MARKER) or {}
+        return f"已通过国知局访问验证（{d.get('sec')}s），开始逐词检索…"
+    if s.startswith(_WAIT_MARKER):
+        d = _json_after(s, _WAIT_MARKER) or {}
+        return f"正在等待国知局访问验证（已等待 {d.get('sec')}s）…"
+    return None
+
+
+def _stream_script(
+    args: list[str], env: dict[str, str], hard_limit: float, on_line: LineCallback | None
+) -> tuple[list[str], int | None, bool]:
+    """起子进程并逐行读，超过 `hard_limit` 秒强杀整棵进程树。返回 `(行, 退出码, 是否被强杀)`。
+
+    读管道放在单独线程：主循环按剩余时间 `queue.get(timeout)`，这样子进程卡死不出声时
+    也能按时强杀，而不是被一个阻塞的 readline 永远挂住。
+    """
+    proc = spawn_tool(SEARCH_SCRIPT, args, extra_env=env)
+    lines: list[str] = []
+    q: queue.Queue[str | None] = queue.Queue()
+
+    def pump() -> None:
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                q.put(line)
+        except (OSError, ValueError):  # 管道在强杀后被关闭
+            pass
+        finally:
+            q.put(None)
+
+    reader = threading.Thread(target=pump, name="cnipa-search-reader", daemon=True)
+    reader.start()
+
+    def take(line: str) -> None:
+        line = line.rstrip("\r\n")
+        lines.append(line)
+        if on_line is not None:
+            try:
+                on_line(line)
+            except Exception as exc:  # noqa: BLE001 —— 进度上报失败不影响检索
+                logger.debug("检索进度回调失败：%s", exc)
+
+    killed = False
+    end = time.monotonic() + hard_limit
+    finished = False
+    while not finished:
+        left = end - time.monotonic()
+        if left <= 0:
+            killed = True
+            kill_process_tree(proc)
+            break
+        try:
+            item = q.get(timeout=min(left, 1.0))
+        except queue.Empty:
+            continue
+        if item is None:
+            finished = True
+        else:
+            take(item)
+
+    if killed:
+        # 强杀后把管道里残留的行读干净——已完成的词就在这些行里
+        drain_end = time.monotonic() + 5.0
+        while time.monotonic() < drain_end:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            take(item)
+    try:
+        rc: int | None = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        rc = None
+    return lines, rc, killed
+
+
+def _failure(kind: str, error: str, terms: Sequence[str], parsed: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    parsed = parsed or {}
+    return {
+        "ok": False,
+        "kind": kind,
+        "hits": [],
+        "error": error,
+        "searched": [],
+        "skipped": list(terms),
+        "failed": [],
+        "stop": kind,
+        "stderr": " | ".join((parsed.get("notes") or [])[-6:])[:1000],
+    }
+
+
+def _run_search_script(
+    terms: Sequence[str],
+    patent_type: str,
+    budget: int,
+    on_line: LineCallback | None = None,
+) -> dict[str, Any]:
+    """跑一次检索子进程（同步；供线程池调用）。
+
+    返回 `{ok, kind, hits, error, searched, skipped, failed, stop, stderr}`：
+    - ok=True 时 hits 为可入库的命中，**可能是部分完成**（skipped/failed 非空）；
+    - ok=False 时 kind 说明是哪一类失败（blocked / budget / script），error 是给人看的原因。
+    """
+    terms = list(terms)
     args = ["--type", patent_type, *terms]
     env = _browser_env()
-    # 脚本内部 setdefault EPUB_WAF_MAX_WAIT_SEC=180；留出子进程收尾余量
-    env["EPUB_WAF_MAX_WAIT_SEC"] = str(max(30, timeout - 20))
+    env["EPUB_DEADLINE_SEC"] = str(budget)
+    env["EPUB_WAF_MAX_WAIT_SEC"] = str(min(WAF_MAX_WAIT_SEC, budget))
     try:
-        proc = run_tool(SEARCH_SCRIPT, args, timeout=timeout, extra_env=env)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "hits": [], "error": f"检索超时（{timeout}s，疑似 WAF 拦截或网络不可达）", "stderr": ""}
+        lines, rc, killed = _stream_script(args, env, budget + TEARDOWN_GRACE_SEC, on_line)
     except OSError as exc:
-        return {"ok": False, "hits": [], "error": f"无法启动检索脚本：{exc}", "stderr": ""}
+        return _failure("script", f"无法启动检索脚本：{exc}", terms)
 
-    stderr = proc.stderr or ""
-    hits = parse_hits_stdout(proc.stdout or "")
-    if proc.returncode != 0:
+    parsed = parse_search_protocol(lines)
+    summary = parsed["summary"]
+    tail = " | ".join(parsed["notes"][-6:])[:1000]
+
+    # ---- 1) 脚本自己走完了收尾：摘要是权威说法 ----
+    if summary is not None:
+        searched = [str(t) for t in summary.get("searched") or []]
+        skipped = [str(t) for t in summary.get("skipped") or []]
+        failed = [str(t) for t in summary.get("failed") or []]
+        stop = summary.get("stop")
+        reason = str(summary.get("error") or "").strip()
+        if rc == _EXIT_BLOCKED or (stop == "blocked" and not searched):
+            return _failure(
+                "blocked",
+                f"国知局访问验证未通过，未能开始检索（{reason or '首页未出现检索框'}）。"
+                "多为临时拦截或网络问题，稍后重试可能恢复",
+                terms,
+                parsed,
+            )
+        hits = parsed["hits"] if parsed["hits"] is not None else _merge_term_hits(parsed["terms"])
         return {
-            "ok": False,
-            "hits": [],
-            "error": f"检索脚本退出码 {proc.returncode}：{_stderr_tail(stderr) or '无输出'}",
-            "stderr": stderr,
+            "ok": True,
+            "kind": None,
+            "hits": hits,
+            "error": None,
+            "searched": searched,
+            "skipped": skipped,
+            "failed": failed,
+            "stop": stop,
+            "stderr": tail,
         }
-    if hits is None:
+
+    # ---- 2) 没有摘要：被强杀或崩溃。先从逐词行里抢救已完成的词 ----
+    done = [str(t.get("term")) for t in parsed["terms"] if t.get("term")]
+    bad = [str(t.get("term")) for t in parsed["term_fails"] if t.get("term")]
+    if done:
         return {
-            "ok": False,
-            "hits": [],
-            "error": f"未解析到 EPUB_HITS_JSON 输出：{_stderr_tail(stderr) or '无输出'}",
-            "stderr": stderr,
+            "ok": True,
+            "kind": None,
+            "hits": _merge_term_hits(parsed["terms"]),
+            "error": None,
+            "searched": done,
+            "skipped": [t for t in terms if t not in done and t not in bad],
+            "failed": bad,
+            "stop": "killed" if killed else "crashed",
+            "stderr": tail,
         }
-    return {"ok": True, "hits": hits, "error": None, "stderr": stderr}
+
+    if killed:
+        if parsed["home_ready"]:
+            return _failure(
+                "budget",
+                f"检索超时：国知局已通过访问验证、站点正常，但 {budget}s 预算内没有完成任何一个检索词",
+                terms,
+                parsed,
+            )
+        return _failure(
+            "blocked",
+            f"检索超时：{budget}s 内未能通过国知局访问验证（可能被拦截或网络不通）",
+            terms,
+            parsed,
+        )
+
+    if rc not in (0, None):
+        return _failure("script", f"检索脚本退出码 {rc}：{tail or '无输出'}", terms, parsed)
+    if parsed["hits"] is None:
+        return _failure("script", f"未解析到 EPUB_HITS_JSON 输出：{tail or '无输出'}", terms, parsed)
+    # 旧协议（只有结果行、没有摘要）：视为全部检索完成
+    return {
+        "ok": True,
+        "kind": None,
+        "hits": parsed["hits"],
+        "error": None,
+        "searched": terms,
+        "skipped": [],
+        "failed": [],
+        "stop": None,
+        "stderr": tail,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +707,9 @@ def _cached_query(key: str, ttl_hours: int) -> sqlite3.Row | None:
             raw = json.loads(row["raw_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             continue
+        # 部分完成的会话只覆盖了一部分词：当成这组词的完整结果复用，等于替用户假装检索过剩下的词
+        if raw.get("partial"):
+            continue
         if raw.get("terms_key") == key:
             return row
     return None
@@ -441,7 +725,7 @@ async def search(
     terms: Iterable[str],
     patent_type: str = "invention",
     *,
-    timeout: int = SEARCH_TIMEOUT,
+    timeout: int | None = None,
     on_progress: ProgressCallback | None = None,
     use_cache: bool = True,
     cache_ttl_hours: int = CACHE_TTL_HOURS,
@@ -453,13 +737,13 @@ async def search(
     ----
     terms            : 检索词（一次会话多词，脚本内共用一个浏览器；上限 8 个）。
     patent_type      : invention | utility_model | design | all（其它值一律 all）。
-    timeout          : 子进程超时（秒），默认 180。
-    on_progress      : `cb(stage, msg)`，stage ∈ start|cache|running|parsed|done|failed。
-    use_cache        : 命中 6 小时内同 terms+type 的成功会话即复用。
+    timeout          : 时间预算（秒）；缺省按词数 `search_budget(n)`。
+    on_progress      : `cb(stage, msg)`，stage ∈ start|cache|running|crawl|parsed|done|failed。
+    use_cache        : 命中 6 小时内同 terms+type 的**完整**成功会话即复用。
     empty_is_failure : 零解析视为失败（默认 True，交人工兜底门控；A4 明确禁止编造检索结果）。
 
-    失败（超时 / WAF / 退出码非零 / 无 EPUB_HITS_JSON / 零解析）时
-    `status='failed'` 且 `error` 有值，`search_queries` 同步写 failed 行。
+    部分完成（有词因预算用尽或失败没检索到）但有命中时，`status='done'`，
+    `skipped_terms` / `failed_terms` 如实列出没检索的词；失败时 `failure_kind` 说明是哪一类。
     """
     started = time.monotonic()
     norm_terms = normalize_terms(terms)
@@ -468,7 +752,9 @@ async def search(
     if not norm_terms:
         error = "检索词为空"
         await _notify(on_progress, "failed", error)
-        return SearchResult(status="failed", hits=[], error=error, terms=[], patent_type=ptype)
+        return SearchResult(
+            status="failed", hits=[], error=error, terms=[], patent_type=ptype, failure_kind="script"
+        )
 
     key = terms_key(norm_terms, ptype)
     await _notify(
@@ -498,27 +784,40 @@ async def search(
             raw={"terms_key": key, "terms": norm_terms, "patent_type": ptype},
         )
     )
-    await _notify(on_progress, "running", f"正在检索（最长 {timeout}s，复用本机浏览器过 WAF）…")
+    budget = int(timeout) if timeout else search_budget(len(norm_terms))
+    await _notify(
+        on_progress,
+        "running",
+        f"正在检索 {len(norm_terms)} 个词（时间预算 {budget}s，复用本机浏览器过访问验证）…",
+    )
 
-    outcome = await db.arun(_run_search_script, norm_terms, ptype, timeout)
+    # 子进程在线程池里跑；它每打一行进度，就从那个线程把通知投递回事件循环
+    loop = asyncio.get_running_loop()
+
+    def on_line(line: str) -> None:
+        msg = _progress_message(line)
+        if msg and on_progress is not None:
+            asyncio.run_coroutine_threadsafe(_notify(on_progress, "crawl", msg), loop)
+
+    outcome = await db.arun(_run_search_script, norm_terms, ptype, budget, on_line)
+    base_raw = {"terms_key": key, "terms": norm_terms, "patent_type": ptype, "budget": budget}
+
+    def _elapsed() -> int:
+        return int((time.monotonic() - started) * 1000)
 
     if not outcome["ok"]:
         error = str(outcome["error"])
+        kind = outcome.get("kind") or "script"
         await db.arun(
             lambda: _update_query(
                 query_id,
                 status="failed",
-                raw={
-                    "terms_key": key,
-                    "terms": norm_terms,
-                    "patent_type": ptype,
-                    "stderr": _stderr_tail(outcome.get("stderr") or ""),
-                },
+                raw={**base_raw, "failure_kind": kind, "stderr": outcome.get("stderr") or ""},
                 error=error,
             )
         )
         await _notify(on_progress, "failed", f"检索失败：{error}")
-        logger.warning("CNIPA 检索失败 case=%s：%s", case_id, error)
+        logger.warning("CNIPA 检索失败 case=%s kind=%s：%s", case_id, kind, error)
         return SearchResult(
             status="failed",
             hits=[],
@@ -526,25 +825,54 @@ async def search(
             query_id=query_id,
             terms=norm_terms,
             patent_type=ptype,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
+            elapsed_ms=_elapsed(),
+            searched_terms=list(outcome.get("searched") or []),
+            skipped_terms=list(outcome.get("skipped") or []),
+            failed_terms=list(outcome.get("failed") or []),
+            failure_kind=kind,
         )
 
+    searched = [t for t in (outcome.get("searched") or norm_terms) if t]
+    skipped = list(outcome.get("skipped") or [])
+    failed = list(outcome.get("failed") or [])
+    partial = bool(skipped or failed)
+    pending_note = (
+        f"另有 {len(skipped) + len(failed)} 个词未检索（{'、'.join([*skipped, *failed])}）"
+        if partial
+        else ""
+    )
+
     hits, dropped = normalize_hits(outcome["hits"])
-    await _notify(on_progress, "parsed", f"解析到 {len(hits)} 条命中（丢弃无链接 {dropped} 条）")
+    await _notify(
+        on_progress,
+        "parsed",
+        f"已检索 {len(searched)}/{len(norm_terms)} 个词，解析到 {len(hits)} 条命中（丢弃无链接 {dropped} 条）",
+    )
 
     if not hits and empty_is_failure:
-        error = "检索未解析到任何命中（可尝试放宽检索词或改用 --type all）"
+        if partial:
+            # 做完的词都是零命中，但还有词没做：这是预算/拦截问题，不是「确实查不到」
+            kind = "blocked" if outcome.get("stop") == "blocked" else "budget"
+            error = (
+                f"已检索的 {len(searched)} 个词均无命中；{pending_note}"
+                + ("，检索中途被国知局拦截" if kind == "blocked" else "，时间预算已用尽")
+            )
+        else:
+            kind = "empty"
+            error = f"全部 {len(searched)} 个词检索完成，均无命中（原词重试结果不会不同，请放宽或更换检索词）"
         await db.arun(
             lambda: _update_query(
                 query_id,
                 status="failed",
                 raw={
-                    "terms_key": key,
-                    "terms": norm_terms,
-                    "patent_type": ptype,
+                    **base_raw,
                     "hits": [],
                     "dropped": dropped,
-                    "stderr": _stderr_tail(outcome.get("stderr") or ""),
+                    "searched": searched,
+                    "skipped": skipped,
+                    "failed": failed,
+                    "failure_kind": kind,
+                    "stderr": outcome.get("stderr") or "",
                 },
                 error=error,
             )
@@ -557,7 +885,11 @@ async def search(
             query_id=query_id,
             terms=norm_terms,
             patent_type=ptype,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
+            elapsed_ms=_elapsed(),
+            searched_terms=searched,
+            skipped_terms=skipped,
+            failed_terms=failed,
+            failure_kind=kind,
         )
 
     rows = await db.arun(_insert_hits, case_id, query_id, hits)
@@ -566,15 +898,22 @@ async def search(
             query_id,
             status="done",
             raw={
-                "terms_key": key,
-                "terms": norm_terms,
-                "patent_type": ptype,
+                **base_raw,
                 "hits": hits,
                 "dropped": dropped,
+                "searched": searched,
+                "skipped": skipped,
+                "failed": failed,
+                # 部分完成的会话不能当完整结果进缓存（见 _cached_query）
+                "partial": partial,
             },
         )
     )
-    await _notify(on_progress, "done", f"检索完成，入库 {len(rows)} 条")
+    await _notify(
+        on_progress,
+        "done",
+        f"检索完成，入库 {len(rows)} 条" + (f"；{pending_note}" if partial else ""),
+    )
     return SearchResult(
         status="done",
         hits=[hit_row_to_model(r) for r in rows],
@@ -582,7 +921,10 @@ async def search(
         query_id=query_id,
         terms=norm_terms,
         patent_type=ptype,
-        elapsed_ms=int((time.monotonic() - started) * 1000),
+        elapsed_ms=_elapsed(),
+        searched_terms=searched,
+        skipped_terms=skipped,
+        failed_terms=failed,
     )
 
 
@@ -605,6 +947,7 @@ async def _reuse_cached(
             terms=list(norm_terms),
             patent_type=ptype,
             cached=True,
+            searched_terms=list(norm_terms),
         )
 
     try:
@@ -639,6 +982,7 @@ async def _reuse_cached(
         terms=list(norm_terms),
         patent_type=ptype,
         cached=True,
+        searched_terms=list(norm_terms),
     )
 
 
@@ -817,7 +1161,7 @@ def start_background_search(
     *,
     step_key: str | None = None,
     use_cache: bool = True,
-    timeout: int = SEARCH_TIMEOUT,
+    timeout: int | None = None,
 ) -> asyncio.Task:
     """启动后台检索任务（进度经 SSE `search_progress` 推送）；已在跑时抛 RuntimeError。"""
     if is_searching(case_id):

@@ -6,16 +6,30 @@
 本文件侧重 **写出结果页 HTML** 与可插拔的 ``fetch_epub_result_html`` API。
 
 -------------------------------------------------------------------------------
-一、整体流程（单次检索）
+一、整体流程（一场多词检索）
 -------------------------------------------------------------------------------
 1. 启动浏览器（默认无头；系统 Chrome → Edge → 自带 Chromium；可用环境变量改为有界面）。
-2. 新建浏览器上下文：设定 **桌面 Chrome UA**、**zh-CN**、固定 **视口**（见 ``_new_context``），使请求形态接近普通用户浏览器。
+2. 新建浏览器上下文：设定 **与真实内核同版本的桌面 UA**、**zh-CN**、固定 **视口**（见 ``_new_context``）。
 3. ``page.goto`` 站点首页，**wait_until="load"**。
-4. **等待首页可检索**：首页在访客到达后会先经 **前端脚本/WAF 一类逻辑**，未通过前 **不会出现** 检索输入框 ``#searchStr``。本实现通过 **周期性轮询 DOM**（每 3 秒一次，总时长见 ``EPUB_WAF_MAX_WAIT_SEC``，默认 180s）直到 ``#searchStr`` 出现；**不是**用 requests 直接 POST 能等价替代的步骤。
-5. ``page.fill`` 将关键词写入 ``#searchStr``，对 ``#indexForm`` 执行 **submit**（而非单独点按钮），并等待结果页导航 **commit**。
+4. **等待首页可检索**：首页在访客到达后会先经 **前端脚本/WAF 一类逻辑**（实测为瑞数动态防护：先回 202 挑战页，JS 跑完后才给真页面），未通过前 **不会出现** 检索输入框 ``#searchStr``。本实现 **周期性轮询 DOM**（每 3 秒一次，上限见 ``EPUB_WAF_MAX_WAIT_SEC``）直到 ``#searchStr`` 出现；**不是**用 requests 直接 POST 能等价替代的步骤。
+5. ``page.fill`` 将关键词写入 ``#searchStr``，对 ``#indexForm`` 执行 **submit**，并等待结果页导航 **commit**。
 6. 等待结果页就绪：标题为 **「专利查询结果展示」或「无查询结果」**（见 ``EPUB_TITLE_*`` 常量），且 ``#result`` 内出现列表条目（``div.item`` / ``h1.title``）或明确零结果文案；不等待完整 ``load``。国知局改版时需同步调整常量与 ``_RESULT_PAGE_READY_JS``。
 7. ``page.content()`` 取全页 HTML；若处于导航中抛错则 **重试退避**（``_safe_page_content``），避免竞态。
-8. 后续解析由 **`cnipa_epub_parse.py`** 完成（本文件 ``search_epub_keyword`` 内会调用）。
+8. **第 2 个词起直接在结果页上检索**：结果页 ``/Dxb/IndexQuery`` 自带同一个 ``#indexForm`` / ``#searchStr``
+   （带新的防伪 token，类型勾选沿用上次提交的状态），所以不必回首页、不必再过一遍防护挑战。
+   早先每个词都回首页重过挑战，一词约 35 秒，7 个词 248 秒——而外层预算只有 180 秒。
+9. 解析由 **`cnipa_epub_parse.py`** 完成。
+
+-------------------------------------------------------------------------------
+一·补、时间预算与部分结果（``run_epub_session``）
+-------------------------------------------------------------------------------
+- 调用方给一个绝对截止时刻 ``deadline``（``time.monotonic()`` 口径）。每一步的超时都取
+  「该步上限」与「剩余预算」的较小者，保证**脚本总能在外层杀进程之前自己收尾并报出原因**。
+- 开始下一个词之前若剩余不足 ``MIN_TERM_SEC``，就停下来，把没来得及检索的词如实列为 skipped。
+- **已完成的词永远保留**。早先超时是全有或全无：7 个词完成了 5 个，一超时 5 个的结果一起作废。
+- 单个词失败不连累其它词（回首页重来）；**连续** ``MAX_CONSECUTIVE_FAILS`` 个词失败才判为被拦截并停止，
+  免得在已被封的状态下把剩余预算全耗在注定失败的请求上。
+- 首页门控（第一次过防护）失败 ⇒ ``stop="blocked"``：这是唯一真正意义上的「被拦截/不可达」。
 
 -------------------------------------------------------------------------------
 二、策略摘要：在解决什么、用了哪些手段
@@ -34,7 +48,7 @@
 -------------------------------------------------------------------------------
 环境变量
 -------------------------------------------------------------------------------
-  EPUB_WAF_MAX_WAIT_SEC  轮询等待 #searchStr 的最长时间，默认 180
+  EPUB_WAF_MAX_WAIT_SEC  轮询等待 #searchStr 的最长时间，默认 180（另受 deadline 约束）
   PLAYWRIGHT_HEADED        设为 1 时使用有界面 Chromium
   EPUB_RESULT_HTML         结果页 HTML 完整路径；不设则 tools/_last_result_YYYYMMDDHHmmss.html
 """
@@ -43,9 +57,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from playwright.sync_api import Browser, BrowserContext, Error, Page, Playwright, sync_playwright
 
@@ -89,14 +105,60 @@ _RESULT_PAGE_READY_JS = """(titles) => {
     }
     return false;
 }"""
+# 仅在拿不到真实内核版本时兜底用；正常路径见 desktop_user_agent()
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# 结果页上的类型勾选框 id 与首页不同（首页 #fmgb，结果页 #indexSearchModel_fmgb）
+_RESULT_PAGE_BOX_PREFIX = "indexSearchModel_"
+
+# 开始下一个词至少要剩这么多秒：结果页直接提交 + 等结果 + 解析，实测 2~8s，
+# 回首页重过挑战约 10~20s。留足余量，宁可少检索一个词，也不要被外层强杀。
+MIN_TERM_SEC = 20.0
+# 连续这么多个词失败，判为已被拦截，停止烧剩余预算
+MAX_CONSECUTIVE_FAILS = 2
+# 单个词「提交 → 结果页就绪」每一步的上限。正常 2~15s；早先沿用 120s，
+# 真站点上一个卡住的词就烧掉了 137s，把后面所有词的预算吃光。
+TERM_STEP_CAP_MS = 45_000
+# 相邻两个词之间的间隔。结果页复用后请求变得很密（不再每词回首页），真站点上
+# 第 3 个词起开始卡——与此前「第 4~5 个词后耗时陡增」的观察一致，像是触发了限频。
+# 对政府站点放慢一点本来也是应有的礼貌。
+TERM_PACING_SEC = 4.0
+# 等待防护挑战期间，每隔这么多秒报一次「还在等」
+WAIT_BEAT_SEC = 15.0
+
+
+class EpubBlockedError(TimeoutError):
+    """首页始终没有出现检索框：访问验证未通过或页面加载不了（真正意义上的「被拦截/不可达」）。
+
+    继承 TimeoutError 以兼容旧调用方的 except 分支。
+    """
+
 
 def _max_wait_sec() -> float:
     return float(os.environ.get("EPUB_WAF_MAX_WAIT_SEC", "180"))
+
+
+def _timeout_ms(deadline: float | None, cap_ms: int, *, floor_ms: int = 5_000) -> int:
+    """单步超时 = min(该步上限, 剩余预算)。
+
+    预算已尽时仍给一个下限，让这一步**快速失败**而不是无限等——
+    外层早先的问题正是「goto 120s + 等挑战 160s > 子进程上限 180s」，
+    脚本还没来得及说清卡在哪，就被整个杀掉了。
+    """
+    if deadline is None:
+        return cap_ms
+    left_ms = int((deadline - time.monotonic()) * 1000)
+    return max(floor_ms, min(cap_ms, left_ms))
+
+
+def _short(exc: BaseException, limit: int = 200) -> str:
+    """异常 → 一行可读原因（Playwright 的报错常带多行调用日志）。"""
+    text = str(exc).strip().splitlines()
+    head = text[0] if text else type(exc).__name__
+    return head[:limit]
 
 
 def _headed() -> bool:
@@ -108,19 +170,64 @@ def default_result_html_path() -> Path:
     return Path(__file__).resolve().parent / f"_last_result_{ts}.html"
 
 
-def wait_for_epub_home_ready(page: Page, *, max_wait_sec: float | None = None) -> None:
+def wait_for_epub_home_ready(
+    page: Page,
+    *,
+    max_wait_sec: float | None = None,
+    deadline: float | None = None,
+    on_wait: Callable[[float], None] | None = None,
+) -> None:
+    """打开首页并等到检索框出现（即防护挑战已通过）。
+
+    - ``deadline``：绝对截止时刻；goto 超时与轮询上限都不会越过它。
+    - ``on_wait(sec)``：每等 ``WAIT_BEAT_SEC`` 秒回调一次——等挑战可能要十几秒，
+      这段时间里必须有东西证明「还在等」，否则界面会把它判成卡死。
+    """
     limit = max_wait_sec if max_wait_sec is not None else _max_wait_sec()
-    page.goto(EPUB_BASE, wait_until="load", timeout=120_000)
+    if deadline is not None:
+        limit = min(limit, max(5.0, deadline - time.monotonic()))
+    try:
+        page.goto(EPUB_BASE, wait_until="load", timeout=_timeout_ms(deadline, 120_000))
+    except Error as exc:
+        raise EpubBlockedError(f"国知局首页打不开：{_short(exc)}") from exc
     elapsed = 0.0
     step = 3.0
-    while elapsed < limit:
+    next_beat = WAIT_BEAT_SEC
+    while True:
+        if _has_search_box(page):
+            return
+        if elapsed >= limit:
+            break
         page.wait_for_timeout(int(step * 1000))
         elapsed += step
-        if page.query_selector("#searchStr"):
-            return
-    raise TimeoutError(
-        f"{limit}s 内未出现检索框 #searchStr；可增大 EPUB_WAF_MAX_WAIT_SEC 或设置 PLAYWRIGHT_HEADED=1"
+        if on_wait is not None and elapsed >= next_beat:
+            on_wait(elapsed)
+            next_beat += WAIT_BEAT_SEC
+    raise EpubBlockedError(
+        f"{limit:.0f}s 内首页未出现检索框 #searchStr（访问验证未通过或页面未加载完）；"
+        "可增大 EPUB_WAF_MAX_WAIT_SEC 或设置 PLAYWRIGHT_HEADED=1"
     )
+
+
+def _has_search_box(page: Page) -> bool:
+    """检索框出现了吗。**页面正在跳转时查询会抛错，那只说明「还没好」，不是失败。**
+
+    瑞数挑战页跑完 JS 会自己跳到真页面；查询恰好撞在跳转途中时，Playwright 报
+    「Execution context was destroyed, most likely because of a navigation」。
+    把它当致命错误，就会把一次正常通过的挑战误判成「被拦截」——真站点上实测撞到过。
+    """
+    try:
+        return page.query_selector("#searchStr") is not None
+    except Error:
+        return False
+
+
+def _can_search_here(page: Page) -> bool:
+    """当前页能否直接发起下一次检索（结果页自带同一个检索表单）。"""
+    try:
+        return bool(page.query_selector("#searchStr") and page.query_selector("#indexForm"))
+    except Error:
+        return False
 
 
 def _safe_page_content(page: Page, *, max_attempts: int = 10) -> str:
@@ -143,22 +250,34 @@ def _safe_page_content(page: Page, *, max_attempts: int = 10) -> str:
     raise RuntimeError("_safe_page_content: 未返回内容")
 
 
-def _wait_result_page_ready(page: Page) -> None:
+def _wait_result_page_ready(
+    page: Page, *, deadline: float | None = None, cap_ms: int = 120_000
+) -> None:
     """等结果页 title 与 #result 列表/零结果 DOM 就绪（不等完整 load）。"""
     page.wait_for_function(
         _RESULT_PAGE_READY_JS,
         arg={"result": EPUB_TITLE_RESULT, "noHit": EPUB_TITLE_NO_HIT},
-        timeout=120_000,
+        timeout=_timeout_ms(deadline, cap_ms),
     )
 
 
+def _type_box(page: Page, cid: str) -> Any:
+    """按 id 找类型勾选框：首页叫 #fmgb，结果页叫 #indexSearchModel_fmgb。
+
+    两处都要认——在结果页上直接发起下一次检索时若只认首页 id，
+    会**静默**找不到元素、跳过勾选，类型过滤就这么丢了且不报错。
+    """
+    return page.query_selector(f"#{cid}") or page.query_selector(f"#{_RESULT_PAGE_BOX_PREFIX}{cid}")
+
+
 def apply_epub_type_filter(page: Page, patent_type: str = TYPE_ALL) -> None:
-    """按类型勾选首页 #fmgb/#fmsq/#xxsq/#wgsq（与截图四类一致）。"""
+    """按类型勾选 发明公布/发明授权/实用新型/外观设计 四类（首页与结果页通用）。"""
     states = epub_checkbox_states(patent_type)
     for cid, want in states.items():
-        box = page.query_selector(f"#{cid}")
+        box = _type_box(page, cid)
         if not box:
             continue
+        box_id = box.get_attribute("id") or cid
         try:
             if want:
                 box.check(force=True)
@@ -173,7 +292,7 @@ def apply_epub_type_filter(page: Page, patent_type: str = TYPE_ALL) -> None:
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     el.dispatchEvent(new Event('click', { bubbles: true }));
                 }""",
-                {"id": cid, "checked": want},
+                {"id": box_id, "checked": want},
             )
 
 
@@ -182,10 +301,13 @@ def submit_index_search(
     keyword: str,
     *,
     patent_type: str = TYPE_ALL,
+    deadline: float | None = None,
+    cap_ms: int = 120_000,
 ) -> None:
+    """在当前页（首页或结果页）的 #indexForm 上提交一次检索并等结果页就绪。"""
     apply_epub_type_filter(page, patent_type)
     page.fill("#searchStr", keyword)
-    with page.expect_navigation(timeout=120_000, wait_until="commit"):
+    with page.expect_navigation(timeout=_timeout_ms(deadline, cap_ms), wait_until="commit"):
         form = page.query_selector("#indexForm")
         if form:
             form.evaluate("el => el.submit()")
@@ -196,7 +318,7 @@ def submit_index_search(
                 if (f) f.submit();
             }"""
             )
-    _wait_result_page_ready(page)
+    _wait_result_page_ready(page, deadline=deadline, cap_ms=cap_ms)
 
 
 def fetch_epub_result_html(
@@ -215,31 +337,120 @@ def fetch_epub_result_html(
     return rows[0][0]
 
 
+EventCallback = Callable[[str, dict[str, Any]], None]
+
+
+@dataclass
+class EpubRun:
+    """一场多词检索的结果：**完成的、失败的、没来得及的，各自如实记录**。"""
+
+    rows: list[tuple[str, str, list[EpubSearchHit]]] = field(default_factory=list)  # (词, html, 命中)
+    failed: list[tuple[str, str]] = field(default_factory=list)                     # (词, 原因)
+    skipped: list[str] = field(default_factory=list)                                # 预算用尽未开始
+    stop: str | None = None      # None=全部跑完 | "deadline"=预算用尽 | "blocked"=被拦截/不可达
+    error: str | None = None     # stop 的原因说明
+
+    @property
+    def searched(self) -> list[str]:
+        return [term for term, _html, _hits in self.rows]
+
+
+def run_epub_session(
+    terms: list[str],
+    *,
+    patent_type: str = TYPE_ALL,
+    deadline: float | None = None,
+    on_event: EventCallback | None = None,
+    playwright_factory: Callable[[], Playwright] | None = None,
+) -> EpubRun:
+    """一场检索共用一个浏览器、**只过一次防护挑战**；按截止时刻收口，保留已完成的词。
+
+    ``on_event(kind, data)``，kind ∈ ``wait`` / ``home_ready`` / ``term`` / ``term_failed``，
+    供 CLI 逐行上报进度——外层据此在界面上显示「已完成 3/7」，也据此证明检索还活着。
+    只有浏览器起不来这类环境错误才会抛出；被拦截、超预算都体现在返回值里。
+    """
+    run = EpubRun()
+    if not terms:
+        return run
+    emit = on_event or (lambda _kind, _data: None)
+    pw_gen = playwright_factory or sync_playwright
+    with pw_gen() as p:
+        browser, label = _launch_browser_labeled(p)
+        context = _new_context(browser, label)
+        try:
+            page = context.new_page()
+            t0 = time.monotonic()
+            try:
+                wait_for_epub_home_ready(
+                    page, deadline=deadline, on_wait=lambda sec: emit("wait", {"stage": "home", "sec": int(sec)})
+                )
+            except Exception as exc:  # noqa: BLE001 —— 首页门控失败 = 被拦截/不可达
+                run.stop, run.error = "blocked", _short(exc)
+                run.skipped = list(terms)
+                return run
+            emit("home_ready", {"sec": round(time.monotonic() - t0, 1)})
+
+            fails_in_row = 0
+            total = len(terms)
+            for i, term in enumerate(terms):
+                if i > 0 and deadline is not None and deadline - time.monotonic() < MIN_TERM_SEC:
+                    run.stop = "deadline"
+                    run.error = f"时间预算用尽，剩余 {total - i} 个词未检索"
+                    run.skipped = list(terms[i:])
+                    break
+                if i > 0:
+                    page.wait_for_timeout(int(TERM_PACING_SEC * 1000))
+                started = time.monotonic()
+                try:
+                    if not _can_search_here(page):
+                        # 上一个词失败把页面带偏了：回首页（通常已有挑战 cookie，很快）
+                        wait_for_epub_home_ready(page, deadline=deadline)
+                    submit_index_search(
+                        page, term, patent_type=patent_type, deadline=deadline, cap_ms=TERM_STEP_CAP_MS
+                    )
+                    html = _safe_page_content(page)
+                    hits = parse_search_result_html(html)
+                except Exception as exc:  # noqa: BLE001 —— 单词失败不连累其它词
+                    fails_in_row += 1
+                    reason = _short(exc)
+                    run.failed.append((term, reason))
+                    emit("term_failed", {"i": i + 1, "n": total, "term": term, "error": reason})
+                    if fails_in_row >= MAX_CONSECUTIVE_FAILS:
+                        run.stop = "blocked"
+                        run.error = f"连续 {fails_in_row} 个词检索失败，判为已被拦截：{reason}"
+                        run.skipped = list(terms[i + 1 :])
+                        break
+                    continue
+                fails_in_row = 0
+                run.rows.append((term, html, hits))
+                emit(
+                    "term",
+                    {"i": i + 1, "n": total, "term": term, "sec": round(time.monotonic() - started, 1), "hits": hits},
+                )
+            return run
+        finally:
+            context.close()
+            browser.close()
+
+
 def search_epub_keywords(
     terms: list[str],
     *,
     patent_type: str = TYPE_ALL,
     playwright_factory: Callable[[], Playwright] | None = None,
 ) -> list[tuple[str, list[EpubSearchHit]]]:
-    """一场检索共用一个浏览器；一词一页，返回与 ``terms`` 等长的 ``(html, hits)`` 列表。"""
-    if not terms:
-        return []
-    pw_gen = playwright_factory or sync_playwright
-    with pw_gen() as p:
-        browser = _launch_browser(p)
-        context = _new_context(browser)
-        try:
-            page = context.new_page()
-            out: list[tuple[str, list[EpubSearchHit]]] = []
-            for keyword in terms:
-                wait_for_epub_home_ready(page)
-                submit_index_search(page, keyword, patent_type=patent_type)
-                html = _safe_page_content(page)
-                out.append((html, parse_search_result_html(html)))
-            return out
-        finally:
-            context.close()
-            browser.close()
+    """兼容旧接口：全部成功才返回（与 ``terms`` 等长的 ``(html, hits)``），否则抛出。
+
+    新代码请用 ``run_epub_session``——它会保留部分结果，而不是全有或全无。
+    """
+    run = run_epub_session(terms, patent_type=patent_type, playwright_factory=playwright_factory)
+    if run.stop == "blocked" and not run.rows:
+        raise EpubBlockedError(run.error or "国知局访问验证未通过")
+    if run.failed or run.skipped:
+        done = len(run.rows)
+        detail = run.error or (run.failed[0][1] if run.failed else "")
+        raise RuntimeError(f"仅完成 {done}/{len(terms)} 个检索词：{detail}")
+    return [(html, hits) for _term, html, hits in run.rows]
 
 
 def search_epub_keyword(
@@ -266,14 +477,50 @@ def search_epub_keyword_with_page(
     return html, parse_search_result_html(html)
 
 
+def _launch_browser_labeled(p: Playwright) -> tuple[Browser, str]:
+    return launch_chromium(p, headless=not _headed())
+
+
 def _launch_browser(p: Playwright) -> Browser:
-    browser, _label = launch_chromium(p, headless=not _headed())
+    browser, _label = _launch_browser_labeled(p)
     return browser
 
 
-def _new_context(browser: Browser) -> BrowserContext:
+def _os_token() -> str:
+    """UA 里的平台段与真实平台一致（navigator.platform 骗不了，UA 就别自相矛盾）。"""
+    if sys.platform.startswith("win"):
+        return "Windows NT 10.0; Win64; x64"
+    if sys.platform == "darwin":
+        return "Macintosh; Intel Mac OS X 10_15_7"
+    return "X11; Linux x86_64"
+
+
+def desktop_user_agent(browser_version: str | None, label: str = "chrome") -> str:
+    """按**真实内核版本**拼桌面 UA（采用 Chrome 的 UA 精简格式：只保留主版本号）。
+
+    无头模式的默认 UA 带 ``HeadlessChrome``，所以必须覆盖；但覆盖成一个写死的旧版本
+    （早先是 Chrome/120，而本机内核是 153）会让「UA 声称的版本」与「页面能用的新 API」
+    对不上，这是功能检测层面的自动化特征。版本号跟着真实内核走，就不存在这种矛盾。
+    """
+    major = str(browser_version or "").split(".", 1)[0]
+    if not major.isdigit():
+        return DEFAULT_USER_AGENT
+    ua = (
+        f"Mozilla/5.0 ({_os_token()}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+    if label == "msedge":
+        ua += f" Edg/{major}.0.0.0"
+    return ua
+
+
+def _new_context(browser: Browser, label: str = "chrome") -> BrowserContext:
+    try:
+        version = browser.version
+    except Exception:  # noqa: BLE001 —— 取不到版本就用兜底 UA，不因此放弃检索
+        version = None
     return browser.new_context(
-        user_agent=DEFAULT_USER_AGENT,
+        user_agent=desktop_user_agent(version, label),
         locale="zh-CN",
         viewport={"width": 1280, "height": 900},
     )

@@ -42,6 +42,36 @@ function collectPayloads(): { kind: string; payload: InteractionRequiredEvent }[
   return [...byKind.entries()].map(([kind, payload]) => ({ kind, payload }))
 }
 
+/**
+ * 剧本里走不到、但真后端会发的状态变体。
+ *
+ * 画廊按 kind 只取剧本里的第一条载荷，而剧本只演成功路径——查新卡的失败态因此从没在
+ * 任何页面上被人看到过：提示文案写着「重试检索」，卡片上却没有这个入口，直到真实用户撞上。
+ * 载荷形状照抄 backend `disclosure.prior_art_search` 失败门控的 default，改后端时同步这里。
+ */
+const VARIANTS: { label: string; kind: string; payload: InteractionRequiredEvent }[] = [
+  {
+    label: 'prior_art · 失败态（超出时间预算，只补检索未完成的词）',
+    kind: 'prior_art',
+    payload: {
+      step_key: 'prior_art_search',
+      kind: 'prior_art',
+      prompt:
+        '检索超出时间预算：已检索的 2 个词均无命中；另有 5 个词未检索（内镜模拟训练、路径判定、自动判题、训练考核装置、错误锁定），时间预算已用尽。国知局本身是通的。「重试」已预填尚未检索的 5 个词，只补检索这些。请选择：重试检索 / 手工补录在先文献 / 跳过查新（跳过时 1.1 会如实写明未进行系统性检索，平台不会编造检索结果）。',
+      schema: null,
+      default: {
+        action: 'retry',
+        terms: ['内镜模拟训练', '路径判定', '自动判题', '训练考核装置', '错误锁定'],
+        hits: [],
+        reason: '',
+        failed: true,
+        error_message: '已检索的 2 个词均无命中；另有 5 个词未检索',
+        failure_kind: 'budget',
+      },
+    } as InteractionRequiredEvent,
+  },
+]
+
 function makeStage(
   kind: string,
   payload: InteractionRequiredEvent,
@@ -65,15 +95,17 @@ function StageCell({
   payload,
   status,
   busy = false,
+  variant = '',
 }: {
   kind: string
   payload: InteractionRequiredEvent
   status: StageStatus
   busy?: boolean
+  variant?: string
 }) {
   return createElement(resolveStageCard(kind), {
     caseId: 'ds',
-    stage: makeStage(kind, payload, status, busy ? '-busy' : ''),
+    stage: makeStage(kind, payload, status, `${busy ? '-busy' : ''}${variant}`),
     submit: noop,
     skip: noop,
     busy,
@@ -118,6 +150,20 @@ export function DsStageGallery() {
             <div key={kind} className="space-y-1.5">
               <code className="text-[11px] text-gray-400 dark:text-gray-500">kind={kind}</code>
               <StageCell kind={kind} payload={payload} status="active" />
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="space-y-3">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">
+          状态变体（剧本走不到、真后端会发）
+        </h3>
+        <div className="space-y-4">
+          {VARIANTS.map(({ label, kind, payload }, i) => (
+            <div key={label} className="space-y-1.5">
+              <code className="text-[11px] text-gray-400 dark:text-gray-500">{label}</code>
+              <StageCell kind={kind} payload={payload} status="active" variant={`-v${i}`} />
             </div>
           ))}
         </div>

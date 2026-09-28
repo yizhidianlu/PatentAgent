@@ -209,3 +209,23 @@ def disk_path(value) -> Path:
     resolved = paths_service.resolve(value)
     assert resolved is not None, f"路径落实失败：{value!r}"
     return resolved
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cnipa_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """任何测试都**不许**真的拉起国知局检索脚本。
+
+    检索脚本会启动真实浏览器去访问国知局公布公告站：测试一跑就是十几次真实请求，
+    慢（每次几十秒），而且可能让本机 IP 被站点的防护拉黑——那会把测试里的假「连不上」
+    变成生产上真的连不上。曾经就因为检索改走流式子进程、而旧用例只替换了 run_tool，
+    整套用例悄悄对真站点发起了检索。
+
+    需要子进程行为的用例自行替换 `cnipa._stream_script`（或 `cnipa.spawn_tool`）；
+    没替换就会得到一次「无法启动检索脚本」，服务层按降级处理，绝不触网。
+    """
+    from app.services import cnipa
+
+    def _refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("测试中禁止真实启动国知局检索脚本（请在用例里替换 cnipa._stream_script）")
+
+    monkeypatch.setattr(cnipa, "spawn_tool", _refuse)

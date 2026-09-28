@@ -621,7 +621,13 @@ export const zh = {
 
     priorArt: {
       confirm: '确认继续',
+      confirmManual: '纳入补录并继续',
       skip: '跳过查新',
+      retry: '重试检索',
+      retryTitle: '重试检索',
+      retryPlaceholder: '检索词，用空格或顿号分隔',
+      retryHint: (n: number) =>
+        n > 0 ? `将重新检索这 ${n} 个词；已检索过且无命中的词不会重复发请求` : '请至少填写一个检索词',
       hitsTitle: (n: number) => `命中 ${n} 条相关文献`,
       selectedCount: (selected: number, total: number) => `已纳入 ${selected}/${total} 条`,
       empty: '本次未检索到命中文献',
@@ -638,12 +644,13 @@ export const zh = {
       manualTitle: '手动添加现有技术',
       manualPubNo: '公开号',
       manualName: '标题',
-      manualUrl: '来源链接',
+      manualUrl: '来源链接（必填）',
       manualAbstract: '摘要',
       manualAdd: '添加',
       manualCancel: '收起',
       manualBadge: '手动录入',
       manualIncomplete: '请至少填写公开号或标题',
+      manualUrlRequired: '请填写来源链接：交底书 1.1 每条现有技术都必须附可核验的公开链接',
       manualRemove: '移除该条',
       summary: (n: number) => (n > 0 ? `已纳入 ${n} 条现有技术` : '未纳入现有技术'),
     },

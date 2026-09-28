@@ -92,22 +92,76 @@ def run_tool(
     - 非零退出码不抛异常，由调用方按需处理（转换失败非致命）；
     - 超时抛 subprocess.TimeoutExpired，由调用方捕获。
     """
-    cmd = [sys.executable, str(TOOLS_DIR / script), *args]
+    return subprocess.run(
+        _tool_cmd(script, args),
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_tool_env(extra_env),
+        cwd=str(TOOLS_DIR),
+        timeout=timeout,
+        check=False,  # 非零退出码由调用方判断（转换失败非致命）
+    )
+
+
+def _tool_cmd(script: str, args: list[str]) -> list[str]:
+    return [sys.executable, str(TOOLS_DIR / script), *args]
+
+
+def _tool_env(extra_env: dict[str, str] | None) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     if extra_env:
         env.update(extra_env)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
+    return env
+
+
+def spawn_tool(
+    script: str,
+    args: list[str],
+    *,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.Popen[str]:
+    """以流式方式启动 app/tools 下的 CLI 脚本：**stderr 合并进 stdout**，逐行读。
+
+    与 `run_tool` 的区别：调用方能在子进程运行期间逐行拿到输出（用于进度上报、
+    以及被迫强杀时抢救已经打出来的结果）。合并 stderr 是为了只读一条管道——
+    只读 stdout 而放任 stderr 管道写满，子进程会阻塞在写 stderr 上，两边互等。
+    """
+    return subprocess.Popen(
+        _tool_cmd(script, args),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
         encoding="utf-8",
         errors="replace",
-        env=env,
+        env=_tool_env(extra_env),
         cwd=str(TOOLS_DIR),
-        timeout=timeout,
-        check=False,  # 非零退出码由调用方判断（转换失败非致命）
+        bufsize=1,
     )
+
+
+def kill_process_tree(proc: subprocess.Popen[Any]) -> None:
+    """强杀子进程**连同它拉起的整棵进程树**。
+
+    检索脚本经 Playwright 驱动拉起浏览器：只杀 python 进程，Chrome 会作为孤儿留下，
+    每次超时都多挂一个无头浏览器。Windows 上用 taskkill /T 连根拔起。
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform.startswith("win"):
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.warning("taskkill 失败，退回单进程 kill：%s", exc)
+    if proc.poll() is None:
+        proc.kill()
 
 
 def sanitize_filename(name: str) -> str:

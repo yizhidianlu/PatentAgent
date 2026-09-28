@@ -30,7 +30,7 @@ import json
 import logging
 import re
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1566,6 +1566,100 @@ SEARCH_FAIL_SCHEMA: dict[str, Any] = {
     },
 }
 
+_PROMPT_TAIL = (
+    "请选择：重试检索 / 手工补录在先文献 / 跳过查新"
+    "（跳过时 1.1 会如实写明未进行系统性检索，平台不会编造检索结果）。"
+)
+
+
+def _search_fail_prompt(result: Any, retry_terms: Sequence[str]) -> str:
+    """失败门控的提示：按失败类型说真话，并告诉用户重试会发生什么。
+
+    早先不论什么原因都是「检索超时（180s，疑似 WAF 拦截或网络不可达）」——而那次的真实情况是
+    站点正常、检索正在成功进行，只是时间预算不够。用户据此判断「连不上专利库」，改去手工检索。
+    """
+    kind = getattr(result, "failure_kind", None)
+    error = getattr(result, "error", None) or ""
+    if kind == "blocked":
+        head = f"国知局访问验证未通过，本次未能完成检索（{error}）。这类失败多为临时拦截或网络问题，稍后重试可能恢复。"
+    elif kind == "budget":
+        head = (
+            f"检索超出时间预算：{error}。国知局本身是通的。"
+            f"「重试」已预填尚未检索的 {len(retry_terms)} 个词，只补检索这些。"
+        )
+    elif kind == "empty":
+        head = f"检索已完成但零命中（{error}）。请放宽或更换检索词后重试——原词重试结果不会不同。"
+    else:
+        head = f"本次国知局检索未取得可用结果（{error or '零命中'}）。"
+    return head + _PROMPT_TAIL
+
+
+def _manual_items(answer: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """门控回填里的手工在先文献，兼容两种形状：
+
+    - 后端契约 `hits: [{url, pub_no, title, applicant, abstract}]`
+    - 前端卡片 `manual: [{pub_number, title, url, abstract}]`
+    """
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for key in ("hits", "manual"):
+        for h in answer.get(key) or []:
+            if not isinstance(h, Mapping):
+                continue
+            item = {
+                "url": str(h.get("url") or "").strip(),
+                "pub_no": h.get("pub_no") or h.get("pub_number") or None,
+                "title": h.get("title") or None,
+                "applicant": h.get("applicant") or None,
+                "abstract": h.get("abstract") or None,
+            }
+            # 同一条可能在两个键下各出现一次（兼容期的前端两处都带）：只算一条
+            ident = (item["url"], str(item["pub_no"] or ""), str(item["title"] or ""))
+            if ident in seen:
+                continue
+            seen.add(ident)
+            items.append(item)
+    return items
+
+
+def _fail_gate_answer(value: Any) -> dict[str, Any]:
+    """失败门控回填 → 统一成 `{action, terms, hits, reason}`。
+
+    前端卡片提交的是 `{manual: [...], skipped, hit_ids}`，后端却只认 `action`——取不到就落到
+    `skip`，于是**手工补录的在先文献被静默丢弃**、1.1 写成未检索。两种形状都要认。
+    """
+    answer = _answer(value)
+    action = str(answer.get("action") or "").strip()
+    hits = _manual_items(answer)
+    if action not in ("retry", "manual", "skip"):
+        if answer.get("skipped"):
+            action = "skip"
+        elif hits:
+            action = "manual"
+        elif answer.get("retry"):
+            action = "retry"
+        else:
+            action = "skip"
+    terms = [str(t).strip() for t in (answer.get("terms") or []) if str(t).strip()]
+    return {"action": action, "terms": terms, "hits": hits, "reason": str(answer.get("reason") or "").strip()}
+
+
+def _selected_ids(answer: Mapping[str, Any]) -> set[str] | None:
+    """勾选门控回填里的纳入清单：后端契约叫 selected_ids，前端卡片发的是 hit_ids。
+
+    只认 selected_ids 的话，用户在卡片上取消勾选的条目会被忽略、照样写进 1.1。
+    """
+    for key in ("selected_ids", "hit_ids"):
+        if isinstance(answer.get(key), list):
+            return {str(i) for i in answer[key]}
+    return None
+
+
+def _merge_terms(into: list[str], terms: Iterable[str]) -> None:
+    for t in terms:
+        if t and t not in into:
+            into.append(t)
+
 
 async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
     """A4 联网查新：检索词 → 爬虫 → 失败三选项门控 → 消化改写 → 勾选纳入。"""
@@ -1600,6 +1694,7 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
         }
 
     blocks, type_param, terms_report = await _search_terms(ctx)
+    planned = cnipa.normalize_terms(blocks)
     progress = cnipa.hub_progress(ctx.case_id, ctx.step_key)
 
     result = await cnipa.search(ctx.case_id, blocks, type_param, on_progress=progress)
@@ -1610,38 +1705,113 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
     skipped = False
     skip_reason = ""
     manual = False
+    # 实际检索完成的词（跨轮累计）——1.1 的检索说明只能写这些
+    searched_all: list[str] = []
+    # 已检索且零命中的词：原词重试结果不会不同，不再为它们发请求
+    zero_terms: set[str] = set()
+
+    def absorb(res: Any) -> None:
+        _merge_terms(searched_all, res.searched_terms)
+        if not (res.ok and res.hits):
+            zero_terms.update(res.searched_terms)
+
+    absorb(result)
+
+    # 部分完成（有命中、但有词没做完）：换一个全新的浏览器会话自动补检索一次。
+    # 新会话重新过一次防护挑战，站点对上一个会话的限频也随之不再作用——真站点上
+    # 常见的形态是「前两三个词很快，后面的词开始卡」。不补的话，这些词用户根本没有机会再检索：
+    # 有命中就不会弹失败门控，流程直接往下走了。
+    follow_up = [t for t in result.pending_terms if t not in zero_terms] if (result.ok and hits) else []
+    if follow_up:
+        await ctx.emit(
+            "log",
+            {
+                "message": (
+                    f"有 {len(follow_up)} 个检索词未完成（{'、'.join(follow_up)}），"
+                    "换一个新会话自动补检索一次…"
+                )
+            },
+        )
+        extra = await cnipa.search(
+            ctx.case_id, follow_up, type_param, on_progress=progress, use_cache=False
+        )
+        absorb(extra)
+        if extra.ok and extra.hits:
+            known = {str(h.url) for h in hits}
+            hits += [h for h in extra.hits if str(h.url) not in known]
 
     while not (result.ok and hits) and not skipped and rounds <= MAX_SEARCH_ROUNDS:
-        answer = _answer(
+        # 预算型失败：重试只补还没检索的词；其余情况沿用本轮的词（用户可改）
+        pending = [t for t in result.pending_terms if t not in zero_terms]
+        retry_default = pending if (result.failure_kind == "budget" and pending) else (
+            [t for t in planned if t not in zero_terms] or planned
+        )
+        answer = _fail_gate_answer(
             await ctx.await_user(
                 InteractionRequest(
                     kind="prior_art",
                     schema=SEARCH_FAIL_SCHEMA,
-                    prompt=(
-                        "本次国知局检索未取得可用结果"
-                        + (f"（{error}）" if error else "（零命中）")
-                        + "。请选择：重试检索 / 手工粘贴在先文献 / 跳过查新"
-                        "（跳过时 1.1 会如实写明未进行系统性检索，平台不会编造检索结果）。"
-                    ),
-                    default={"action": "retry", "terms": blocks, "hits": [], "reason": ""},
+                    prompt=_search_fail_prompt(result, retry_default),
+                    default={
+                        "action": "retry",
+                        "terms": retry_default,
+                        "hits": [],
+                        "reason": "",
+                        # 前端卡片据此进入失败态（显示原因、重试入口）
+                        "failed": True,
+                        "error_message": result.error or "",
+                        "failure_kind": result.failure_kind,
+                        "searched_terms": list(searched_all),
+                        "zero_terms": sorted(zero_terms),
+                    },
                 )
             )
         )
-        action = str(answer.get("action") or "skip")
+        action = answer["action"]
         if action == "retry" and rounds < MAX_SEARCH_ROUNDS:
             rounds += 1
-            retry_terms = [str(t).strip() for t in (answer.get("terms") or []) if str(t).strip()]
-            blocks = retry_terms or blocks
+            wanted = cnipa.normalize_terms(answer["terms"] or retry_default)
+            if answer["terms"]:
+                # 用户改了检索词：计划跟着用户最新的意图走，被换掉的词不再算「未检索」
+                planned = [*searched_all, *[t for t in wanted if t not in searched_all]]
+            fresh = [t for t in wanted if t not in zero_terms]
+            if not fresh:
+                await ctx.emit(
+                    "log",
+                    {
+                        "message": (
+                            f"「{'、'.join(wanted)}」都已检索过且无命中，原词重试结果不会不同，本轮未重新检索。"
+                            "请修改检索词，或选择手工补录 / 跳过查新。"
+                        )
+                    },
+                )
+                continue
             result = await cnipa.search(
-                ctx.case_id, blocks, type_param, on_progress=progress, use_cache=False
+                ctx.case_id, fresh, type_param, on_progress=progress, use_cache=False
             )
+            absorb(result)
             hits = list(result.hits)
             status, error, cached = result.status, result.error, bool(result.cached)
             continue
         if action == "manual":
-            raw_hits = [h for h in (answer.get("hits") or []) if isinstance(h, Mapping)]
+            items = answer["hits"]
+            with_url = [h for h in items if h["url"]]
+            if len(with_url) < len(items):
+                await ctx.emit(
+                    "log",
+                    {
+                        "message": (
+                            f"{len(items) - len(with_url)} 条手工录入缺少来源链接，未纳入"
+                            "（1.1 每条现有技术都必须附可核验的公开链接）。"
+                        )
+                    },
+                )
             try:
-                added = await cnipa.add_manual_hits(ctx.case_id, raw_hits, note="用户手工录入的在先文献")
+                added = (
+                    await cnipa.add_manual_hits(ctx.case_id, with_url, note="用户手工录入的在先文献")
+                    if with_url
+                    else []
+                )
             except ValueError as exc:
                 await ctx.emit("log", {"message": f"手工录入失败：{exc}"})
                 added = []
@@ -1651,7 +1821,7 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
                 break
             rounds += 1
             continue
-        skip_reason = str(answer.get("reason") or "").strip()
+        skip_reason = answer["reason"]
         if action == "retry":     # 重试次数已达上限：按跳过收口，避免门控死循环
             await ctx.emit(
                 "log",
@@ -1661,6 +1831,19 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
         await cnipa.skip_search(ctx.case_id, skip_reason)
         skipped, hits, status = True, [], "manual_pending"
         break
+
+    unsearched = [t for t in planned if t not in searched_all]
+    if hits and not manual and unsearched:
+        await ctx.emit(
+            "log",
+            {
+                "message": (
+                    f"国知局检索部分完成：已检索 {len(searched_all)} 个词，"
+                    f"{len(unsearched)} 个词未检索（{'、'.join(unsearched)}）。"
+                    "1.1 的检索说明只写实际检索过的词。"
+                )
+            },
+        )
 
     notes: list[dict[str, Any]] = []
     selected_count = 0
@@ -1700,8 +1883,12 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
                 )
             )
         )
-        if "selected_ids" in answer:
-            keep = {str(i) for i in (answer.get("selected_ids") or [])}
+        keep = _selected_ids(answer)
+        if answer.get("skipped") and keep is None:
+            # 卡片上的「跳过」：不纳入任何检索结果（早先会被当成全选，与用户意图正相反）
+            keep = set()
+            await ctx.emit("log", {"message": "已按用户选择不纳入本次检索结果。"})
+        if keep is not None:
             for hit in hits:
                 try:
                     await cnipa.set_selected(str(hit.id), str(hit.id) in keep)
@@ -1709,6 +1896,19 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
                     logger.debug("写回 search_hits.selected 失败：%s", exc)
             urls = {str(h.url) for h in hits if str(h.id) in keep}
             notes = [n for n in notes if str(n.get("url") or "") in urls]
+        # 勾选卡片上手工追加的在先文献（早先整段被忽略）
+        extra = [h for h in _manual_items({"manual": answer.get("manual")}) if h["url"]]
+        if extra:
+            try:
+                added = await cnipa.add_manual_hits(ctx.case_id, extra, note="用户在勾选时追加的在先文献")
+            except ValueError as exc:
+                await ctx.emit("log", {"message": f"手工追加失败：{exc}"})
+                added = []
+            known = {str(n.get("url") or "") for n in notes}
+            fresh = [h for h in added if str(h.url) not in known]
+            if fresh:
+                notes = notes + await _digest_hits(ctx, fresh)
+                manual = True
         selected_count = len(notes)
 
     output = {
@@ -1716,7 +1916,11 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
             "searched": bool(notes) and not skipped,
             "status": status,
             "error": error,
-            "terms": blocks,
+            # 1.1「检索说明」据此写检索词：只能是**实际检索完成**的词。
+            # 一个词都没检索成（被拦截后手工补录）时沿用计划词，与改动前一致。
+            "terms": searched_all or blocks,
+            "planned_terms": planned,
+            "unsearched_terms": unsearched,
             "type_param": type_param,
             "terms_report": terms_report,
             "rounds": rounds,

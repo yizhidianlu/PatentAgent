@@ -1,14 +1,20 @@
 """CNIPA 查新服务与 API 测试（prompt-porting-spec §2 A4 / R8）。
 
-**不依赖真实网络**：把 `app.services.cnipa.run_tool` 换成脚本化假子进程，按移植脚本
-`tools/cnipa_epub_search.py` 的真实 stdout 协议（唯一一行 `EPUB_HITS_JSON:` + JSON 数组）
-喂数据，其余环节（解析 → 落库 → 缓存 → 降级 → 人工兜底 → REST 契约）全部真跑。
+**不依赖真实网络**：把 `app.services.cnipa._stream_script` 换成脚本化的假子进程输出，按
+`tools/cnipa_epub_search.py` 的真实 stdout 协议（逐词行 + 摘要行 + `EPUB_HITS_JSON:` 结果行）
+喂数据，其余环节（解析 → 分类 → 落库 → 缓存 → 降级 → 人工兜底 → REST 契约）全部真跑。
+conftest 另有一道保险：没替换就去拉起真实检索脚本的用例，会得到一次「无法启动」而不是触网。
+
+`_stream_script` 自身（逐行读、按时强杀、强杀后抢救已打出的行）用**本地的小 python 脚本**
+真跑子进程来测，同样不触网。
 
 覆盖：
 - 解析入库（URL 照抄 link；无 link 条目丢弃）；
-- 6 小时缓存命中（同案件复用旧命中；跨案件复制一份）；
-- 失败降级：超时 / 退出码非零 / 无 EPUB_HITS_JSON / 零解析 —— 一律 status='failed'
-  且**不抛异常**（交 A4 三选项门控）；
+- 6 小时缓存命中（同案件复用旧命中；跨案件复制一份）；部分完成的会话不进缓存；
+- 时间预算随词数伸缩，并作为截止时刻传给脚本；
+- **部分结果保留**：预算用尽 / 被强杀时，已完成的词照常入库，没做的词如实列出；
+- 失败分类说真话：被拦截（blocked）/ 超预算（budget）/ 零命中（empty）/ 脚本错误（script）；
+- 逐词进度推到界面，且刷新流水线的「卡住」计时；
 - 人工兜底录入、勾选、跳过查新、URL 白名单；
 - 浏览器探测；
 - REST：POST/GET/PATCH 五个端点。
@@ -18,7 +24,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -95,7 +103,81 @@ class FakeRunTool:
 
 
 def _patch_tool(monkeypatch: pytest.MonkeyPatch, fake: FakeRunTool) -> FakeRunTool:
+    """浏览器探测仍走阻塞的 run_tool。"""
     monkeypatch.setattr(cnipa, "run_tool", fake)
+    return fake
+
+
+# ---- 检索子进程：按脚本真实协议拼输出行 ----
+
+
+def _line(prefix: str, payload: Any) -> str:
+    return f"{prefix} {json.dumps(payload, ensure_ascii=False)}"
+
+
+def _home_ready(sec: float = 8.6) -> str:
+    return _line("EPUB_HOME_READY:", {"sec": sec})
+
+
+def _term(i: int, n: int, term: str, hits: list[dict[str, Any]], sec: float = 2.0) -> str:
+    return _line("EPUB_TERM_JSON:", {"i": i, "n": n, "term": term, "sec": sec, "hits": hits})
+
+
+def _summary(
+    searched: Sequence[str],
+    skipped: Sequence[str] = (),
+    failed: Sequence[str] = (),
+    stop: str | None = None,
+    error: str | None = None,
+) -> str:
+    return _line(
+        "EPUB_SUMMARY_JSON:",
+        {"searched": list(searched), "failed": list(failed), "skipped": list(skipped), "stop": stop, "error": error},
+    )
+
+
+def _hits_line(hits: list[dict[str, Any]]) -> str:
+    return _line("EPUB_HITS_JSON:", hits)
+
+
+def _success(terms: Sequence[str], hits: list[dict[str, Any]]) -> list[str]:
+    """一场全部完成的检索输出：命中都算在第一个词上。"""
+    lines = [_home_ready()]
+    for i, t in enumerate(terms, 1):
+        lines.append(_term(i, len(terms), t, hits if i == 1 else []))
+    lines += [_summary(terms), _hits_line(hits)]
+    return lines
+
+
+class FakeStream:
+    """替换 `cnipa._stream_script`：记录调用，把预置行逐条喂给 on_line，按预置返回。"""
+
+    def __init__(
+        self,
+        lines: Sequence[str] = (),
+        *,
+        rc: int | None = 0,
+        killed: bool = False,
+        raises: BaseException | None = None,
+    ) -> None:
+        self.lines = list(lines)
+        self.rc = rc
+        self.killed = killed
+        self.raises = raises
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, args: list[str], env: dict[str, str], hard_limit: float, on_line: Any) -> Any:
+        self.calls.append({"args": list(args), "env": dict(env), "hard_limit": hard_limit})
+        if self.raises is not None:
+            raise self.raises
+        for line in self.lines:
+            if on_line is not None:
+                on_line(line)
+        return list(self.lines), self.rc, self.killed
+
+
+def _patch_stream(monkeypatch: pytest.MonkeyPatch, fake: FakeStream) -> FakeStream:
+    monkeypatch.setattr(cnipa, "_stream_script", fake)
     return fake
 
 
@@ -158,7 +240,7 @@ def test_terms_key_order_insensitive():
 async def test_search_parses_and_persists(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """成功路径：解析 → 落库 → 进度回调；query 行 done，命中 URL 照抄。"""
     case_id = _new_case(client, "查新-成功")
-    fake = _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout(HITS_PAYLOAD))))
+    fake = _patch_stream(monkeypatch, FakeStream(_success(["资源画像", "任务调度"], HITS_PAYLOAD)))
 
     stages: list[tuple[str, str]] = []
 
@@ -181,15 +263,23 @@ async def test_search_parses_and_persists(client: TestClient, monkeypatch: pytes
     assert result.hits[0].selected is True
     assert result.hits[0].manual_entry is False
 
-    # 子进程参数：--type 映射 + 一次会话传多词
-    script, args, kwargs = fake.calls[0]
-    assert script == "cnipa_epub_search.py"
-    assert args == ["--type", "invention", "资源画像", "任务调度"]
-    assert kwargs["timeout"] == cnipa.SEARCH_TIMEOUT
-    assert "EPUB_WAF_MAX_WAIT_SEC" in kwargs["extra_env"]
+    # 子进程参数：--type 映射 + 一次会话传多词；预算按词数算，作为截止时刻传给脚本
+    call = fake.calls[0]
+    assert call["args"] == ["--type", "invention", "资源画像", "任务调度"]
+    budget = cnipa.search_budget(2)
+    assert call["env"]["EPUB_DEADLINE_SEC"] == str(budget)
+    assert "EPUB_WAF_MAX_WAIT_SEC" in call["env"]
+    # 强杀线 = 预算 + 收尾宽限：脚本总有机会自己收尾、报出原因
+    assert call["hard_limit"] == budget + cnipa.TEARDOWN_GRACE_SEC
+    assert result.searched_terms == ["资源画像", "任务调度"]
+    assert result.partial is False
 
-    # 进度回调覆盖关键阶段
-    assert [s for s, _ in stages] == ["start", "running", "parsed", "done"]
+    # 进度回调覆盖关键阶段；运行中逐词上报（crawl）
+    kinds = [s for s, _ in stages]
+    assert kinds[:2] == ["start", "running"]
+    assert kinds[-2:] == ["parsed", "done"]
+    assert "crawl" in kinds
+    assert any("已完成 1/2" in m for s, m in stages if s == "crawl")
 
     # 落库
     queries = await cnipa.list_queries(case_id)
@@ -205,7 +295,7 @@ async def test_search_parses_and_persists(client: TestClient, monkeypatch: pytes
 async def test_search_reuses_cache_in_same_case(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """同案件 6 小时内同 terms+type：直接复用，不再起子进程。"""
     case_id = _new_case(client, "查新-缓存同案")
-    fake = _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout(HITS_PAYLOAD))))
+    fake = _patch_stream(monkeypatch, FakeStream(_success(["缓存词甲", "缓存词乙"], HITS_PAYLOAD)))
 
     first = await cnipa.search(case_id, ["缓存词甲", "缓存词乙"], "invention")
     assert first.status == "done" and first.cached is False
@@ -223,7 +313,7 @@ async def test_search_cache_copies_across_cases(client: TestClient, monkeypatch:
     """跨案件命中缓存：复制一份进新案件（仍不起子进程）。"""
     case_a = _new_case(client, "查新-缓存源案")
     case_b = _new_case(client, "查新-缓存目标案")
-    fake = _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout(HITS_PAYLOAD))))
+    fake = _patch_stream(monkeypatch, FakeStream(_success(["跨案词甲", "跨案词乙"], HITS_PAYLOAD)))
 
     await cnipa.search(case_a, ["跨案词甲", "跨案词乙"], "utility_model")
     assert len(fake.calls) == 1
@@ -240,20 +330,17 @@ async def test_search_cache_copies_across_cases(client: TestClient, monkeypatch:
 async def test_search_cache_disabled(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """use_cache=False：即使有缓存也重跑（用户点「重试」的语义）。"""
     case_id = _new_case(client, "查新-禁用缓存")
-    fake = _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout(HITS_PAYLOAD))))
+    fake = _patch_stream(monkeypatch, FakeStream(_success(["禁缓存词"], HITS_PAYLOAD)))
 
     await cnipa.search(case_id, ["禁缓存词"], "invention")
     await cnipa.search(case_id, ["禁缓存词"], "invention", use_cache=False)
     assert len(fake.calls) == 2
 
 
-async def test_search_timeout_degrades(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """超时（疑似 WAF）：返回 failed，不抛异常，query 行落 failed + 原因。"""
+async def test_search_killed_before_home_is_blocked(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """被强杀且首页防护始终没过：判「被拦截」——这才是真正的访问验证失败。"""
     case_id = _new_case(client, "查新-超时")
-    _patch_tool(
-        monkeypatch,
-        FakeRunTool(raises=subprocess.TimeoutExpired(cmd="cnipa_epub_search.py", timeout=180)),
-    )
+    _patch_stream(monkeypatch, FakeStream([], rc=None, killed=True))
 
     stages: list[str] = []
     result = await cnipa.search(
@@ -262,7 +349,8 @@ async def test_search_timeout_degrades(client: TestClient, monkeypatch: pytest.M
 
     assert result.status == "failed"
     assert result.ok is False
-    assert "超时" in result.error
+    assert result.failure_kind == "blocked"
+    assert "超时" in result.error and "访问验证" in result.error
     assert result.hits == []
     assert stages[-1] == "failed"
 
@@ -272,40 +360,74 @@ async def test_search_timeout_degrades(client: TestClient, monkeypatch: pytest.M
     assert await cnipa.list_hits(case_id) == []
 
 
+async def test_search_killed_after_home_is_budget_not_waf(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """首页已通过、却在预算内一个词都没做完：是时间预算问题，**不许**报成拦截。
+
+    早先这两种情况共用「疑似 WAF 拦截或网络不可达」——而真实那次站点正常、检索正在成功进行。
+    """
+    case_id = _new_case(client, "查新-超预算")
+    _patch_stream(monkeypatch, FakeStream([_home_ready()], rc=None, killed=True))
+    result = await cnipa.search(case_id, ["预算词甲", "预算词乙"], "invention")
+    assert result.status == "failed"
+    assert result.failure_kind == "budget"
+    assert "站点正常" in result.error
+    assert "WAF" not in result.error and "拦截" not in result.error
+
+
+async def test_search_blocked_exit_code(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """脚本自己判定首页防护未通过（退出码 3）：blocked，原因原样带出。"""
+    case_id = _new_case(client, "查新-被拦截")
+    lines = [_summary([], skipped=["拦截词"], stop="blocked", error="90s 内首页未出现检索框 #searchStr")]
+    _patch_stream(monkeypatch, FakeStream(lines, rc=3))
+    result = await cnipa.search(case_id, ["拦截词"], "invention")
+    assert result.status == "failed"
+    assert result.failure_kind == "blocked"
+    assert "访问验证未通过" in result.error
+    assert "首页未出现检索框" in result.error
+    assert result.skipped_terms == ["拦截词"]
+
+
 async def test_search_nonzero_exit_degrades(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """脚本非零退出（playwright 缺失等）：failed + stderr 关键行入 error。"""
+    """脚本非零退出（playwright 缺失等）：failed + 关键行入 error，归为脚本错误。"""
     case_id = _new_case(client, "查新-退出码")
-    _patch_tool(
+    _patch_stream(
         monkeypatch,
-        FakeRunTool(_proc(stderr="ERROR: pip install playwright\nHINT: browser.py --probe", returncode=1)),
+        FakeStream(["ERROR: pip install playwright", "HINT: browser.py --probe"], rc=1),
     )
     result = await cnipa.search(case_id, ["退出码词"], "invention")
     assert result.status == "failed"
+    assert result.failure_kind == "script"
     assert "退出码 1" in result.error
     assert "playwright" in result.error
 
 
 async def test_search_missing_marker_degrades(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """退出码 0 但没有 EPUB_HITS_JSON（页面改版/被拦截）：仍判 failed。"""
+    """退出码 0 但没有任何机读行（页面改版等）：仍判 failed。"""
     case_id = _new_case(client, "查新-无标记")
-    _patch_tool(monkeypatch, FakeRunTool(_proc(stdout="不是机读协议的输出", stderr="EPUB_NOTE: html_bytes=512")))
+    _patch_stream(monkeypatch, FakeStream(["不是机读协议的输出", "EPUB_NOTE: html_bytes=512"], rc=0))
     result = await cnipa.search(case_id, ["无标记词"], "invention")
     assert result.status == "failed"
     assert "EPUB_HITS_JSON" in result.error
 
 
 async def test_search_zero_hits_degrades(client: TestClient, monkeypatch: pytest.MonkeyPatch):
-    """零解析：判 failed 交人工兜底（A4 明确禁止编造检索结果）。"""
+    """全部检索完、确实零命中：判 failed 交人工兜底（A4 禁止编造检索结果），并说清原词重试没用。"""
     case_id = _new_case(client, "查新-零命中")
-    _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout([]))))
+    _patch_stream(monkeypatch, FakeStream([_home_ready(), _summary(["零命中词"]), _hits_line([])]))
     result = await cnipa.search(case_id, ["零命中词"], "invention")
     assert result.status == "failed"
-    assert "未解析到任何命中" in result.error
+    assert result.failure_kind == "empty"
+    assert "均无命中" in result.error
+    assert "原词重试" in result.error
+    assert result.searched_terms == ["零命中词"]
     queries = await cnipa.list_queries(case_id)
     assert queries[0].status == "failed"
 
     # empty_is_failure=False 时按 done 处理（供上层按需放宽）
     case2 = _new_case(client, "查新-零命中放宽")
+    _patch_stream(monkeypatch, FakeStream([_home_ready(), _summary(["零命中词2"]), _hits_line([])]))
     result2 = await cnipa.search(case2, ["零命中词2"], "invention", empty_is_failure=False)
     assert result2.status == "done"
     assert result2.hits == []
@@ -314,12 +436,183 @@ async def test_search_zero_hits_degrades(client: TestClient, monkeypatch: pytest
 async def test_search_empty_terms(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """空检索词：直接 failed，不起子进程也不写库。"""
     case_id = _new_case(client, "查新-空词")
-    fake = _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout(HITS_PAYLOAD))))
+    fake = _patch_stream(monkeypatch, FakeStream(_success(["x"], HITS_PAYLOAD)))
     result = await cnipa.search(case_id, ["  "], "invention")
     assert result.status == "failed"
     assert result.error == "检索词为空"
     assert fake.calls == []
     assert await cnipa.list_queries(case_id) == []
+
+
+# ---------------------------------------------------------------------------
+# 时间预算与部分结果
+# ---------------------------------------------------------------------------
+
+
+def test_search_budget_scales_with_terms():
+    """预算随词数伸缩、封顶——早先一个 180s 写死套在任意词数上，7 个词实测要 248s。"""
+    assert cnipa.search_budget(1) < cnipa.search_budget(4) < cnipa.search_budget(7)
+    assert cnipa.search_budget(7) > 180
+    assert cnipa.search_budget(100) == cnipa.SEARCH_BUDGET_CAP
+    assert cnipa.search_budget(0) == cnipa.search_budget(1)
+
+
+async def test_search_partial_keeps_completed_terms(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """预算用尽：已完成词的命中照常入库，没来得及的词如实列出；**不许进缓存**。"""
+    case_id = _new_case(client, "查新-部分完成")
+    terms = ["部分甲", "部分乙", "部分丙"]
+    lines = [
+        _home_ready(),
+        _term(1, 3, "部分甲", HITS_PAYLOAD[:1]),
+        _term(2, 3, "部分乙", HITS_PAYLOAD[1:2]),
+        _summary(["部分甲", "部分乙"], skipped=["部分丙"], stop="deadline", error="时间预算用尽，剩余 1 个词未检索"),
+        _hits_line(HITS_PAYLOAD[:2]),
+    ]
+    fake = _patch_stream(monkeypatch, FakeStream(lines))
+    stages: list[tuple[str, str]] = []
+    result = await cnipa.search(case_id, terms, "invention", on_progress=lambda s, m: stages.append((s, m)))
+
+    assert result.status == "done"
+    assert len(result.hits) == 2
+    assert result.searched_terms == ["部分甲", "部分乙"]
+    assert result.skipped_terms == ["部分丙"]
+    assert result.partial is True
+    assert result.pending_terms == ["部分丙"]
+    done_msg = next(m for s, m in stages if s == "done")
+    assert "部分丙" in done_msg and "未检索" in done_msg
+
+    # 同一组词再搜：部分结果不能当完整结果复用，必须真跑
+    await cnipa.search(case_id, terms, "invention")
+    assert len(fake.calls) == 2
+
+
+async def test_search_salvages_completed_terms_when_killed(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    """脚本被强杀、没来得及打摘要：从逐词行里抢救已完成的词，而不是全部作废。"""
+    case_id = _new_case(client, "查新-强杀抢救")
+    lines = [_home_ready(), _term(1, 3, "抢救甲", HITS_PAYLOAD[:2])]
+    _patch_stream(monkeypatch, FakeStream(lines, rc=None, killed=True))
+    result = await cnipa.search(case_id, ["抢救甲", "抢救乙", "抢救丙"], "invention")
+    assert result.status == "done"
+    assert [h.url for h in result.hits] == [
+        "http://epub.cnipa.gov.cn/patent/CN114567890A",
+        "http://epub.cnipa.gov.cn/patent/CN113456789B",
+    ]
+    assert result.searched_terms == ["抢救甲"]
+    assert result.skipped_terms == ["抢救乙", "抢救丙"]
+
+
+async def test_search_zero_hits_but_unfinished_is_budget(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """做完的词零命中、但还有词没做：是预算问题，不是「确实查不到」。"""
+    case_id = _new_case(client, "查新-零命中未做完")
+    lines = [_home_ready(), _summary(["未完甲"], skipped=["未完乙"], stop="deadline"), _hits_line([])]
+    _patch_stream(monkeypatch, FakeStream(lines))
+    result = await cnipa.search(case_id, ["未完甲", "未完乙"], "invention")
+    assert result.status == "failed"
+    assert result.failure_kind == "budget"
+    assert result.pending_terms == ["未完乙"]
+    assert "未完乙" in result.error
+
+
+async def test_search_spawn_failure_never_raises(client: TestClient):
+    """子进程起不来（conftest 的保险就是这么模拟的）：降级为 script 失败，绝不抛。"""
+    case_id = _new_case(client, "查新-起不来")
+    result = await cnipa.search(case_id, ["起不来"], "invention")
+    assert result.status == "failed"
+    assert result.failure_kind == "script"
+    assert "无法启动检索脚本" in result.error
+
+
+def test_hub_progress_touches_stall_timer(monkeypatch: pytest.MonkeyPatch):
+    """每条检索进度都要刷新流水线的「卡住」计时——国知局子进程不在 LLM 在途登记里。"""
+    import asyncio
+
+    from app.services import progress as progress_service
+    from app.services.sse import hub
+
+    touched: list[tuple[str, str]] = []
+    monkeypatch.setattr(progress_service, "touch", lambda cid, detail="": touched.append((cid, detail)))
+
+    async def fake_emit(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(hub, "emit", fake_emit)
+    cb = cnipa.hub_progress("case-touch", step_key="prior_art_search")
+    asyncio.run(cb("crawl", "已完成 2/7"))
+    assert touched == [("case-touch", "已完成 2/7")]
+
+
+def test_parse_search_protocol_tolerates_noise():
+    """坏行、未知行不拖垮解析；逐词行出现即说明首页已通过。"""
+    parsed = cnipa.parse_search_protocol(
+        [
+            "BROWSER: channel=chrome",
+            "EPUB_TERM_JSON: {坏掉的JSON",
+            _term(1, 1, "甲", HITS_PAYLOAD[:1]),
+            "EPUB_MERGE: terms=1",
+        ]
+    )
+    assert parsed["home_ready"] is True
+    assert [t["term"] for t in parsed["terms"]] == ["甲"]
+    assert parsed["summary"] is None and parsed["hits"] is None
+    assert "BROWSER: channel=chrome" in parsed["notes"]
+
+
+# ---------------------------------------------------------------------------
+# 流式子进程：本地小脚本真跑（不触网）
+# ---------------------------------------------------------------------------
+
+
+def _local_script(tmp_path, body: str):
+    """写一个本地 python 脚本，并返回一个替身 spawn_tool：拉起它而不是真实检索脚本。"""
+    script = tmp_path / "fake_search.py"
+    script.write_text(body, encoding="utf-8")
+
+    def spawn(_name: str, args: list[str], *, extra_env: dict[str, str] | None = None) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, "-u", str(script), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    return spawn
+
+
+def test_stream_script_reads_lines_and_exit_code(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    body = (
+        "import sys\n"
+        "print('EPUB_HOME_READY: {\"sec\": 1}', flush=True)\n"
+        "print('EPUB_NOTE: hello', file=sys.stderr, flush=True)\n"
+        "print('EPUB_HITS_JSON: []', flush=True)\n"
+        "sys.exit(0)\n"
+    )
+    monkeypatch.setattr(cnipa, "spawn_tool", _local_script(tmp_path, body))
+    seen: list[str] = []
+    lines, rc, killed = cnipa._stream_script([], {}, 30, seen.append)
+    assert rc == 0 and killed is False
+    assert "EPUB_HITS_JSON: []" in lines
+    assert "EPUB_NOTE: hello" in lines          # stderr 合并进来，没有被丢
+    assert seen == lines                        # 逐行实时回调
+
+
+def test_stream_script_kills_on_overrun_and_keeps_printed_lines(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """子进程卡住不出声：按时强杀；强杀前已经打出的行（已完成的词）要留下来。"""
+    body = (
+        "import time\n"
+        "print('EPUB_TERM_JSON: {\"i\": 1, \"n\": 3, \"term\": \"甲\", \"hits\": []}', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(cnipa, "spawn_tool", _local_script(tmp_path, body))
+    started = time.monotonic()
+    lines, _rc, killed = cnipa._stream_script([], {}, 2, None)
+    assert killed is True
+    assert time.monotonic() - started < 20            # 没被卡在阻塞的 readline 上
+    assert any(line.startswith("EPUB_TERM_JSON:") for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +734,7 @@ def _wait_for_search(client: TestClient, case_id: str, timeout: float = 20.0) ->
 def test_api_search_flow(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """REST：触发检索（202）→ 后台完成 → 命中列表 → 勾选。"""
     case_id = _new_case(client, "查新-API成功")
-    _patch_tool(monkeypatch, FakeRunTool(_proc(stdout=_hits_stdout(HITS_PAYLOAD))))
+    _patch_stream(monkeypatch, FakeStream(_success(["API词甲", "API词乙"], HITS_PAYLOAD)))
 
     resp = client.post(
         f"{API}/cases/{case_id}/search/cnipa",
@@ -467,7 +760,7 @@ def test_api_search_flow(client: TestClient, monkeypatch: pytest.MonkeyPatch):
 def test_api_search_failure_is_reported_not_500(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     """检索失败不返回 5xx：latest_status=failed + latest_error，前端据此弹三选项。"""
     case_id = _new_case(client, "查新-API失败")
-    _patch_tool(monkeypatch, FakeRunTool(raises=subprocess.TimeoutExpired(cmd="x", timeout=180)))
+    _patch_stream(monkeypatch, FakeStream([], rc=None, killed=True))
 
     resp = client.post(f"{API}/cases/{case_id}/search/cnipa", json={"terms": ["API失败词"]})
     assert resp.status_code == 202
