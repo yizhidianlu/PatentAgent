@@ -536,6 +536,48 @@ def pdf_text_summary(pdf: bytes) -> dict[str, str]:
     return _summary_from_biblio(structure.biblio, normalize_patent_text(text))
 
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# Google 对个人申请人不给姓名，只写这个占位词
+_PLACEHOLDER_APPLICANTS = frozenset({"individual"})
+
+
+def _needs_original_applicant(pub: str, applicant: str) -> bool:
+    """中国专利的申请人却没有一个汉字：多半是 Google 给的英译名或「Individual」占位。
+
+    交底书是中文文件，1.1 里写「Eye and ENT Hospital of Fudan University」「Individual」
+    都不对；原文申请人在全文扉页上。外国专利的英文名是原文，不动。
+    """
+    return pub.upper().startswith("CN") and not _CJK_RE.search(applicant or "")
+
+
+async def _front_page_info(payload: bytes) -> tuple[dict[str, str] | None, str, str, bool]:
+    """全文 PDF 扉页 → ``(著录, 来源, 失败原因, 是否扫描件)``；文字层没有就走 OCR。"""
+    try:
+        return pdf_text_summary(payload), "pdf_text", "", False
+    except ValueError as exc:                          # 没有文字层：扫描件
+        if not await asyncio.to_thread(ocr_service.available):
+            return None, "pdf_ocr", f"{exc}；{ocr_service.unavailable_reason()}", True
+        text = await asyncio.to_thread(ocr_service.pdf_front_page_text, payload)
+        info = parse_front_page_text(text) if text else None
+        if not info:
+            return None, "pdf_ocr", f"{exc}，OCR 也没有识别出摘要", True
+        return info, "pdf_ocr", "", True
+    except Exception as exc:  # noqa: BLE001
+        return None, "pdf_text", str(exc), False
+
+
+async def _original_applicant(client: httpx.AsyncClient, pdf_url: str | None, fallback: str) -> str:
+    """从全文扉页取原文申请人；取不到时保留英文原名，但不留「Individual」这种占位词。"""
+    if pdf_url:
+        payload, _error = await _download_pdf(client, pdf_url)
+        if payload is not None:
+            info, _source, _why, _scanned = await _front_page_info(payload)
+            name = (info or {}).get("applicant") or ""
+            if _CJK_RE.search(name):
+                return name
+    return "" if fallback.strip().lower() in _PLACEHOLDER_APPLICANTS else fallback
+
+
 async def fetch_patent_summary(
     pub_no: str | None,
     *,
@@ -567,6 +609,8 @@ async def fetch_patent_summary(
                         out.ok, out.source = True, "google_patents_page"
                         out.title, out.abstract = info["title"], info["abstract"]
                         out.applicant, out.pub_date = info["applicant"], info["pub_date"]
+                        if _needs_original_applicant(pub, out.applicant):
+                            out.applicant = await _original_applicant(client, candidate_pdf, out.applicant)
                         return out
                     errors.append("Google Patents 详情页没有摘要")
                 else:
@@ -581,29 +625,18 @@ async def fetch_patent_summary(
             if payload is None:
                 errors.append(f"全文 PDF {error}")
             else:
-                info: dict[str, str] | None = None
-                source = "pdf_text"
-                try:
-                    info = pdf_text_summary(payload)
-                except ValueError as exc:                      # 没有文字层：扫描件
-                    out.scanned = True
-                    if await asyncio.to_thread(ocr_service.available):
-                        source = "pdf_ocr"
-                        text = await asyncio.to_thread(ocr_service.pdf_front_page_text, payload)
-                        info = parse_front_page_text(text) if text else None
-                        if not (info and info["abstract"]):
-                            errors.append(f"全文 PDF：{exc}，OCR 也没有识别出摘要")
-                            info = None
-                    else:
-                        errors.append(f"全文 PDF：{exc}；{ocr_service.unavailable_reason()}")
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"全文 PDF：{exc}")
-                if info is not None:
-                    if info["abstract"]:
-                        out.ok, out.source = True, source
-                        out.title, out.abstract = info["title"], info["abstract"]
-                        out.applicant, out.pub_date = info["applicant"], info["pub_date"]
-                        return out
+                info, source, why, scanned = await _front_page_info(payload)
+                out.scanned = scanned
+                if info is None:
+                    errors.append(f"全文 PDF：{why}")
+                elif info["abstract"]:
+                    out.ok, out.source = True, source
+                    out.title, out.abstract = info["title"], info["abstract"]
+                    out.applicant, out.pub_date = info["applicant"], info["pub_date"]
+                    return out
+                elif scanned:
+                    errors.append("全文 PDF：PDF 为扫描件，没有可抽取的文字层，OCR 也没有识别出摘要")
+                else:
                     errors.append("全文 PDF 扉页未解析出摘要")
         elif not pub:
             errors.append("没有公开号，也没有全文 PDF 链接")

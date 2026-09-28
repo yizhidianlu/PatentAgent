@@ -280,3 +280,58 @@ async def test_enrich_stops_waiting_once_google_is_rate_limiting(monkeypatch: py
     _out, problems = await cnipa.enrich_hits(case_id, hits, spacing=0)
     assert delays_seen == [patent_fetch.RATE_LIMIT_RETRY_DELAYS, (), ()]
     assert len(problems) == 3                                   # 补不上的每条都如实列出
+
+
+# ---------------------------------------------------------------------------
+# 申请人：Google 给英译名或「Individual」时，从扉页取原文
+# ---------------------------------------------------------------------------
+
+_EN_PAGE = PAGE_HTML.replace("复旦大学附属眼耳鼻喉科医院", "Eye and ENT Hospital of Fudan University")
+
+
+def _page_then_pdf(page_html: str):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "patents.google.com" in str(request.url):
+            return httpx.Response(200, text=page_html)
+        return httpx.Response(200, content=b"%PDF-1.4 front page")
+
+    return handler
+
+
+async def test_chinese_applicant_comes_from_front_page_when_google_gives_english(monkeypatch: pytest.MonkeyPatch):
+    """Google 中文页对这篇只给英译名：交底书里要写原文「复旦大学附属眼耳鼻喉科医院」（取自扉页）。"""
+    monkeypatch.setattr(
+        patent_fetch, "pdf_text_summary",
+        lambda _pdf: {"title": "T", "abstract": "A" * 30, "applicant": "复旦大学附属眼耳鼻喉科医院", "pub_date": ""},
+    )
+    async with _client(_page_then_pdf(_EN_PAGE)) as client:
+        s = await patent_fetch.fetch_patent_summary("CN114186982A", client=client, sleep=Sleeps())
+    assert s.ok and s.source == "google_patents_page"               # 摘要仍取详情页
+    assert s.applicant == "复旦大学附属眼耳鼻喉科医院"
+
+
+async def test_individual_placeholder_is_dropped_when_front_page_has_no_name(monkeypatch: pytest.MonkeyPatch):
+    """个人申请 Google 只写「Individual」：扉页也认不出姓名时宁可留空，不把占位词写进交底书。"""
+
+    def scanned(_pdf: bytes) -> dict[str, str]:
+        raise ValueError("PDF 为扫描件，没有可抽取的文字层")
+
+    monkeypatch.setattr(patent_fetch, "pdf_text_summary", scanned)
+    monkeypatch.setattr(patent_fetch.ocr_service, "available", lambda: False)
+    page = PAGE_HTML.replace("复旦大学附属眼耳鼻喉科医院", "Individual")
+    async with _client(_page_then_pdf(page)) as client:
+        s = await patent_fetch.fetch_patent_summary("CN101656028A", client=client, sleep=Sleeps())
+    assert s.ok and s.applicant == ""
+
+
+async def test_foreign_english_applicant_is_kept(monkeypatch: pytest.MonkeyPatch):
+    """外国专利的英文申请人就是原文，不去扉页找。"""
+
+    def boom(_pdf: bytes) -> dict[str, str]:  # pragma: no cover
+        raise AssertionError("不该去读扉页")
+
+    monkeypatch.setattr(patent_fetch, "pdf_text_summary", boom)
+    page = PAGE_HTML.replace("复旦大学附属眼耳鼻喉科医院", "Olympus Corporation")
+    async with _client(_page_then_pdf(page)) as client:
+        s = await patent_fetch.fetch_patent_summary("US2020123456A1", client=client, sleep=Sleeps())
+    assert s.ok and s.applicant == "Olympus Corporation"
