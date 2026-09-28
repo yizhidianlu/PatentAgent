@@ -23,9 +23,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import html as html_lib
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -50,6 +52,13 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+# Google Patents 被限流时（503 / 429）的退避间隔（秒）。
+# 实测：连续十来个请求之后整个 IP 会开始吃 503，隔几秒通常能恢复。
+RATE_LIMIT_STATUSES = (429, 503)
+RATE_LIMIT_RETRY_DELAYS = (4.0, 10.0)
+
+SleepFn = Callable[[float], Awaitable[None]]
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +209,12 @@ def extract_pdf_url(html: str) -> str | None:
     return None
 
 
+def _status_error(code: int) -> str:
+    if code in RATE_LIMIT_STATUSES:
+        return f"HTTP {code}（Google 限流，稍后重试通常可恢复）"
+    return f"HTTP {code}"
+
+
 def looks_like_pdf(payload: bytes | None) -> bool:
     """字节流是否为 PDF（防把 WAF 拦截页当成 PDF 存下来）。"""
     return bool(payload) and payload[:5] == b"%PDF-"
@@ -207,6 +222,27 @@ def looks_like_pdf(payload: bytes | None) -> bool:
 
 async def _get(client: httpx.AsyncClient, url: str) -> httpx.Response:
     return await client.get(url, headers={"User-Agent": USER_AGENT})
+
+
+async def _get_page(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    retry_delays: tuple[float, ...] = RATE_LIMIT_RETRY_DELAYS,
+    sleep: SleepFn = asyncio.sleep,
+) -> httpx.Response:
+    """GET 一个 Google Patents 页面；遇到限流（503/429）按间隔退避重试。
+
+    限流不是「这篇专利取不到」，是「这一刻请求太密了」——不重试就会把一篇完全能取到的
+    专利报成失败。重试次数有限，退避之后仍被限流就把最后一次响应交回调用方如实报告。
+    """
+    resp = await _get(client, url)
+    for delay in retry_delays:
+        if resp.status_code not in RATE_LIMIT_STATUSES:
+            break
+        await sleep(delay)
+        resp = await _get(client, url)
+    return resp
 
 
 async def _download_pdf(client: httpx.AsyncClient, url: str) -> tuple[bytes | None, str]:
@@ -260,13 +296,15 @@ async def fetch_patent_pdf(
                 return result
 
         # ② Google Patents 详情页 → 解析直链 → 下载
-        for url in page_urls(pub):
+        for i, url in enumerate(page_urls(pub)):
             html = ""
             try:
-                resp = await _get(client, url)
+                # 只在第一个页面上退避重试：限流是全站的，换语言版本不会绕过它；
+                # 而真正的 404 不该多等
+                resp = await (_get_page(client, url) if i == 0 else _get(client, url))
                 if resp.status_code != 200:
                     result.attempts.append(
-                        FetchAttempt("google_patents_page", url, False, f"HTTP {resp.status_code}")
+                        FetchAttempt("google_patents_page", url, False, _status_error(resp.status_code))
                     )
                     continue
                 html = resp.text
@@ -334,6 +372,181 @@ async def fetch_patent_pdf(
     failed = [a for a in result.attempts if not a.ok and a.error]
     result.error = "；".join(f"{a.source_id}：{a.error}" for a in failed[-3:]) or "全部取证源均未取得 PDF"
     return result
+
+
+# ---------------------------------------------------------------------------
+# 摘要补全（查新条目只有标题和链接时）
+# ---------------------------------------------------------------------------
+#
+# 手工补录的在先文献通常只有公开号、标题和一个链接。早先平台不去取内容，消化改写只能
+# 「仅据标题保守概括」——而用户补录的往往恰恰是最相关的那几篇（他们是专门去 Google 上
+# 找来的），交底书 1.1 里最该认真比对的条目反而只有一句推测。
+#
+# 取法按可靠性排：
+# 1. Google Patents 详情页：摘要、申请人、公开日都在 meta 里；**老专利的 PDF 是扫描件，
+#    没有文字层，这里是唯一的文字来源**（Google 自己做过识别）；
+# 2. 全文 PDF 的文字层：详情页被限流或没有摘要时，从扉页 (57) 摘要里取。
+
+
+@dataclass
+class PatentSummary:
+    """一篇专利的著录摘要（补全查新条目用）。"""
+
+    pub_no: str
+    ok: bool = False
+    title: str = ""
+    applicant: str = ""
+    pub_date: str = ""
+    abstract: str = ""
+    source: str = ""        # google_patents_page | pdf_text
+    error: str = ""
+    rate_limited: bool = False   # 详情页退避之后仍被限流（调用方据此别再逐条苦等）
+
+
+_PUB_IN_URL_RE = re.compile(r"(CN\d{7,13}[A-Z]\d?)", re.IGNORECASE)
+_DATE_RE = re.compile(r"\d{4}[-.]\d{2}[-.]\d{2}")
+
+
+def pub_no_from_url(url: str | None) -> str:
+    """从链接里认出公开号（…/patent/CN101656028A/zh、…/CN101656028A.pdf）。"""
+    m = _PUB_IN_URL_RE.search(str(url or ""))
+    return normalize_pub_no(m.group(1)) if m else ""
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", html_lib.unescape(text or "")).strip()
+
+
+def _meta(html: str, name: str, **attrs: str) -> list[str]:
+    """取 <meta name=…> 的 content（属性顺序不限；可再按其它属性过滤，如 scheme="assignee"）。"""
+    out: list[str] = []
+    for tag in re.findall(r"<meta\b[^>]*>", html or "", re.IGNORECASE):
+        if not re.search(rf'\bname="{re.escape(name)}"', tag):
+            continue
+        if any(not re.search(rf'\b{re.escape(k)}="{re.escape(v)}"', tag) for k, v in attrs.items()):
+            continue
+        m = re.search(r'\bcontent="([^"]*)"', tag)
+        if m and _clean(m.group(1)):
+            out.append(_clean(m.group(1)))
+    return out
+
+
+def _itemprop(html: str, prop: str) -> list[str]:
+    return [
+        _clean(m.group(1))
+        for m in re.finditer(rf'<[^>]*\bitemprop="{re.escape(prop)}"[^>]*>([^<]+)<', html or "")
+        if _clean(m.group(1))
+    ]
+
+
+def parse_summary_page(html: str) -> dict[str, str]:
+    """Google Patents 详情页 → {title, abstract, applicant, pub_date, pdf_url}（取不到的为空串）。"""
+    abstract = (_meta(html, "DC.description") or _meta(html, "description") or [""])[0]
+    if not abstract:
+        m = re.search(r'<section[^>]*itemprop="abstract".*?</section>', html or "", re.DOTALL)
+        if m:
+            abstract = re.sub(r"^(Abstract|摘要)\s*", "", _clean(re.sub(r"<[^>]+>", " ", m.group(0))))
+    applicant = (
+        _meta(html, "DC.contributor", scheme="assignee")
+        or _itemprop(html, "assigneeOriginal")
+        or [""]
+    )[0]
+    dates = _itemprop(html, "publicationDate") or _meta(html, "citation_publication_date")
+    pub_date = next((d for d in dates if _DATE_RE.search(d)), "")
+    return {
+        "title": (_meta(html, "DC.title") or [""])[0],
+        "abstract": abstract,
+        "applicant": applicant,
+        "pub_date": pub_date,
+        "pdf_url": extract_pdf_url(html) or "",
+    }
+
+
+def pdf_text_summary(pdf: bytes) -> dict[str, str]:
+    """全文 PDF 文字层 → 扉页著录项（摘要 / 申请人 / 名称）。
+
+    扫描件（多见于十几年前的公开文本）没有文字层，抛 ValueError 说清原因，而不是返回空摘要。
+    """
+    import fitz  # PyMuPDF；延迟导入，只有真走到 PDF 兜底时才加载
+
+    with fitz.open(stream=pdf, filetype="pdf") as doc:
+        text = "\n".join(page.get_text() for page in doc)
+    if len(text.strip()) < 50:
+        raise ValueError("PDF 为扫描件，没有可抽取的文字层")
+    biblio = parse_patent_md(text).biblio
+    date = biblio.get("公开日", "")
+    return {
+        "title": biblio.get("名称", ""),
+        "abstract": re.sub(r"\s+", "", biblio.get("摘要", "")),   # 版面换行会把中文切出空格
+        "applicant": re.sub(r"\s*地址.*$", "", biblio.get("申请人", "")).strip(),
+        "pub_date": _DATE_RE.search(date).group(0) if _DATE_RE.search(date) else "",
+    }
+
+
+async def fetch_patent_summary(
+    pub_no: str | None,
+    *,
+    pdf_url: str | None = None,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = FETCH_TIMEOUT,
+    retry_delays: tuple[float, ...] = RATE_LIMIT_RETRY_DELAYS,
+    sleep: SleepFn = asyncio.sleep,
+) -> PatentSummary:
+    """按公开号取摘要等著录项。**任何失败都不抛异常**，原因写进 `error`。"""
+    pub = normalize_pub_no(pub_no) or pub_no_from_url(pdf_url)
+    out = PatentSummary(pub_no=pub)
+    errors: list[str] = []
+    candidate_pdf = str(pdf_url or "").strip() or None
+
+    owns_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    try:
+        # ① 详情页
+        if pub:
+            url = page_urls(pub)[0]
+            try:
+                resp = await _get_page(client, url, retry_delays=retry_delays, sleep=sleep)
+                if resp.status_code == 200:
+                    info = parse_summary_page(resp.text)
+                    candidate_pdf = candidate_pdf or info["pdf_url"] or None
+                    if info["abstract"]:
+                        out.ok, out.source = True, "google_patents_page"
+                        out.title, out.abstract = info["title"], info["abstract"]
+                        out.applicant, out.pub_date = info["applicant"], info["pub_date"]
+                        return out
+                    errors.append("Google Patents 详情页没有摘要")
+                else:
+                    errors.append(f"Google Patents 详情页 {_status_error(resp.status_code)}")
+                    out.rate_limited = resp.status_code in RATE_LIMIT_STATUSES
+            except Exception as exc:  # noqa: BLE001 —— 补全失败不抛
+                errors.append(f"Google Patents 详情页 {type(exc).__name__}: {exc}")
+
+        # ② PDF 文字层
+        if candidate_pdf:
+            payload, error = await _download_pdf(client, candidate_pdf)
+            if payload is None:
+                errors.append(f"全文 PDF {error}")
+            else:
+                try:
+                    info = pdf_text_summary(payload)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"全文 PDF：{exc}")
+                else:
+                    if info["abstract"]:
+                        out.ok, out.source = True, "pdf_text"
+                        out.title, out.abstract = info["title"], info["abstract"]
+                        out.applicant, out.pub_date = info["applicant"], info["pub_date"]
+                        return out
+                    errors.append("全文 PDF 扉页未解析出摘要")
+        elif not pub:
+            errors.append("没有公开号，也没有全文 PDF 链接")
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    out.error = "；".join(errors) or "未取得摘要"
+    return out
 
 
 # ---------------------------------------------------------------------------

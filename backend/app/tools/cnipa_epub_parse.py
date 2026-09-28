@@ -24,6 +24,8 @@ class EpubSearchHit:
     pub_number: str | None = None
     link: str | None = None
     abstract: str | None = None
+    applicant: str | None = None
+    pub_date: str | None = None     # YYYY-MM-DD（申请公布日 / 授权公告日）
 
 
 def _html_fragment_to_plain(html_snippet: str) -> str:
@@ -36,6 +38,14 @@ def _html_fragment_to_plain(html_snippet: str) -> str:
     return t
 
 
+# 站点脚本把摘要 200 字以后折进隐藏的 span.alltxt，并在断点插一个「...」和一个「全部」链接。
+# 不去掉这两样，摘要中间会凭空多出「 ... 」，还把断点处的词从中间劈开（「隔 ... 板四」）。
+_FOLD_MARKERS = (
+    re.compile(r"<i[^>]*class=[\"']point[\"'][^>]*>.*?</i>", re.IGNORECASE | re.DOTALL),
+    re.compile(r"<a[^>]*j-open-all(?:txt|info)[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL),
+)
+
+
 def _extract_abstract_from_item_html(item_html: str) -> str | None:
     """从单条 ``div.item`` 内 ``dt`` 摘要对应的 ``dd`` 中抽取全文（含折叠 span）。"""
     m = re.search(
@@ -45,8 +55,34 @@ def _extract_abstract_from_item_html(item_html: str) -> str | None:
     )
     if not m:
         return None
-    plain = _html_fragment_to_plain(m.group(1))
+    frag = m.group(1)
+    for marker in _FOLD_MARKERS:
+        frag = marker.sub("", frag)
+    # 折叠的 span 与可见部分本是一段连续文字：去标签时不能插空格
+    frag = re.sub(r"</?span[^>]*>", "", frag, flags=re.IGNORECASE)
+    plain = _html_fragment_to_plain(frag)
     return plain if len(plain) >= 4 else None
+
+
+def _extract_dd(item_html: str, *labels: str) -> str | None:
+    """取 ``<dt>标签：</dt><dd>值</dd>`` 的值（多个候选标签取第一个出现的）。"""
+    m = re.search(
+        r"<dt[^>]*>\s*(?:" + "|".join(map(re.escape, labels)) + r")\s*[：:]\s*</dt>\s*<dd[^>]*>(.*?)</dd>",
+        item_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return None
+    frag = m.group(1)
+    for marker in _FOLD_MARKERS:        # 多个申请人时后几个折在「全部」后面
+        frag = marker.sub("", frag)
+    plain = _html_fragment_to_plain(frag)
+    return plain or None
+
+
+def _normalize_date(raw: str | None) -> str | None:
+    m = re.search(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})", raw or "")
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else None
 
 
 def _abs_url(href: str) -> str:
@@ -167,6 +203,8 @@ def _parse_overview_card_layout(html: str) -> list[EpubSearchHit]:
             if m_pub and not pub_number:
                 pub_number = m_pub.group(1).strip()
         abstract = _extract_abstract_from_item_html(item_html)
+        applicant = _extract_dd(item_html, "申请人", "专利权人")
+        pub_date = _normalize_date(_extract_dd(item_html, "申请公布日", "授权公告日", "公告日"))
         if not title and not pub_number and not link:
             continue
         raw = "|".join(
@@ -179,6 +217,8 @@ def _parse_overview_card_layout(html: str) -> list[EpubSearchHit]:
                 pub_number=pub_number,
                 link=link,
                 abstract=abstract,
+                applicant=applicant,
+                pub_date=pub_date,
             )
         )
     seen: set[str] = set()

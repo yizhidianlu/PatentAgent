@@ -229,3 +229,16 @@ def _no_real_cnipa_search(monkeypatch: pytest.MonkeyPatch) -> None:
         raise OSError("测试中禁止真实启动国知局检索脚本（请在用例里替换 cnipa._stream_script）")
 
     monkeypatch.setattr(cnipa, "spawn_tool", _refuse)
+
+    # 同理：查新条目缺摘要时会去 Google Patents 补全。用例里的命中大多不带摘要，
+    # 不拦的话每跑一遍流水线用例就对 Google 发一串真实请求（它对密集请求会整站回 503）。
+    import httpx
+
+    def _offline_client() -> httpx.AsyncClient:
+        def refuse(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("测试中禁止访问外网（Google Patents）", request=request)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(refuse))
+
+    monkeypatch.setattr(cnipa, "_enrich_client", _offline_client)
+    monkeypatch.setattr(cnipa, "ENRICH_SPACING_SEC", 0.0)

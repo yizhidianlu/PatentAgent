@@ -372,3 +372,40 @@ async def test_supplementary_search_reports_searched_terms(monkeypatch: pytest.M
     report = await iterate_pipeline._supplementary_search(Ctx(), ["灰度节点集合"])
     assert report["searched_terms"] == ["灰度节点集合"]
     assert report["unsearched_terms"] == ["批量作业调度"]
+
+
+async def test_missing_abstracts_are_filled_before_digest(gate, monkeypatch: pytest.MonkeyPatch):
+    """手工补录只有标题和链接：消化改写之前先补摘要，而不是「仅据标题保守概括」。"""
+    make_ctx, _calls, script = gate
+    script += [_fails("blocked", searched=[], pending=["甲", "乙", "丙"])]
+    ctx = make_ctx(
+        "门控-补全摘要",
+        [
+            {"action": "manual", "hits": [
+                {"url": "https://patentimages.storage.googleapis.com/26/5e/56/x/CN101656028A.pdf",
+                 "pub_no": "CN101656028A", "title": "纤维支气管镜训练箱"},
+                {"url": "https://patents.google.com/patent/CN9A/zh", "pub_no": "CN9A", "title": "取不到的"},
+            ]},
+            {},
+        ],
+    )
+
+    async def fake_enrich(case_id, hits, *, on_progress=None, spacing=None):
+        out = [h.model_copy(update={"abstract": "一种纤维支气管镜训练箱……"}) if h.pub_no == "CN101656028A" else h
+               for h in hits]
+        return out, ["CN9A：Google Patents 详情页 HTTP 503（Google 限流）"]
+
+    seen: list[dict[str, Any]] = []
+
+    async def capture_digest(_ctx: Any, hits: Any):
+        seen.extend({"pub": h.pub_no, "abstract": h.abstract} for h in hits)
+        return [{"url": h.url, "pub_number": h.pub_no, "title": h.title} for h in hits]
+
+    monkeypatch.setattr(cnipa, "enrich_hits", fake_enrich)
+    monkeypatch.setattr(disclosure, "_digest_hits", capture_digest)
+    await disclosure.prior_art_search(ctx)
+
+    by_pub = {s["pub"]: s["abstract"] for s in seen}
+    assert by_pub["CN101656028A"] == "一种纤维支气管镜训练箱……"       # 消化改写拿到的是补全后的
+    assert any("已补全 1 条" in m for m in ctx.logs)
+    assert any("未能补全摘要" in m and "CN9A" in m for m in ctx.logs)  # 补不上的如实说

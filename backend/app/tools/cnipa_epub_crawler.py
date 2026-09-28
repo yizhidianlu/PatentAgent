@@ -77,7 +77,9 @@ from browser import launch_chromium
 from stdio_utf8 import ensure_utf8_stdio
 from patent_type import (
     TYPE_ALL,
+    TYPE_LABEL_ZH,
     epub_checkbox_states,
+    epub_query_types,
     normalize_patent_type,
 )
 
@@ -86,8 +88,11 @@ EPUB_BASE = "http://epub.cnipa.gov.cn/"
 # 国知局 /Dxb/IndexQuery 结果页 <title>；改版时须同步单测与 _RESULT_PAGE_READY_JS
 EPUB_TITLE_RESULT = "专利查询结果展示"
 EPUB_TITLE_NO_HIT = "无查询结果"
-# 在浏览器内判断结果页可解析：title + #result DOM（列表或零结果文案）
+# 在浏览器内判断结果页可解析：文档解析完 + title + #result DOM（列表或零结果文案）。
+# 「解析完」不能省：导航只等到 commit，结果页还在流式到达时第一个 div.item 就已出现，
+# 那一刻读出的是半截页面——真站点上一页 3 条只解析到 1 条（2026-09-28 取证）。
 _RESULT_PAGE_READY_JS = """(titles) => {
+    if (document.readyState === "loading") return false;
     const t = document.title.trim();
     if (t === titles.noHit) return true;
     if (t !== titles.result) return false;
@@ -126,6 +131,11 @@ TERM_STEP_CAP_MS = 45_000
 # 第 3 个词起开始卡——与此前「第 4~5 个词后耗时陡增」的观察一致，像是触发了限频。
 # 对政府站点放慢一点本来也是应有的礼貌。
 TERM_PACING_SEC = 4.0
+# 同一个词逐类检索（发明 / 实用新型……）时相邻两次提交的间隔。结果页一次只显示一类，
+# 多类范围只能逐类各提交一次；同一页面上的连续提交，间隔比换词短一些。
+TYPE_PACING_SEC = 2.0
+# 同一个词的下一类至少要剩这么多秒才提交（结果页直接提交通常 1~3s）
+TYPE_MIN_SEC = 8.0
 # 等待防护挑战期间，每隔这么多秒报一次「还在等」
 WAIT_BEAT_SEC = 15.0
 
@@ -346,6 +356,8 @@ class EpubRun:
 
     rows: list[tuple[str, str, list[EpubSearchHit]]] = field(default_factory=list)  # (词, html, 命中)
     failed: list[tuple[str, str]] = field(default_factory=list)                     # (词, 原因)
+    # 词做完了、但其中某一类没检成（例：发明检完，实用新型那次提交失败）：{词: {类型: 原因}}
+    partial: dict[str, dict[str, str]] = field(default_factory=dict)
     skipped: list[str] = field(default_factory=list)                                # 预算用尽未开始
     stop: str | None = None      # None=全部跑完 | "deadline"=预算用尽 | "blocked"=被拦截/不可达
     error: str | None = None     # stop 的原因说明
@@ -353,6 +365,51 @@ class EpubRun:
     @property
     def searched(self) -> list[str]:
         return [term for term, _html, _hits in self.rows]
+
+
+def _search_term(
+    page: Page, term: str, query_types: tuple[str, ...], *, deadline: float | None
+) -> tuple[str, list[EpubSearchHit], dict[str, int], dict[str, str]]:
+    """一个词按类型逐类提交，合并去重。返回 ``(最后一页 html, 命中, {类型: 条数}, {类型: 失败原因})``。
+
+    结果页按类型分页签、一次只显示一类，所以「发明 + 实用新型」必须各提交一次。
+    某一类失败就不再试后面的类：失败多半意味着页面被带偏或站点在限流，接着试只会把
+    这个词拖成几倍的耗时。**一类都没检成才算这个词失败**（抛出，交给外层计入连续失败）。
+    """
+    html = ""
+    merged: list[EpubSearchHit] = []
+    seen: set[str] = set()
+    counts: dict[str, int] = {}
+    errors: dict[str, str] = {}
+    for j, ptype in enumerate(query_types):
+        if j > 0:
+            if deadline is not None and deadline - time.monotonic() < TYPE_MIN_SEC:
+                errors[ptype] = "时间预算用尽，未检索"
+                break
+            page.wait_for_timeout(int(TYPE_PACING_SEC * 1000))
+        try:
+            if not _can_search_here(page):
+                # 上一次提交把页面带偏了：回首页（通常已有挑战 cookie，很快）
+                wait_for_epub_home_ready(page, deadline=deadline)
+            submit_index_search(page, term, patent_type=ptype, deadline=deadline, cap_ms=TERM_STEP_CAP_MS)
+            html = _safe_page_content(page)
+            hits = parse_search_result_html(html)
+        except Exception as exc:  # noqa: BLE001 —— 记下是哪一类，由调用方决定整词成败
+            errors[ptype] = _short(exc)
+            break
+        counts[ptype] = len(hits)
+        for h in hits:
+            key = h.pub_number or h.link or (h.title or "")[:120]
+            if key not in seen:
+                seen.add(key)
+                merged.append(h)
+    if not counts:
+        raise RuntimeError(next(iter(errors.values()), "未检索"))
+    # 停下之后没轮到的类也要如实记下
+    for ptype in query_types:
+        if ptype not in counts and ptype not in errors:
+            errors[ptype] = "未检索"
+    return html, merged, counts, errors
 
 
 def run_epub_session(
@@ -373,6 +430,7 @@ def run_epub_session(
     if not terms:
         return run
     emit = on_event or (lambda _kind, _data: None)
+    query_types = epub_query_types(patent_type)
     pw_gen = playwright_factory or sync_playwright
     with pw_gen() as p:
         browser, label = _launch_browser_labeled(p)
@@ -402,14 +460,7 @@ def run_epub_session(
                     page.wait_for_timeout(int(TERM_PACING_SEC * 1000))
                 started = time.monotonic()
                 try:
-                    if not _can_search_here(page):
-                        # 上一个词失败把页面带偏了：回首页（通常已有挑战 cookie，很快）
-                        wait_for_epub_home_ready(page, deadline=deadline)
-                    submit_index_search(
-                        page, term, patent_type=patent_type, deadline=deadline, cap_ms=TERM_STEP_CAP_MS
-                    )
-                    html = _safe_page_content(page)
-                    hits = parse_search_result_html(html)
+                    html, hits, counts, type_errors = _search_term(page, term, query_types, deadline=deadline)
                 except Exception as exc:  # noqa: BLE001 —— 单词失败不连累其它词
                     fails_in_row += 1
                     reason = _short(exc)
@@ -423,9 +474,19 @@ def run_epub_session(
                     continue
                 fails_in_row = 0
                 run.rows.append((term, html, hits))
+                if type_errors:
+                    run.partial[term] = type_errors
                 emit(
                     "term",
-                    {"i": i + 1, "n": total, "term": term, "sec": round(time.monotonic() - started, 1), "hits": hits},
+                    {
+                        "i": i + 1,
+                        "n": total,
+                        "term": term,
+                        "sec": round(time.monotonic() - started, 1),
+                        "hits": hits,
+                        "types": {TYPE_LABEL_ZH.get(t, t): n for t, n in counts.items()},
+                        "type_errors": {TYPE_LABEL_ZH.get(t, t): e for t, e in type_errors.items()},
+                    },
                 )
             return run
         finally:

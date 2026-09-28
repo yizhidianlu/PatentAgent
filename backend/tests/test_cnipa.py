@@ -206,6 +206,47 @@ def test_normalize_type_maps_aliases():
     assert cnipa.normalize_type("胡说八道") == "all"
 
 
+def test_prior_art_scope_covers_both_technical_types():
+    """现有技术不分专利类型：实用新型案件也要检发明公布（反之亦然）；外观设计仍只检外观。
+
+    2026-09-28 真实案件：实用新型案件只勾了「实用新型」，用户自己在 Google 上找到的两篇
+    最相关文献（CN101656028A、CN114186982A）都是发明公布——平台从一开始就不可能检到。
+    """
+    assert cnipa.prior_art_scope("utility_model") == "invention_utility_model"
+    assert cnipa.prior_art_scope("invention") == "invention_utility_model"
+    assert cnipa.prior_art_scope(None) == "invention_utility_model"
+    assert cnipa.prior_art_scope("design") == "design"
+    assert cnipa.normalize_type("invention_utility_model") == "invention_utility_model"
+
+
+def test_rank_hits_puts_title_matches_first_and_is_stable():
+    hits = [
+        {"title": "某公司", "abstract": "", "url": "u1"},                         # 只在别的字段撞上
+        {"title": "训练箱", "abstract": "", "url": "u2"},
+        {"title": "x", "abstract": "一种支气管镜训练箱", "url": "u3"},
+        {"title": "支气管镜训练箱", "abstract": "支气管镜", "url": "u4"},
+        {"title": "某医院", "abstract": "", "url": "u5"},
+    ]
+    ranked = cnipa.rank_hits(hits, ["训练箱", "支气管镜"])
+    # u4 标题两词 4 分；u2 标题一词、u3 摘要两词都是 2 分，同分保持原顺序；其余 0 分
+    assert [h["url"] for h in ranked] == ["u4", "u2", "u3", "u1", "u5"]
+
+
+def test_progress_message_shows_per_type_counts():
+    line = _line(
+        "EPUB_TERM_JSON:",
+        {"i": 2, "n": 7, "term": "软镜训练", "sec": 5.2, "hits": [{}, {}, {}],
+         "types": {"发明": 2, "实用新型": 1}, "type_errors": {}},
+    )
+    assert cnipa._progress_message(line) == "已完成 2/7：「软镜训练」发明 2 条、实用新型 1 条（5.2s）"
+    gap = _line(
+        "EPUB_TERM_JSON:",
+        {"i": 1, "n": 7, "term": "训练箱", "sec": 3.0, "hits": [{}],
+         "types": {"发明": 1}, "type_errors": {"实用新型": "Timeout"}},
+    )
+    assert cnipa._progress_message(gap) == "已完成 1/7：「训练箱」发明 1 条（3.0s）；实用新型未检成"
+
+
 def test_parse_hits_stdout_protocol():
     """只认 EPUB_HITS_JSON 那一行；缺行或非法 JSON 返回 None。"""
     stdout = "EPUB_NOTE: html_bytes=1024 disk=0\n" + _hits_stdout(HITS_PAYLOAD)
@@ -290,6 +331,57 @@ async def test_search_parses_and_persists(client: TestClient, monkeypatch: pytes
     assert queries[0].hit_count == 2
     hits = await cnipa.list_hits(case_id)
     assert len(hits) == 2
+
+
+async def test_search_ranks_and_caps_hits(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """逐类检索后命中可达四五十条：按与检索词的重合度排序，只入库前 MAX_SEARCH_HITS 条。"""
+    case_id = _new_case(client, "查新-上限")
+    noise = [
+        {"title": f"某某科技有限公司的无关方案{i}", "pub_number": f"CN1{i:08d}A",
+         "link": f"http://epub.cnipa.gov.cn/patent/CN1{i:08d}A", "abstract": "无关"}
+        for i in range(cnipa.MAX_SEARCH_HITS + 5)
+    ]
+    relevant = {"title": "一种软镜训练箱", "pub_number": "CN999999999U",
+                "link": "http://epub.cnipa.gov.cn/patent/CN999999999U", "abstract": "软镜训练"}
+    _patch_stream(monkeypatch, FakeStream(_success(["软镜训练", "训练箱"], [*noise, relevant])))
+    stages: list[tuple[str, str]] = []
+
+    async def on_progress(stage: str, msg: str) -> None:
+        stages.append((stage, msg))
+
+    result = await cnipa.search(case_id, ["软镜训练", "训练箱"], "invention_utility_model", on_progress=on_progress)
+    assert len(result.hits) == cnipa.MAX_SEARCH_HITS
+    assert result.hits[0].pub_no == "CN999999999U"          # 最相关的排到最前，不会被上限截掉
+    parsed = next(m for st, m in stages if st == "parsed")
+    assert f"解析到 {len(noise) + 1} 条命中" in parsed and f"保留前 {cnipa.MAX_SEARCH_HITS} 条" in parsed
+    starting = next(m for st, m in stages if st == "start")
+    assert "范围：发明+实用新型" in starting
+
+
+async def test_search_type_gap_is_reported_and_not_cached(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """某个词的实用新型那次提交没成：结果照收，缺口写进完成提示；这场不进缓存（下次要重检）。"""
+    case_id = _new_case(client, "查新-类型缺口")
+    lines = [
+        _home_ready(),
+        _line("EPUB_TERM_JSON:", {"i": 1, "n": 2, "term": "缺口甲", "sec": 2.0, "hits": HITS_PAYLOAD[:1],
+                                  "types": {"发明": 1}, "type_errors": {"实用新型": "Timeout 45000ms"}}),
+        _line("EPUB_TERM_JSON:", {"i": 2, "n": 2, "term": "缺口乙", "sec": 2.0, "hits": [],
+                                  "types": {"发明": 0, "实用新型": 0}, "type_errors": {}}),
+        _summary(["缺口甲", "缺口乙"]),
+        _hits_line(HITS_PAYLOAD[:1]),
+    ]
+    fake = _patch_stream(monkeypatch, FakeStream(lines))
+    stages: list[tuple[str, str]] = []
+
+    async def on_progress(stage: str, msg: str) -> None:
+        stages.append((stage, msg))
+
+    result = await cnipa.search(case_id, ["缺口甲", "缺口乙"], "invention_utility_model", on_progress=on_progress)
+    assert result.status == "done" and len(result.hits) == 1
+    done = next(m for st, m in stages if st == "done")
+    assert "「缺口甲」的实用新型未检成" in done
+    await cnipa.search(case_id, ["缺口甲", "缺口乙"], "invention_utility_model")
+    assert len(fake.calls) == 2                               # 有缺口的一场不当完整结果复用
 
 
 async def test_search_reuses_cache_in_same_case(client: TestClient, monkeypatch: pytest.MonkeyPatch):
@@ -755,6 +847,17 @@ def test_api_search_flow(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     assert patched.status_code == 200
     assert patched.json()["selected"] is False
     assert client.get(f"{API}/cases/{case_id}/search/hits?selected_only=true").json()["count"] == 1
+
+
+def test_api_search_defaults_to_prior_art_scope(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """不指定类型时按查新口径检发明 + 实用新型，而不是只检案件自己那一类。"""
+    case_id = _new_case(client, "查新-API缺省范围")
+    fake = _patch_stream(monkeypatch, FakeStream(_success(["范围词甲", "范围词乙"], HITS_PAYLOAD)))
+    resp = client.post(f"{API}/cases/{case_id}/search/cnipa", json={"terms": ["范围词甲", "范围词乙"]})
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["patent_type"] == "invention_utility_model"
+    _wait_for_search(client, case_id)
+    assert fake.calls[0]["args"][:2] == ["--type", "invention_utility_model"]
 
 
 def test_api_search_failure_is_reported_not_500(client: TestClient, monkeypatch: pytest.MonkeyPatch):

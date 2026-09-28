@@ -78,7 +78,12 @@ async def start_cnipa_search(
     terms = cnipa.normalize_terms(body.terms)
     if not terms:
         raise HTTPException(status_code=422, detail="检索词为空")
-    patent_type = cnipa.normalize_type(body.patent_type or row["patent_type"])
+    # 没指定范围时按查新口径（发明+实用新型 / 外观设计），不是只查案件自己那一类
+    patent_type = (
+        cnipa.normalize_type(body.patent_type)
+        if body.patent_type
+        else cnipa.prior_art_scope(row["patent_type"])
+    )
 
     try:
         cnipa.start_background_search(

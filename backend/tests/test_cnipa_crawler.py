@@ -4,6 +4,7 @@
 
 - 首页：防护挑战通过后才出现 #searchStr；类型框 id 为 #fmgb / #fmsq / #xxsq / #wgsq
 - 结果页（/Dxb/IndexQuery）：**自带同一个检索表单**，类型框 id 却是 #indexSearchModel_fmgb 等
+- 结果页**按类型分页签、一次只显示一类**：勾了多类提交一次，只拿得到第一类
 
 这些行为都是 2026-09-28 对真站点逐帧取证得到的；改版时先重新取证，再改这里。
 
@@ -12,6 +13,7 @@
 - 结果页上的类型过滤不会被静默丢掉（它的勾选框 id 与首页不同）；
 - 截止时刻到了就停，没做的词如实列为 skipped，做完的保留；
 - 单词失败不连累其它词；连续失败才判为被拦截；
+- 多类范围（发明 + 实用新型）逐类各提交一次；某一类没检成如实记下，不当整词失败；
 - 首页防护始终不过 ⇒ blocked；
 - UA 跟真实内核版本走，不带 HeadlessChrome。
 """
@@ -59,12 +61,20 @@ class FakeElement:
 class FakePage:
     """按真站点行为建模的页面。url ∈ blank / home / result / broken。"""
 
-    def __init__(self, *, home_ok: bool = True, fail_terms: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        home_ok: bool = True,
+        fail_terms: tuple[str, ...] = (),
+        fail_types: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         self.url = "blank"
         self.home_ok = home_ok
         self.fail_terms = set(fail_terms)
+        self.fail_types = set(fail_types)          # {(词, 勾选的类别框)}，例 ("甲", "xxsq")
         self.home_visits = 0
         self.submitted: list[str] = []
+        self.submitted_types: list[str] = []       # 每次提交时勾着的类别框（本页的 id，去前缀）
         self.checked: dict[str, bool] = {}
         self._search = ""
         self.waits: list[int] = []
@@ -102,9 +112,18 @@ class FakePage:
         else:
             self._submit()
 
+    def _boxes_on(self) -> str:
+        """当前页面上勾着的类别框（首页认 #fmgb，结果页认 #indexSearchModel_fmgb）。"""
+        prefix = "" if self.url == "home" else "indexSearchModel_"
+        return "+".join(b for b in HOME_BOXES if self.checked.get(prefix + b))
+
     def _submit(self) -> None:
+        boxes = self._boxes_on()
         self.submitted.append(self._search)
-        self.url = "broken" if self._search in self.fail_terms else "result"
+        self.submitted_types.append(boxes)
+        self._shown = boxes
+        broken = self._search in self.fail_terms or (self._search, boxes) in self.fail_types
+        self.url = "broken" if broken else "result"
 
     def wait_for_function(self, _js: str, **kw: Any) -> None:
         self.result_timeouts.append(int(kw.get("timeout") or 0))
@@ -112,7 +131,7 @@ class FakePage:
             raise TimeoutError("Timeout 120000ms exceeded.")
 
     def content(self) -> str:
-        return f"<html><body>{self._search}</body></html>"
+        return f"<html><body>{self._search}|{getattr(self, '_shown', '')}</body></html>"
 
 
 class FakeBrowser:
@@ -152,7 +171,7 @@ def fake_site(monkeypatch: pytest.MonkeyPatch):
 
 def test_second_term_onwards_reuses_result_page(fake_site):
     page, _browser, factory = fake_site()
-    run = crawler.run_epub_session(["甲", "乙", "丙"], playwright_factory=factory)
+    run = crawler.run_epub_session(["甲", "乙", "丙"], patent_type="invention", playwright_factory=factory)
     assert run.searched == ["甲", "乙", "丙"]
     assert run.stop is None and not run.failed and not run.skipped
     assert page.home_visits == 1, "只该过一次首页防护；每词回首页正是 7 个词要 248s 的原因"
@@ -173,6 +192,74 @@ def test_type_filter_is_applied_on_result_page(fake_site):
     assert page.checked["indexSearchModel_fmgb"] is True
     assert page.checked["indexSearchModel_xxsq"] is False
     assert page.checked["indexSearchModel_wgsq"] is False
+
+
+def test_prior_art_scope_submits_each_type_separately(fake_site):
+    """结果页一次只显示一类：发明 + 实用新型必须各提交一次，否则实用新型那一页签永远看不到。
+
+    早先勾两类提交一次，拿到的只是「发明公布」；`all` 实际上也只检了发明公布。
+    """
+    page, _browser, factory = fake_site()
+    events: list[dict[str, Any]] = []
+    run = crawler.run_epub_session(
+        ["甲", "乙"],
+        patent_type="invention_utility_model",
+        playwright_factory=factory,
+        on_event=lambda kind, d: events.append(d) if kind == "term" else None,
+    )
+    assert run.searched == ["甲", "乙"] and not run.partial
+    assert page.submitted == ["甲", "甲", "乙", "乙"]
+    assert page.submitted_types == ["fmgb+fmsq", "xxsq", "fmgb+fmsq", "xxsq"]
+    assert page.home_visits == 1
+    # 两类的命中合并进同一个词
+    assert len(run.rows[0][2]) == 2
+    assert events[0]["types"] == {"发明": 1, "实用新型": 1} and events[0]["type_errors"] == {}
+    # 同一个词两类之间也放慢一点
+    assert page.waits.count(int(crawler.TYPE_PACING_SEC * 1000)) == 2
+
+
+def test_all_types_really_means_all(fake_site):
+    page, _browser, factory = fake_site()
+    crawler.run_epub_session(["甲"], playwright_factory=factory)          # 缺省 all
+    assert page.submitted_types == ["fmgb+fmsq", "xxsq", "wgsq"]
+
+
+def test_one_type_failing_keeps_the_term(fake_site):
+    """实用新型那次提交失败：发明的结果保留，这个词算检过，缺口如实记下；下一个词照常。"""
+    page, _browser, factory = fake_site(fail_types=(("甲", "xxsq"),))
+    events: list[dict[str, Any]] = []
+    run = crawler.run_epub_session(
+        ["甲", "乙"],
+        patent_type="invention_utility_model",
+        playwright_factory=factory,
+        on_event=lambda kind, d: events.append(d) if kind == "term" else None,
+    )
+    assert run.searched == ["甲", "乙"] and not run.failed and run.stop is None
+    assert list(run.partial) == ["甲"] and "utility_model" in run.partial["甲"]
+    assert events[0]["types"] == {"发明": 1} and list(events[0]["type_errors"]) == ["实用新型"]
+    assert page.home_visits == 2                  # 失败把页面带偏，下一个词先回首页
+
+
+def test_first_type_failing_fails_the_term_without_trying_the_rest(fake_site):
+    """第一类就失败：不再接着试后面的类（站点多半在拦截，接着试只会把这个词拖成几倍耗时）。"""
+    page, _browser, factory = fake_site(fail_types=(("甲", "fmgb+fmsq"),))
+    run = crawler.run_epub_session(
+        ["甲", "乙"], patent_type="invention_utility_model", playwright_factory=factory
+    )
+    assert [t for t, _ in run.failed] == ["甲"] and run.searched == ["乙"]
+    assert page.submitted == ["甲", "乙", "乙"]
+
+
+def test_deadline_between_types_is_reported_not_overrun(fake_site, monkeypatch: pytest.MonkeyPatch):
+    import time
+
+    _page, _browser, factory = fake_site()
+    monkeypatch.setattr(crawler, "TYPE_MIN_SEC", 10_000.0)   # 第一类之后剩余时间一定不够
+    run = crawler.run_epub_session(
+        ["甲"], patent_type="invention_utility_model", deadline=time.monotonic() + 60, playwright_factory=factory
+    )
+    assert run.searched == ["甲"]
+    assert run.partial == {"甲": {"utility_model": "时间预算用尽，未检索"}}
 
 
 def test_deadline_stops_before_next_term_and_keeps_done(fake_site, monkeypatch: pytest.MonkeyPatch):
@@ -249,6 +336,14 @@ def test_navigation_race_during_challenge_is_not_blocked(fake_site):
     run = crawler.run_epub_session(["甲"], playwright_factory=factory)
     assert raised["n"] == 2
     assert run.stop is None and run.searched == ["甲"]
+
+
+def test_result_page_ready_waits_for_the_whole_document():
+    """导航只等到 commit：结果页还在流式到达时第一个 div.item 就已出现，那一刻读到的是半截页面。
+
+    真站点上一页 3 条只解析到 1 条（2026-09-28 取证）。就绪条件必须包含「文档已解析完」。
+    """
+    assert 'document.readyState === "loading"' in crawler._RESULT_PAGE_READY_JS
 
 
 def test_user_agent_follows_real_browser_version(fake_site):
@@ -340,3 +435,30 @@ def test_cli_blocked_exits_3_without_result_line(monkeypatch: pytest.MonkeyPatch
     assert _lines(captured.out, "EPUB_SUMMARY_JSON:")[0]["stop"] == "blocked"
     assert not _lines(captured.out, "EPUB_HITS_JSON:")
     assert "首页未出现检索框" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# 结果页解析（按 2026-09-28 真站点「公布模式」结果页裁剪）
+# ---------------------------------------------------------------------------
+
+_ITEM = """<div class="item"> <div class="title"><h1 class="title">[实用新型] 一种纤维支气管镜训练箱</h1></div>
+<div class="info"> <dl><dt>授权公告号：</dt><dd>CN205451563U</dd></dl> <dl><dt>授权公告日：</dt><dd>2016.08.10</dd></dl>
+<dl> <dt> 申请人： </dt> <dd> 奥林巴斯医疗株式会社; <a href="javascript:;" class="open j-open-allinfo">全部</a>
+<div class="allinfo"> 国立研究开发法人国立癌症研究中心</div> </dd> </dl> </div>
+<div class="intro"> <dl> <dt> 摘要： </dt> <dd class="chopping"><p>本实用新型公开了一种纤维支气管镜训练箱，隔<i class="point">...</i><span class="alltxt" style="display:none">板四与箱体的底板之间设置有十六孔分隔块。</span><a href="javascript:" class="open j-open-alltxt">全部</a></p></dd></dl></div>
+</div>"""
+
+
+def test_parse_joins_folded_abstract_without_ellipsis():
+    """站点把 200 字以后折进隐藏 span，并在断点插「...」和「全部」：摘要里不能留下这些。
+
+    早先解析出的摘要中间凭空多出「 ... 」，还把断点处的词劈开（「隔 ... 板四」）。
+    """
+    from cnipa_epub_parse import parse_search_result_html
+
+    html = f'<div id="result"><div class="overview-default">{_ITEM}</div></div>'
+    [hit] = parse_search_result_html(html)
+    assert hit.abstract == "本实用新型公开了一种纤维支气管镜训练箱，隔板四与箱体的底板之间设置有十六孔分隔块。"
+    assert hit.pub_number == "CN205451563U"
+    assert hit.pub_date == "2016-08-10"
+    assert hit.applicant == "奥林巴斯医疗株式会社; 国立研究开发法人国立癌症研究中心"   # 折起来的第二申请人也在

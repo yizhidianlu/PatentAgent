@@ -841,7 +841,10 @@ async def _supplementary_search(ctx: Ctx, new_terms: Sequence[str]) -> dict[str,
     result = await cnipa.search(
         ctx.case_id,
         blocks,
-        str(prior.get("type_param") or "invention"),
+        # 旧案件的 type_param 可能还是单一类型（utility_model 等）：一律换算成查新范围
+        cnipa.prior_art_scope(
+            str(prior.get("type_param") or (getattr(ctx, "case", None) or {}).get("patent_type") or "")
+        ),
         on_progress=progress,
         use_cache=False,
     )

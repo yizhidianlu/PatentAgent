@@ -1443,7 +1443,9 @@ async def _search_terms(ctx: Ctx) -> tuple[list[str], str, dict[str, Any]]:
         )
         problems = lint_search_blocks(plan.blocks)
     blocks = [str(b).strip() for b in plan.blocks if str(b).strip()]
-    type_param = str(plan.type_param or ptype)
+    # 检索范围由平台按案件类型定，不取模型填的 type_param：现有技术不分专利类型，
+    # 按案件类型只勾一类会把另一类的相关文献整片漏掉（见 cnipa.prior_art_scope）
+    type_param = cnipa.prior_art_scope(ptype)
     return blocks, type_param, {"repairs": repairs, "unresolved": problems, "rationale": plan.rationale}
 
 
@@ -1655,6 +1657,33 @@ def _selected_ids(answer: Mapping[str, Any]) -> set[str] | None:
     return None
 
 
+async def _enrich_for_digest(ctx: Ctx, hits: list[Any], progress: Any) -> list[Any]:
+    """消化改写之前，给缺摘要的条目补上摘要（手工补录的通常只有标题和链接）。
+
+    不补的话，消化改写只能「仅据标题保守概括」——而用户专门去 Google 上找来补录的，
+    往往正是与本案最相关的那几篇：1.1 里最该认真比对的条目反而只有一句推测。
+    """
+    missing = [h for h in hits if not str(getattr(h, "abstract", "") or "").strip()]
+    if not missing:
+        return hits
+    await ctx.emit("log", {"message": f"{len(missing)} 条在先文献缺摘要，正在从 Google Patents 补全…"})
+    enriched, problems = await cnipa.enrich_hits(ctx.case_id, hits, on_progress=progress)
+    filled = sum(1 for h in enriched if h.id in {m.id for m in missing} and str(h.abstract or "").strip())
+    if filled:
+        await ctx.emit("log", {"message": f"已补全 {filled} 条在先文献的摘要，将按摘要进行比对。"})
+    if problems:
+        await ctx.emit(
+            "log",
+            {
+                "message": (
+                    f"{len(problems)} 条未能补全摘要，1.1 中只能据标题概括：" + "；".join(problems)
+                    + "。可稍后重试，或在补录时把摘要一并粘贴进来。"
+                )
+            },
+        )
+    return enriched
+
+
 def _merge_terms(into: list[str], terms: Iterable[str]) -> None:
     for t in terms:
         if t and t not in into:
@@ -1848,6 +1877,7 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
     notes: list[dict[str, Any]] = []
     selected_count = 0
     if hits:
+        hits = await _enrich_for_digest(ctx, hits, progress)
         notes = await _digest_hits(ctx, hits)
         answer = _answer(
             await ctx.await_user(
@@ -1907,6 +1937,7 @@ async def prior_art_search(ctx: Ctx) -> dict[str, Any]:
             known = {str(n.get("url") or "") for n in notes}
             fresh = [h for h in added if str(h.url) not in known]
             if fresh:
+                fresh = await _enrich_for_digest(ctx, fresh, progress)
                 notes = notes + await _digest_hits(ctx, fresh)
                 manual = True
         selected_count = len(notes)

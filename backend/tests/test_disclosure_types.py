@@ -116,6 +116,10 @@ def _install_llm(monkeypatch: pytest.MonkeyPatch, fake: FakeLLM) -> FakeLLM:
     return fake
 
 
+# 每个案件查新时传给检索的范围：{case_id: [patent_type, ...]}
+_SEARCH_SCOPES: dict[str, list[str]] = {}
+
+
 def _install_failing_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """检索桩：恒定失败（本套用例统一走「跳过查新」分支，不编造检索结果）。"""
     import inspect as _inspect
@@ -124,6 +128,7 @@ def _install_failing_search(monkeypatch: pytest.MonkeyPatch) -> None:
     from app.services import cnipa
 
     async def fake_search(case_id: str, terms, patent_type: str = "invention", **kwargs):
+        _SEARCH_SCOPES.setdefault(case_id, []).append(patent_type)
         on_progress = kwargs.get("on_progress")
         if on_progress is not None:
             result = on_progress("failed", "浏览器不可用（测试桩）")
@@ -857,6 +862,8 @@ async def test_utility_pipeline_runs_to_deliver(
     )
 
     assert _case_row(case_id)["status"] == "completed", _failures(case_id)
+    # 现有技术不分专利类型：实用新型案件的查新同时检发明公布与实用新型
+    assert set(_SEARCH_SCOPES[case_id]) == {"invention_utility_model"}
     _um["case_id"] = case_id
     _um["state"] = _case_state(case_id)
     _um["calls"] = list(fake.calls)
@@ -1005,6 +1012,7 @@ async def test_design_pipeline_runs_to_deliver(
     )
 
     assert _case_row(case_id)["status"] == "completed", _failures(case_id)
+    assert set(_SEARCH_SCOPES[case_id]) == {"design"}           # 外观设计仍只检外观
     _ds["case_id"] = case_id
     _ds["state"] = _case_state(case_id)
     _ds["calls"] = list(fake.calls)

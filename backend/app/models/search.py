@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 SearchSource = Literal["cnipa", "manual", "fallback_web"]
 SearchStatus = Literal["running", "done", "failed", "manual_pending"]
-PatentTypeParam = Literal["invention", "utility_model", "design", "all"]
+PatentTypeParam = Literal["invention", "utility_model", "design", "all", "invention_utility_model"]
 
 # 失败归类——处置方式完全不同，所以不能共用一句话：
 #   blocked : 首页防护没过（被拦截/网络不通）→ 稍后重试可能恢复，或手工检索
@@ -135,7 +135,7 @@ class SearchStartIn(BaseModel):
 
     terms: list[str] = Field(default_factory=list, description="检索词（一次会话最多 8 个）")
     patent_type: PatentTypeParam | None = Field(
-        default=None, description="缺省取案件的 patent_type，再缺省 all"
+        default=None, description="缺省按案件类型取查新范围（发明/实用新型案件为 invention_utility_model）"
     )
     use_cache: bool = Field(default=True, description="6 小时内同 terms+type 复用历史结果")
 

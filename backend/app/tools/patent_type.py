@@ -13,14 +13,25 @@ TYPE_INVENTION = "invention"
 TYPE_UTILITY_MODEL = "utility_model"
 TYPE_DESIGN = "design"
 TYPE_ALL = "all"
+# 查新范围：发明 + 实用新型。两者都构成现有技术——实用新型案件只查实用新型，
+# 会把最相关的发明公布整片漏掉（2026-09-28 真实案件：用户在 Google 上找到的两篇
+# 高度相关文献都是发明公布，平台的查新从一开始就不可能检到它们）。
+TYPE_INVENTION_UTILITY_MODEL = "invention_utility_model"
 
-CANONICAL_TYPES = (TYPE_INVENTION, TYPE_UTILITY_MODEL, TYPE_DESIGN, TYPE_ALL)
+CANONICAL_TYPES = (
+    TYPE_INVENTION,
+    TYPE_UTILITY_MODEL,
+    TYPE_DESIGN,
+    TYPE_ALL,
+    TYPE_INVENTION_UTILITY_MODEL,
+)
 
 TYPE_LABEL_ZH: dict[str, str] = {
     TYPE_INVENTION: "发明",
     TYPE_UTILITY_MODEL: "实用新型",
     TYPE_DESIGN: "外观设计",
     TYPE_ALL: "全部",
+    TYPE_INVENTION_UTILITY_MODEL: "发明+实用新型",
 }
 
 # 国知局 epub 首页 checkbox id → 中文标签
@@ -32,6 +43,15 @@ EPUB_TYPE_CHECKBOXES: dict[str, dict[str, bool]] = {
     TYPE_INVENTION: {"fmgb": True, "fmsq": True, "xxsq": False, "wgsq": False},
     TYPE_UTILITY_MODEL: {"fmgb": False, "fmsq": False, "xxsq": True, "wgsq": False},
     TYPE_DESIGN: {"fmgb": False, "fmsq": False, "xxsq": False, "wgsq": True},
+    TYPE_INVENTION_UTILITY_MODEL: {"fmgb": True, "fmsq": False, "xxsq": True, "wgsq": False},
+}
+
+# 结果页**按类型分页签**，一次只显示一个页签（勾了几类就有几个页签，默认停在第一个）。
+# 所以勾选多类提交一次，拿到的只是第一类——早先 `all` 实际上只检了「发明公布」。
+# 多类范围必须拆成逐类各检一次（2026-09-28 真站点取证）。
+EPUB_QUERY_SPLIT: dict[str, tuple[str, ...]] = {
+    TYPE_ALL: (TYPE_INVENTION, TYPE_UTILITY_MODEL, TYPE_DESIGN),
+    TYPE_INVENTION_UTILITY_MODEL: (TYPE_INVENTION, TYPE_UTILITY_MODEL),
 }
 
 # Google Patents（WebSearch / 浏览器）：官方 type 仅 PATENT | DESIGN
@@ -57,6 +77,11 @@ GOOGLE_PATENTS_TYPE_HINT: dict[str, dict[str, str]] = {
         "query_extra": "country:CN",
         "note": "不限制 type",
     },
+    TYPE_INVENTION_UTILITY_MODEL: {
+        "gp_type": "PATENT",
+        "query_extra": "country:CN",
+        "note": "type=PATENT 同时覆盖发明（…A/…B）与实用新型（…U）",
+    },
 }
 
 # Google 学术：无专利类型过滤器
@@ -76,6 +101,8 @@ _ALIASES = {
     "design": TYPE_DESIGN,
     "全部": TYPE_ALL,
     "all": TYPE_ALL,
+    "发明+实用新型": TYPE_INVENTION_UTILITY_MODEL,
+    "invention_utility_model": TYPE_INVENTION_UTILITY_MODEL,
 }
 
 # 中国专利文献种类标识（公开/公告号末位字母）→ 三大类
@@ -206,6 +233,12 @@ def resolve_reader_patent_type(
 def epub_checkbox_states(patent_type: str) -> dict[str, bool]:
     t = normalize_patent_type(patent_type, default=TYPE_ALL)
     return dict(EPUB_TYPE_CHECKBOXES[t])
+
+
+def epub_query_types(patent_type: str) -> tuple[str, ...]:
+    """一个检索词要逐类提交的类型序列（单类原样；多类拆开，见 EPUB_QUERY_SPLIT）。"""
+    t = normalize_patent_type(patent_type, default=TYPE_ALL)
+    return EPUB_QUERY_SPLIT.get(t, (t,))
 
 
 def google_patents_websearch_query(keywords: str, patent_type: str) -> str:

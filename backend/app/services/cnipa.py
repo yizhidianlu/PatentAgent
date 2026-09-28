@@ -41,6 +41,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
+import httpx
 from ulid import ULID
 
 from ..db import database as db
@@ -53,6 +54,7 @@ from ..models.search import (
     SearchResult,
     hit_row_to_model,
 )
+from . import patent_fetch
 from . import progress as progress_service
 from .convert import kill_process_tree, run_tool, spawn_tool
 from .sse import hub
@@ -111,7 +113,23 @@ _TYPE_ALIASES = {
     "外观": "design",
     "all": "all",
     "全部": "all",
+    "invention_utility_model": "invention_utility_model",
+    "发明+实用新型": "invention_utility_model",
 }
+
+# 给人看的检索范围
+TYPE_LABELS = {
+    "invention": "发明",
+    "utility_model": "实用新型",
+    "design": "外观设计",
+    "all": "全部类型",
+    "invention_utility_model": "发明+实用新型",
+}
+
+# 一场检索入库的上限。逐类检索后每个词每类最多 3 条，8 个词、两类可达四十多条；消化改写
+# 每 8 条一次 LLM 调用，全收会把这一步拖得很长，而排在后面的多是只在申请人、地址这类字段里
+# 撞上检索词的条目。
+MAX_SEARCH_HITS = 30
 
 # 进度回调：cb(stage, msg) —— 同步或协程皆可
 ProgressCallback = Callable[[str, str], Awaitable[None] | None]
@@ -173,6 +191,32 @@ def normalize_type(patent_type: str | None) -> str:
     """专利类型 → 脚本 `--type` 参数（未知一律 all，绝不炸）。"""
     raw = str(patent_type or "").strip().lower()
     return _TYPE_ALIASES.get(raw, _TYPE_ALIASES.get(str(patent_type or "").strip(), "all"))
+
+
+def prior_art_scope(case_type: str | None) -> str:
+    """案件专利类型 → 查新检索范围。
+
+    现有技术不分专利类型：实用新型案件同样要和发明公布比，发明案件也要和实用新型比。
+    早先按案件类型只勾一类，实用新型案件把全部发明公布挡在了门外——2026-09-28 的真实
+    案件里，用户自己在 Google 上找到的两篇最相关文献都是发明公布，平台从一开始就不可能
+    检到。外观设计比的是设计本身，仍只检外观设计。
+    """
+    return "design" if normalize_type(case_type) == "design" else "invention_utility_model"
+
+
+def rank_hits(hits: Sequence[Mapping[str, Any]], terms: Sequence[str]) -> list[dict[str, Any]]:
+    """按与检索词的重合度排序：词出现在标题里计 2 分、只在摘要里计 1 分，同分保持原顺序。
+
+    公布站是多字段「或」检索，只在申请人、地址、代理机构里撞上检索词的条目也会进结果；
+    它们与方案无关，应该排在后面、超上限时先被舍弃。
+    """
+
+    def score(hit: Mapping[str, Any]) -> int:
+        title = str(hit.get("title") or "")
+        abstract = str(hit.get("abstract") or "")
+        return sum(2 if t in title else 1 if t in abstract else 0 for t in terms if t)
+
+    return sorted((dict(h) for h in hits), key=score, reverse=True)
 
 
 def normalize_terms(terms: Iterable[str] | None) -> list[str]:
@@ -349,6 +393,16 @@ def parse_search_protocol(lines: Sequence[str]) -> dict[str, Any]:
     return out
 
 
+def _type_gaps(terms: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, str]]:
+    """逐词行里「这个词做完了，但某一类没检成」的记录：{词: {类型: 原因}}。"""
+    gaps: dict[str, dict[str, str]] = {}
+    for t in terms:
+        errors = t.get("type_errors")
+        if t.get("term") and isinstance(errors, Mapping) and errors:
+            gaps[str(t["term"])] = {str(k): str(v) for k, v in errors.items()}
+    return gaps
+
+
 def _merge_term_hits(terms: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """逐词行里的命中合并去重（强杀后抢救用；与脚本的合并口径一致：按公开号/链接）。"""
     seen: set[str] = set()
@@ -371,7 +425,17 @@ def _progress_message(line: str) -> str | None:
     if s.startswith(_TERM_MARKER):
         d = _json_after(s, _TERM_MARKER) or {}
         n_hits = len(d.get("hits") or [])
-        return f"已完成 {d.get('i')}/{d.get('n')}：「{d.get('term')}」{n_hits} 条命中（{d.get('sec')}s）"
+        types = d.get("types") if isinstance(d.get("types"), dict) else {}
+        gaps = d.get("type_errors") if isinstance(d.get("type_errors"), dict) else {}
+        detail = (
+            "、".join(f"{label} {n} 条" for label, n in types.items())
+            if len(types) > 1 or gaps
+            else f"{n_hits} 条命中"
+        )
+        msg = f"已完成 {d.get('i')}/{d.get('n')}：「{d.get('term')}」{detail}（{d.get('sec')}s）"
+        if gaps:
+            msg += f"；{'、'.join(gaps)}未检成"
+        return msg
     if s.startswith(_TERM_FAIL_MARKER):
         d = _json_after(s, _TERM_FAIL_MARKER) or {}
         return f"第 {d.get('i')}/{d.get('n')} 个词「{d.get('term')}」检索失败，继续下一个"
@@ -521,6 +585,7 @@ def _run_search_script(
             "failed": failed,
             "stop": stop,
             "stderr": tail,
+            "type_gaps": _type_gaps(parsed["terms"]),
         }
 
     # ---- 2) 没有摘要：被强杀或崩溃。先从逐词行里抢救已完成的词 ----
@@ -537,6 +602,7 @@ def _run_search_script(
             "failed": bad,
             "stop": "killed" if killed else "crashed",
             "stderr": tail,
+            "type_gaps": _type_gaps(parsed["terms"]),
         }
 
     if killed:
@@ -736,7 +802,8 @@ async def search(
     参数
     ----
     terms            : 检索词（一次会话多词，脚本内共用一个浏览器；上限 8 个）。
-    patent_type      : invention | utility_model | design | all（其它值一律 all）。
+    patent_type      : invention | utility_model | design | invention_utility_model | all
+                       （其它值一律 all；查新请用 `prior_art_scope(案件类型)`）。
     timeout          : 时间预算（秒）；缺省按词数 `search_budget(n)`。
     on_progress      : `cb(stage, msg)`，stage ∈ start|cache|running|crawl|parsed|done|failed。
     use_cache        : 命中 6 小时内同 terms+type 的**完整**成功会话即复用。
@@ -758,7 +825,9 @@ async def search(
 
     key = terms_key(norm_terms, ptype)
     await _notify(
-        on_progress, "start", f"开始检索国知局公布公告：{'、'.join(norm_terms)}（类型 {ptype}）"
+        on_progress,
+        "start",
+        f"开始检索国知局公布公告：{'、'.join(norm_terms)}（范围：{TYPE_LABELS.get(ptype, ptype)}）",
     )
 
     # ---- 缓存 ----
@@ -843,10 +912,15 @@ async def search(
     )
 
     hits, dropped = normalize_hits(outcome["hits"])
+    hits = rank_hits(hits, norm_terms)
+    trimmed = max(0, len(hits) - MAX_SEARCH_HITS)
+    hits = hits[:MAX_SEARCH_HITS]
+    type_gaps: dict[str, dict[str, str]] = dict(outcome.get("type_gaps") or {})
     await _notify(
         on_progress,
         "parsed",
-        f"已检索 {len(searched)}/{len(norm_terms)} 个词，解析到 {len(hits)} 条命中（丢弃无链接 {dropped} 条）",
+        f"已检索 {len(searched)}/{len(norm_terms)} 个词，解析到 {len(hits) + trimmed} 条命中（丢弃无链接 {dropped} 条）"
+        + (f"；按与检索词的重合度保留前 {MAX_SEARCH_HITS} 条" if trimmed else ""),
     )
 
     if not hits and empty_is_failure:
@@ -904,15 +978,22 @@ async def search(
                 "searched": searched,
                 "skipped": skipped,
                 "failed": failed,
+                "trimmed": trimmed,
+                "type_gaps": type_gaps,
                 # 部分完成的会话不能当完整结果进缓存（见 _cached_query）
-                "partial": partial,
+                "partial": partial or bool(type_gaps),
             },
         )
+    )
+    gap_note = (
+        "；" + "；".join(f"「{term}」的{'、'.join(gaps)}未检成" for term, gaps in type_gaps.items())
+        if type_gaps
+        else ""
     )
     await _notify(
         on_progress,
         "done",
-        f"检索完成，入库 {len(rows)} 条" + (f"；{pending_note}" if partial else ""),
+        f"检索完成，入库 {len(rows)} 条" + (f"；{pending_note}" if partial else "") + gap_note,
     )
     return SearchResult(
         status="done",
@@ -1040,6 +1121,74 @@ async def add_manual_hits(
 
     rows = await db.arun(op)
     return [hit_row_to_model(r) for r in rows]
+
+
+# 相邻两篇补全之间的间隔：Google Patents 对密集请求会整站回 503
+ENRICH_SPACING_SEC = 2.0
+
+
+def _enrich_client() -> httpx.AsyncClient:
+    """补全摘要用的 HTTP 客户端（单独成函数：测试里换成不触网的桩）。"""
+    return httpx.AsyncClient(timeout=patent_fetch.FETCH_TIMEOUT, follow_redirects=True)
+
+
+def _needs_abstract(hit: SearchHit) -> bool:
+    return not str(hit.abstract or "").strip()
+
+
+async def enrich_hits(
+    case_id: str,
+    hits: Sequence[SearchHit],
+    *,
+    on_progress: ProgressCallback | None = None,
+    spacing: float | None = None,
+) -> tuple[list[SearchHit], list[str]]:
+    """给缺摘要的条目补上摘要 / 申请人 / 公开日（手工补录的通常只有标题和链接）。
+
+    返回 `(按原顺序的条目, 未能补全的说明)`。已有摘要的条目原样返回、不发请求。
+    **绝不抛异常**：补不上的如实列出原因，由调用方写进日志——不能让用户以为补过了。
+    """
+    targets = [h for h in hits if _needs_abstract(h)]
+    if not targets:
+        return list(hits), []
+    gap = ENRICH_SPACING_SEC if spacing is None else spacing
+
+    problems: list[str] = []
+    updated: dict[str, SearchHit] = {}
+    # Google 整站限流（多见于代理出口 IP 被标记）时，退避重试救不回来：同一批里第一条
+    # 退避完仍被限流，后面的条目就只试一次，尽快转 PDF 兜底，别每条都苦等十几秒
+    retry_delays = patent_fetch.RATE_LIMIT_RETRY_DELAYS
+    async with _enrich_client() as client:
+        for n, hit in enumerate(targets):
+            if n and gap > 0:
+                await asyncio.sleep(gap)
+            pub = patent_fetch.normalize_pub_no(hit.pub_no) or patent_fetch.pub_no_from_url(hit.url)
+            url = str(hit.url or "")
+            pdf_url = url if url.split("?", 1)[0].lower().endswith(".pdf") else None
+            label = hit.title or pub or url
+            await _notify(on_progress, "enrich", f"正在补全「{label}」的摘要（{n + 1}/{len(targets)}）…")
+            summary = await patent_fetch.fetch_patent_summary(
+                pub, pdf_url=pdf_url, client=client, retry_delays=retry_delays
+            )
+            if summary.rate_limited:
+                retry_delays = ()
+            if not summary.ok:
+                problems.append(f"{pub or label}：{summary.error}")
+                continue
+            fields: dict[str, Any] = {"abstract": summary.abstract}
+            if not hit.applicant and summary.applicant:
+                fields["applicant"] = summary.applicant
+            if not hit.pub_date and summary.pub_date:
+                fields["pub_date"] = summary.pub_date
+            if not hit.title and summary.title:
+                fields["title"] = summary.title
+            if not hit.pub_no and pub:
+                fields["pub_no"] = pub
+            try:
+                updated[hit.id] = await _patch_hit(hit.id, fields)
+            except KeyError:  # 内存态条目（无对应行）：只更新返回值
+                updated[hit.id] = hit.model_copy(update=fields)
+    return [updated.get(h.id, h) for h in hits], problems
 
 
 async def list_hits(case_id: str, *, selected_only: bool = False) -> list[SearchHit]:
